@@ -97,6 +97,15 @@ wheels = [
 ]
 
 [[package]]
+name = "async-timeout"
+version = "5.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a5/ae/136395dfbfe00dfc94da3f3e136d0b13f394cba8f4841120e34226265780/async_timeout-5.0.1.tar.gz", hash = "sha256:d9321a7a3d5a6a5e187e824d2fa0793ce379a202935782d555d6e9d2735677d3", size = 9274, upload-time = "2024-11-06T16:41:39.6Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/ba/e2081de779ca30d473f21f5b30e0e737c438205440784c7dfc81efc2b029/async_timeout-5.0.1-py3-none-any.whl", hash = "sha256:39e3809566ff85354557ec2398b55e096c8364bacac9405a7a1fa429e77fe76c", size = 6233, upload-time = "2024-11-06T16:41:37.9Z" },
+]
+
+[[package]]
 name = "attrs"
 version = "25.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -437,6 +446,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "python-dateutil" },
+    { name = "redis" },
     { name = "requests" },
     { name = "seaborn" },
     { name = "websocket-client" },
@@ -458,6 +468,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.21.0" },
     { name = "pandas", specifier = ">=1.5.0" },
     { name = "python-dateutil", specifier = ">=2.8.0" },
+    { name = "redis" },
     { name = "requests", specifier = ">=2.28.0" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "websocket-client", specifier = ">=1.4.0" },
@@ -742,7 +753,7 @@ requires-dist = [
     { name = "bech32", marker = "extra == 'dydx'", specifier = ">=1.2.0,<2.0.0" },
     { name = "betfair-parser", marker = "extra == 'betfair'", specifier = "==0.14.4" },
     { name = "bip-utils", marker = "extra == 'dydx'", specifier = ">=2.9.3,<3.0.0" },
-    { name = "click", specifier = ">=8.2.1,<9.0.0" },
+    { name = "click", specifier = ">=8.0.0,<9.0.0" },
     { name = "defusedxml", marker = "extra == 'ib'", specifier = ">=0.7.1,<1.0.0" },
     { name = "docker", marker = "extra == 'docker'", specifier = ">=7.1.0,<8.0.0" },
     { name = "ecdsa", marker = "extra == 'dydx'", specifier = ">=0.19.0,<1.0.0" },
@@ -769,11 +780,11 @@ dev = [
     { name = "black", specifier = ">=25.1.0,<26.0.0" },
     { name = "cython", specifier = "==3.1.2" },
     { name = "docformatter", specifier = ">=1.7.7,<2.0.0" },
-    { name = "mypy", specifier = ">=1.16.1,<2.0.0" },
+    { name = "mypy", specifier = ">=1.17.0,<2.0.0" },
     { name = "pandas-stubs", specifier = ">=2.3.0,<3.0.0" },
     { name = "pre-commit", specifier = ">=4.2.0,<5.0.0" },
     { name = "requests", specifier = ">=2.32.4,<3.0.0" },
-    { name = "ruff", specifier = ">=0.12.2,<1.0.0" },
+    { name = "ruff", specifier = ">=0.12.3,<1.0.0" },
     { name = "setuptools", specifier = ">=75" },
     { name = "types-pytz", specifier = ">=2024.2,<2025.0" },
     { name = "types-requests", specifier = ">=2.32,<3.0" },
@@ -1218,6 +1229,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f8/bf/abbd3cdfb8fbc7fb3d4d38d320f2441b1e7cbe29be4f23797b4a2b5d8aac/pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3", size = 320884, upload-time = "2025-03-25T02:25:00.538Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/81/c4/34e93fe5f5429d7570ec1fa436f1986fb1f00c3e0f43a589fe2bbcd22c3f/pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00", size = 509225, upload-time = "2025-03-25T02:24:58.468Z" },
+]
+
+[[package]]
+name = "redis"
+version = "6.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "async-timeout", marker = "python_full_version < '3.11.3'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ea/9a/0551e01ba52b944f97480721656578c8a7c46b51b99d66814f85fe3a4f3e/redis-6.2.0.tar.gz", hash = "sha256:e821f129b75dde6cb99dd35e5c76e8c49512a5a0d8dfdc560b2fbd44b85ca977", size = 4639129, upload-time = "2025-05-28T05:01:18.91Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/67/e60968d3b0e077495a8fee89cf3f2373db98e528288a48f1ee44967f6e8c/redis-6.2.0-py3-none-any.whl", hash = "sha256:c8ddf316ee0aab65f04a11229e94a64b2618451dab7a67cb2f77eb799d872d5e", size = 278659, upload-time = "2025-05-28T05:01:16.955Z" },
 ]
 
 [[package]]

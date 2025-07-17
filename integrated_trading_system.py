@@ -47,7 +47,7 @@ except ImportError:
 
 # 导入自定义数据源
 try:
-    from custom_data_source import CustomDataSource, DataProcessor
+    from jvquant_k_line_data import CustomDataSource, DataProcessor
     CUSTOM_DATA_SOURCE_AVAILABLE = True
 except ImportError:
     CUSTOM_DATA_SOURCE_AVAILABLE = False

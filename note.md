@@ -292,3 +292,5 @@ $env:Path = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Ll
 
 cd C:\Users\hedz\Downloads\nautilus_trader-develop
 uv pip install -e .
+
+./redis-server.exe redis.conf

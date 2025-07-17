@@ -21,6 +21,28 @@ import pickle
 from typing import Dict, List, Optional, Any
 import logging
 
+# Redis连接检测和健康检查
+REDIS_AVAILABLE = False
+REDIS_HEALTHY = False
+REDIS_TEST_HOST = "localhost"
+REDIS_TEST_PORT = 6379
+try:
+    import redis
+    REDIS_AVAILABLE = True
+    print(f"[Redis] redis-py已安装，开始检测Redis服务...")
+    try:
+        r = redis.StrictRedis(host=REDIS_TEST_HOST, port=REDIS_TEST_PORT, socket_connect_timeout=3)
+        result = r.ping()
+        REDIS_HEALTHY = True
+        print(f"[Redis] Redis服务检测成功: {result}")
+        logging.info("[Redis] redis-py已安装，且Redis服务可用，优先使用Redis持久化模式。")
+    except Exception as e:
+        print(f"[Redis] Redis服务检测失败: {e}")
+        logging.warning(f"[Redis] redis-py已安装，但Redis服务不可用({REDIS_TEST_HOST}:{REDIS_TEST_PORT})，将自动切换为内存缓存模式。错误: {e}")
+except ImportError:
+    print("[Redis] 未安装redis-py，将使用内存缓存模式")
+    logging.warning("[Redis] 未安装redis-py，将使用内存缓存模式。建议: pip install redis")
+
 # NautilusTrader imports
 from nautilus_trader.config import CacheConfig, DatabaseConfig
 from nautilus_trader.cache.cache import Cache
@@ -51,28 +73,36 @@ class ETF159506CacheManager:
     """159506 ETF Cache管理器"""
     
     def __init__(self, use_redis: bool = True, redis_host: str = "localhost", redis_port: int = 6379):
-        self.use_redis = use_redis
+        # 动态切换逻辑
+        print(f"[CacheManager] 初始化参数: use_redis={use_redis}, REDIS_AVAILABLE={REDIS_AVAILABLE}, REDIS_HEALTHY={REDIS_HEALTHY}")
+        self.use_redis = use_redis and REDIS_AVAILABLE and REDIS_HEALTHY
         self.redis_host = redis_host
         self.redis_port = redis_port
+        print(f"[CacheManager] 最终Redis使用状态: {self.use_redis}")
+        if use_redis and not self.use_redis:
+            print("[CacheManager] 请求使用Redis，但Redis不可用，已自动切换为内存缓存模式！")
+            logging.warning("[CacheManager] 请求使用Redis，但Redis不可用，已自动切换为内存缓存模式！")
         
         # 创建Cache配置
-        if use_redis:
+        if self.use_redis:
+            print(f"[CacheManager] 创建Redis配置: host={redis_host}, port={redis_port}")
             cache_config = CacheConfig(
                 database=DatabaseConfig(
                     type="redis",
                     host=redis_host,
                     port=redis_port,
-                    timeout=2,
+                    timeout=5,
                 ),
                 tick_capacity=100_000,  # 存储10万条tick
                 bar_capacity=50_000,    # 存储5万根K线
                 encoding="msgpack",
                 timestamps_as_iso8601=True,
-                use_trader_prefix=True,
-                use_instance_id=False,
+                use_trader_prefix=True,  # 启用trader前缀，这是默认行为
+                use_instance_id=True,    # 启用实例ID，确保数据隔离
                 flush_on_start=False,
                 drop_instruments_on_reset=True,
             )
+            print("[CacheManager] Redis配置创建成功")
         else:
             cache_config = CacheConfig(
                 tick_capacity=100_000,
@@ -84,7 +114,39 @@ class ETF159506CacheManager:
         # 创建Cache实例
         self.clock = LiveClock()
         self.logger = Logger("ETF159506CacheManager")
-        self.cache = Cache(config=cache_config)
+        
+        # 如果需要Redis，创建数据库适配器
+        if self.use_redis:
+            from nautilus_trader.cache.database import CacheDatabaseAdapter
+            from nautilus_trader.model.identifiers import TraderId
+            from nautilus_trader.core.uuid import UUID4
+            from nautilus_trader.serialization.serializer import MsgSpecSerializer
+            import msgspec
+            
+            # 创建必要的组件
+            trader_id = TraderId("TRADER-001")
+            instance_id = UUID4()
+            serializer = MsgSpecSerializer(
+                encoding=msgspec.msgpack, 
+                timestamps_as_str=True,
+                timestamps_as_iso8601=False  # 只使用timestamps_as_str
+            )
+            
+            # 创建数据库适配器
+            database = CacheDatabaseAdapter(
+                trader_id=trader_id,
+                instance_id=instance_id,
+                serializer=serializer,
+                config=cache_config,
+            )
+            
+            # 创建带数据库的Cache
+            self.cache = Cache(database=database, config=cache_config)
+            print("[CacheManager] 已创建带Redis后端的Cache")
+        else:
+            # 创建内存Cache
+            self.cache = Cache(config=cache_config)
+            print("[CacheManager] 已创建内存Cache")
         
         # 初始化159506 ETF工具
         self._init_instrument()
@@ -94,7 +156,7 @@ class ETF159506CacheManager:
         self.bar_count = 0
         self.start_time = datetime.now()
         
-        logger.info(f"Cache管理器初始化完成 - Redis: {use_redis}")
+        logger.info(f"Cache管理器初始化完成 - Redis: {self.use_redis}")
     
     def _init_instrument(self):
         """初始化159506 ETF工具"""
@@ -104,24 +166,23 @@ class ETF159506CacheManager:
             venue=Venue("SZSE")  # 深圳证券交易所
         )
         
-        # 创建工具对象
-        self.instrument = Instrument(
+        # 创建工具对象 - 使用Equity类型而不是Instrument基类
+        from nautilus_trader.model.instruments import Equity
+        from nautilus_trader.model.objects import Price
+        
+        self.instrument = Equity(
             instrument_id=self.instrument_id,
             raw_symbol=Symbol("159506"),
-            asset_class=AssetClass.EQUITY,
-            instrument_class=InstrumentClass.SPOT,
-            quote_currency=Currency.from_str("CNY"),
-            is_inverse=False,
+            currency=Currency.from_str("CNY"),
             price_precision=3,
-            size_precision=0,
-            size_increment=Quantity(1, precision=0),
-            multiplier=Quantity(1, precision=0),
+            price_increment=Price.from_str("0.001"),  # 最小价格变动0.001
+            lot_size=Quantity.from_int(1),  # 最小交易单位1股
+            ts_event=self.clock.timestamp_ns(),
+            ts_init=self.clock.timestamp_ns(),
             margin_init=Decimal("0.0"),
             margin_maint=Decimal("0.0"),
             maker_fee=Decimal("0.0"),
             taker_fee=Decimal("0.0"),
-            ts_event=0,
-            ts_init=0,
         )
         
         # 将工具添加到Cache
@@ -175,12 +236,19 @@ class ETF159506CacheManager:
             
             # 确保价格和成交量是有效的数值
             if not isinstance(price, (int, float)) or price <= 0:
-                price = 0
+                logger.warning(f"无效价格: {price}")
+                return
             if not isinstance(volume, (int, float)) or volume <= 0:
-                volume = 0
+                logger.warning(f"无效成交量: {volume}")
+                return
             
             # 将成交量转换为整数（避免数据类型问题）
             volume_int = int(float(volume))  # 确保是整数
+            
+            # 验证成交量必须大于0
+            if volume_int <= 0:
+                logger.warning(f"成交量为0或负数，跳过存储: {volume_int}")
+                return
             
             # 创建TradeTick对象
             current_time_ns = self.clock.timestamp_ns()
@@ -504,6 +572,9 @@ class ETF159506CacheDataProcessor:
         self.total_processed = 0
         self.start_time = datetime.now()
         
+        # 用于计算增量成交量
+        self.last_volume = 0  # 上次的累计成交量
+        
         logger.info(f"初始化159506 ETF Cache数据处理器")
     
     def process_level1_data(self, data: str):
@@ -575,13 +646,24 @@ class ETF159506CacheDataProcessor:
                                    f"卖一{best_ask['price']:.3f}({best_ask['volume']}) "
                                    f"价差{spread:.4f}")
                 
-                # 存储交易数据（成交价）
-                trade_data = {
-                    'price': latest_price,                   # 成交价
-                    'volume': volume,                        # 成交量
-                    'trade_id': f"trade_{self.total_processed}"
-                }
-                self.cache_manager.store_trade_tick(trade_data)
+                # 计算增量成交量（当前累计成交量 - 上次累计成交量）
+                volume_increment = max(0, volume - self.last_volume)
+                self.last_volume = volume
+                
+                # 添加调试信息（每100条记录一次）
+                if self.total_processed % 100 == 0:
+                    logger.debug(f"成交量计算: 累计={volume}, 增量={volume_increment}, 上次={self.last_volume}")
+                
+                # 只有当增量成交量大于0时才存储交易数据
+                if volume_increment > 0:
+                    trade_data = {
+                        'price': latest_price,                   # 成交价
+                        'volume': volume_increment,              # 增量成交量
+                        'trade_id': f"trade_{self.total_processed}"
+                    }
+                    self.cache_manager.store_trade_tick(trade_data)
+                else:
+                    logger.debug(f"增量成交量为0，跳过存储交易tick: 累计={volume}, 增量={volume_increment}")
             
             self.total_processed += 1
             
@@ -655,6 +737,7 @@ class ETF159506CacheWebSocketClient:
         self.is_connected = False
         
         # 线程控制
+        self.ws_thread = None
         self.save_thread = None
         self.stop_save = False
         self.heartbeat_thread = None
@@ -698,8 +781,23 @@ class ETF159506CacheWebSocketClient:
             on_close=self.on_close
         )
         
-        self.ws.run_forever()
-        return True
+        # 在后台线程中运行WebSocket连接
+        self.ws_thread = threading.Thread(target=self.ws.run_forever)
+        self.ws_thread.daemon = True
+        self.ws_thread.start()
+        
+        # 等待连接建立或超时
+        timeout = 30  # 30秒超时
+        start_time = time.time()
+        while not self.is_connected and (time.time() - start_time) < timeout:
+            time.sleep(0.1)
+        
+        if self.is_connected:
+            logger.info("WebSocket连接成功建立")
+            return True
+        else:
+            logger.error("WebSocket连接超时")
+            return False
     
     def on_open(self, ws):
         """连接打开回调"""
@@ -962,7 +1060,7 @@ def main():
     # 配置参数
     TOKEN = "d0c519adcd47d266f1c96750d4e80aa6"
     STOCK_CODE = "159506"
-    USE_REDIS = True  # 是否使用Redis持久化
+    USE_REDIS = True  # 启用Redis，系统会自动检测并切换
     REDIS_HOST = "localhost"
     REDIS_PORT = 6379
     
@@ -990,7 +1088,8 @@ def main():
             while client.is_connected:
                 time.sleep(1)
                 
-                if int(time.time()) % 300 == 0:  # 每5分钟输出一次状态
+                # 每10秒打印一次数据状态
+                if int(time.time()) % 10 == 0:
                     status = client.get_status()
                     cache_status = status.get('cache_status', {})
                     
@@ -1007,11 +1106,45 @@ def main():
                         spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
                         price_info += f", 价差: {spread:.4f}"
                     
-                    print(f"状态: 连接={status['connected']}, "
+                    current_time = datetime.now().strftime('%H:%M:%S')
+                    print(f"[{current_time}] 数据状态: 连接={status['connected']}, "
                           f"总tick数={cache_status.get('tick_count', 0)}, "
                           f"报价数={cache_status.get('quote_count', 0)}, "
                           f"交易数={cache_status.get('trade_count', 0)}, "
                           f"{price_info}")
+                
+                # 每1分钟打印一次详细状态信息
+                if int(time.time()) % 60 == 0:
+                    status = client.get_status()
+                    cache_status = status.get('cache_status', {})
+                    
+                    # 获取最新价格信息
+                    latest_quote = cache_status.get('latest_quote')
+                    latest_trade = cache_status.get('latest_trade')
+                    
+                    # 显示价格信息
+                    price_info = ""
+                    if latest_trade:
+                        price_info = f"成交价: {float(latest_trade.price):.4f}"
+                    
+                    if latest_quote:
+                        spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
+                        price_info += f", 价差: {spread:.4f}"
+                    
+                    current_time = datetime.now().strftime('%H:%M:%S')
+                    print(f"\n{'='*60}")
+                    print(f"[{current_time}] 详细状态信息:")
+                    print(f"连接状态: {status['connected']}")
+                    print(f"连接次数: {status['connection_count']}")
+                    print(f"断开次数: {status['disconnection_count']}")
+                    print(f"数据接收: {status['data_receive_count']} 条")
+                    print(f"Cache统计:")
+                    print(f"  总tick数: {cache_status.get('tick_count', 0)}")
+                    print(f"  总K线数: {cache_status.get('bar_count', 0)}")
+                    print(f"  报价数: {cache_status.get('quote_count', 0)}")
+                    print(f"  交易数: {cache_status.get('trade_count', 0)}")
+                    print(f"最新数据: {price_info}")
+                    print(f"{'='*60}\n")
                 
     except KeyboardInterrupt:
         print("\n用户中断，正在保存数据...")
