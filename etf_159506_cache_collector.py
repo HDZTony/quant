@@ -153,7 +153,6 @@ class ETF159506CacheManager:
         
         # 数据统计
         self.tick_count = 0
-        self.bar_count = 0
         self.start_time = datetime.now()
         
         logger.info(f"Cache管理器初始化完成 - Redis: {self.use_redis}")
@@ -273,164 +272,7 @@ class ETF159506CacheManager:
             import traceback
             logger.error(f"详细错误信息: {traceback.format_exc()}")
     
-    def create_bars_from_ticks(self, bar_type: BarType):
-        """从tick数据创建K线 - 使用成交价"""
-        try:
-            # 获取交易tick数据（成交价）
-            trade_ticks = self.cache.trade_ticks(self.instrument_id)
-            if len(trade_ticks) < 2:
-                return
-            
-            # 创建K线数据 - 使用成交价
-            latest_tick = trade_ticks[-1]
-            
-            bar = Bar(
-                bar_type=bar_type,
-                open=latest_tick.price,      # 使用成交价
-                high=latest_tick.price,      # 使用成交价
-                low=latest_tick.price,       # 使用成交价
-                close=latest_tick.price,     # 使用成交价
-                volume=latest_tick.size,     # 使用成交量
-                ts_event=latest_tick.ts_event,
-                ts_init=latest_tick.ts_init,
-            )
-            
-            # 添加到Cache
-            self.cache.add_bar(bar)
-            self.bar_count += 1
-            
-            if self.bar_count % 100 == 0:
-                logger.info(f"已创建 {self.bar_count} 根K线（基于成交价）")
-                
-        except Exception as e:
-            logger.error(f"创建K线失败: {e}")
-    
-    def create_enhanced_bars_from_ticks(self, bar_type: BarType):
-        """创建增强K线 - 结合成交价和买卖价差"""
-        try:
-            # 获取交易tick数据（成交价）
-            trade_ticks = self.cache.trade_ticks(self.instrument_id)
-            quote_ticks = self.cache.quote_ticks(self.instrument_id)
-            
-            if len(trade_ticks) < 2:
-                return
-            
-            # 按时间窗口聚合数据
-            window_trades = self._get_window_trades(trade_ticks, bar_type)
-            window_quotes = self._get_window_quotes(quote_ticks, bar_type)
-            
-            if len(window_trades) == 0:
-                return
-            
-            # 计算基于成交价的OHLC
-            trade_prices = [float(tick.price) for tick in window_trades]
-            trade_volumes = [int(tick.size) for tick in window_trades]
-            
-            # 计算基于买卖价差的增强信息
-            spread_info = self._calculate_spread_info(window_quotes)
-            
-            # 检查总成交量是否超过最大值
-            total_volume = sum(trade_volumes)
-            max_quantity = 18_446_744_073  # Quantity类型的最大值
-            
-            # 添加调试信息
-            logger.debug(f"K线生成: 窗口内交易数={len(window_trades)}, 总成交量={total_volume}")
-            
-            if total_volume > max_quantity:
-                logger.warning(f"总成交量 {total_volume} 超过最大值 {max_quantity}，将使用最大值")
-                total_volume = max_quantity
-            
-            # 创建增强K线
-            bar = Bar(
-                bar_type=bar_type,
-                open=self.instrument.make_price(trade_prices[0]),
-                high=self.instrument.make_price(max(trade_prices)),
-                low=self.instrument.make_price(min(trade_prices)),
-                close=self.instrument.make_price(trade_prices[-1]),
-                volume=Quantity.from_int(total_volume),
-                ts_event=window_trades[-1].ts_event,
-                ts_init=window_trades[-1].ts_init,
-            )
-            
-            # 添加到Cache
-            self.cache.add_bar(bar)
-            self.bar_count += 1
-            
-            # 记录增强信息
-            if self.bar_count % 100 == 0:
-                logger.info(f"已创建 {self.bar_count} 根增强K线, "
-                           f"平均价差: {spread_info.get('avg_spread', 0):.4f}")
-                
-        except Exception as e:
-            logger.error(f"创建增强K线失败: {e}")
-            import traceback
-            logger.error(f"详细错误信息: {traceback.format_exc()}")
-    
-    def _get_window_trades(self, trade_ticks, bar_type):
-        """获取时间窗口内的交易数据"""
-        if len(trade_ticks) == 0:
-            return []
-        
-        # 根据bar_type的时间窗口来聚合数据
-        # 对于1分钟K线，获取最近1分钟的数据
-        current_time = trade_ticks[-1].ts_event
-        window_start = current_time - (60 * 1_000_000_000)  # 1分钟 = 60秒 * 10^9纳秒
-        
-        # 过滤时间窗口内的数据
-        window_trades = [tick for tick in trade_ticks if tick.ts_event >= window_start]
-        
-        # 如果数据量仍然过大，进一步限制
-        max_records = 100
-        if len(window_trades) > max_records:
-            window_trades = window_trades[-max_records:]
-            logger.debug(f"时间窗口数据过多，限制为最近{max_records}条记录")
-        
-        return window_trades
-    
-    def _get_window_quotes(self, quote_ticks, bar_type):
-        """获取时间窗口内的报价数据"""
-        if len(quote_ticks) == 0:
-            return []
-        
-        # 根据bar_type的时间窗口来聚合数据
-        # 对于1分钟K线，获取最近1分钟的数据
-        current_time = quote_ticks[-1].ts_event
-        window_start = current_time - (60 * 1_000_000_000)  # 1分钟 = 60秒 * 10^9纳秒
-        
-        # 过滤时间窗口内的数据
-        window_quotes = [tick for tick in quote_ticks if tick.ts_event >= window_start]
-        
-        # 如果数据量仍然过大，进一步限制
-        max_records = 100
-        if len(window_quotes) > max_records:
-            window_quotes = window_quotes[-max_records:]
-            logger.debug(f"时间窗口数据过多，限制为最近{max_records}条记录")
-        
-        return window_quotes
-    
-    def _calculate_spread_info(self, quote_ticks):
-        """计算价差信息"""
-        if len(quote_ticks) == 0:
-            return {}
-        
-        spreads = []
-        bid_prices = []
-        ask_prices = []
-        
-        for tick in quote_ticks:
-            spread = float(tick.ask_price) - float(tick.bid_price)
-            spreads.append(spread)
-            bid_prices.append(float(tick.bid_price))
-            ask_prices.append(float(tick.ask_price))
-        
-        return {
-            'avg_spread': np.mean(spreads) if spreads else 0,
-            'max_spread': max(spreads) if spreads else 0,
-            'min_spread': min(spreads) if spreads else 0,
-            'avg_bid': np.mean(bid_prices) if bid_prices else 0,
-            'avg_ask': np.mean(ask_prices) if ask_prices else 0,
-            'spread_volatility': np.std(spreads) if len(spreads) > 1 else 0
-        }
+
     
     def get_latest_data(self) -> Dict:
         """获取最新数据"""
@@ -440,7 +282,6 @@ class ETF159506CacheManager:
             
             return {
                 'tick_count': self.tick_count,
-                'bar_count': self.bar_count,
                 'latest_quote': latest_quote,
                 'latest_trade': latest_trade,
                 'quote_count': self.cache.quote_tick_count(self.instrument_id),
@@ -961,28 +802,6 @@ Cache统计:
                 time.sleep(self.save_interval)
                 
                 if not self.stop_save:
-                    # 创建增强K线
-                    try:
-                        from nautilus_trader.model.data import BarType, BarSpecification
-                        from nautilus_trader.model.enums import BarAggregation, PriceType
-                        
-                        # 创建1分钟K线 - 修复构造函数参数
-                        bar_spec = BarSpecification(
-                            1,  # step: 1分钟
-                            BarAggregation.MINUTE,
-                            PriceType.LAST,
-                        )
-                        bar_type = BarType(
-                            self.cache_manager.instrument_id,
-                            bar_spec,
-                        )
-                        
-                        # 生成增强K线
-                        self.cache_manager.create_enhanced_bars_from_ticks(bar_type)
-                        
-                    except Exception as e:
-                        logger.error(f"生成增强K线失败: {e}")
-                    
                     # 保存数据到Parquet文件
                     catalog_dir = Path(self.catalog_path)
                     catalog_dir.mkdir(parents=True, exist_ok=True)
@@ -1140,7 +959,6 @@ def main():
                     print(f"数据接收: {status['data_receive_count']} 条")
                     print(f"Cache统计:")
                     print(f"  总tick数: {cache_status.get('tick_count', 0)}")
-                    print(f"  总K线数: {cache_status.get('bar_count', 0)}")
                     print(f"  报价数: {cache_status.get('quote_count', 0)}")
                     print(f"  交易数: {cache_status.get('trade_count', 0)}")
                     print(f"最新数据: {price_info}")
