@@ -69,6 +69,144 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class TradingTimeManager:
+    """A股交易时间管理器"""
+    
+    def __init__(self):
+        # A股交易时间配置（周一至周五）
+        self.trading_sessions = [
+            # 上午交易时段：9:30-11:30
+            {
+                'start': '09:30:00',
+                'end': '11:30:00',
+                'name': '上午交易时段'
+            },
+            # 下午交易时段：13:00-15:00
+            {
+                'start': '13:00:00',
+                'end': '15:00:00',
+                'name': '下午交易时段'
+            }
+        ]
+        
+        # 节假日列表（2025年A股休市安排）
+        self.holidays = [
+            # 元旦：1月1日（星期三）休市，1月2日（星期四）起照常开市
+            '2025-01-01',  # 元旦
+            
+            # 春节：1月28日（星期二）至2月4日（星期二）休市，2月5日（星期三）起照常开市
+            # 另外，1月26日（星期日）、2月8日（星期六）为周末休市
+            '2025-01-28', '2025-01-29', '2025-01-30', '2025-01-31',  # 春节
+            '2025-02-01', '2025-02-02', '2025-02-03', '2025-02-04',  # 春节
+            
+            # 清明节：4月4日（星期五）至4月6日（星期日）休市，4月7日（星期一）起照常开市
+            '2025-04-04', '2025-04-05', '2025-04-06',  # 清明节
+            
+            # 劳动节：5月1日（星期四）至5月5日（星期一）休市，5月6日（星期二）起照常开市
+            # 另外，4月27日（星期日）为周末休市
+            '2025-05-01', '2025-05-02', '2025-05-03', '2025-05-04', '2025-05-05',  # 劳动节
+            
+            # 端午节：5月31日（星期六）至6月2日（星期一）休市，6月3日（星期二）起照常开市
+            '2025-05-31', '2025-06-01', '2025-06-02',  # 端午节
+            
+            # 国庆节、中秋节：10月1日（星期三）至10月8日（星期三）休市，10月9日（星期四）起照常开市
+            # 另外，9月28日（星期日）、10月11日（星期六）为周末休市
+            '2025-10-01', '2025-10-02', '2025-10-03', '2025-10-04',  # 国庆节、中秋节
+            '2025-10-05', '2025-10-06', '2025-10-07', '2025-10-08',  # 国庆节、中秋节
+        ]
+        
+        logger.info("交易时间管理器初始化完成")
+    
+    def is_trading_day(self, date: datetime = None) -> bool:
+        """判断是否为交易日"""
+        if date is None:
+            date = datetime.now()
+        
+        # 检查是否为周末
+        if date.weekday() >= 5:  # 5=周六, 6=周日
+            return False
+        
+        # 检查是否为节假日
+        date_str = date.strftime('%Y-%m-%d')
+        if date_str in self.holidays:
+            return False
+        
+        return True
+    
+    def is_trading_time(self, current_time: datetime = None) -> bool:
+        """判断当前是否为交易时间"""
+        if current_time is None:
+            current_time = datetime.now()
+        
+        # 首先检查是否为交易日
+        if not self.is_trading_day(current_time):
+            return False
+        
+        # 获取当前时间字符串
+        time_str = current_time.strftime('%H:%M:%S')
+        
+        # 检查是否在任一交易时段内
+        for session in self.trading_sessions:
+            if session['start'] <= time_str <= session['end']:
+                return True
+        
+        return False
+    
+    def get_next_trading_time(self, current_time: datetime = None) -> datetime:
+        """获取下一个交易时间"""
+        if current_time is None:
+            current_time = datetime.now()
+        
+        # 如果当前是交易时间，返回当前时间
+        if self.is_trading_time(current_time):
+            return current_time
+        
+        # 获取当前日期
+        current_date = current_time.date()
+        current_time_str = current_time.strftime('%H:%M:%S')
+        
+        # 检查今天剩余的交易时段
+        for session in self.trading_sessions:
+            if current_time_str < session['start']:
+                # 今天还有交易时段
+                next_time_str = f"{current_date} {session['start']}"
+                return datetime.strptime(next_time_str, '%Y-%m-%d %H:%M:%S')
+        
+        # 今天没有交易时段了，查找下一个交易日
+        next_date = current_date + timedelta(days=1)
+        while not self.is_trading_day(datetime.combine(next_date, datetime.min.time())):
+            next_date += timedelta(days=1)
+        
+        # 返回下一个交易日的第一个交易时段
+        next_time_str = f"{next_date} {self.trading_sessions[0]['start']}"
+        return datetime.strptime(next_time_str, '%Y-%m-%d %H:%M:%S')
+    
+    def get_trading_status(self) -> Dict:
+        """获取交易状态信息"""
+        current_time = datetime.now()
+        is_trading = self.is_trading_time(current_time)
+        is_trading_day = self.is_trading_day(current_time)
+        next_trading_time = self.get_next_trading_time(current_time)
+        
+        return {
+            'current_time': current_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'is_trading_day': is_trading_day,
+            'is_trading_time': is_trading,
+            'next_trading_time': next_trading_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'time_until_next': str(next_trading_time - current_time).split('.')[0] if next_trading_time > current_time else '0:00:00'
+        }
+    
+    def wait_until_trading_time(self, check_interval: int = 60):
+        """等待直到交易时间"""
+        while not self.is_trading_time():
+            status = self.get_trading_status()
+            logger.info(f"当前非交易时间: {status['current_time']}")
+            logger.info(f"下一个交易时间: {status['next_trading_time']} (等待 {status['time_until_next']})")
+            time.sleep(check_interval)
+        
+        logger.info(f"已进入交易时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+
 class ETF159506CacheManager:
     """159506 ETF Cache管理器"""
     
@@ -91,10 +229,10 @@ class ETF159506CacheManager:
                     type="redis",
                     host=redis_host,
                     port=redis_port,
-                    timeout=5,
+                    timeout=2,  # 减少超时时间
                 ),
-                tick_capacity=100_000,  # 存储10万条tick
-                bar_capacity=50_000,    # 存储5万根K线
+                tick_capacity=500_000,  # 增加到50万条tick（提高容量）
+                bar_capacity=100_000,   # 增加到10万根K线
                 encoding="msgpack",
                 timestamps_as_iso8601=True,
                 use_trader_prefix=True,  # 启用trader前缀，这是默认行为
@@ -564,14 +702,24 @@ class ETF159506CacheWebSocketClient:
     """159506 ETF基于Cache的WebSocket客户端"""
     
     def __init__(self, token: str, stock_code: str = "159506", 
-                 use_redis: bool = True, redis_host: str = "localhost", redis_port: int = 6379):
+                 use_redis: bool = True, redis_host: str = "localhost", redis_port: int = 6379,
+                 enable_trading_time_control: bool = True):
         self.token = token
         self.stock_code = stock_code
+        self.enable_trading_time_control = enable_trading_time_control
         
         # 初始化组件
         self.server_manager = ETF159506ServerManager(token)
         self.cache_manager = ETF159506CacheManager(use_redis, redis_host, redis_port)
         self.data_processor = ETF159506CacheDataProcessor(stock_code, self.cache_manager)
+        
+        # 交易时间管理
+        if self.enable_trading_time_control:
+            self.trading_time_manager = TradingTimeManager()
+            logger.info("已启用交易时间控制")
+        else:
+            self.trading_time_manager = None
+            logger.info("已禁用交易时间控制")
         
         # WebSocket相关
         self.ws = None
@@ -581,10 +729,13 @@ class ETF159506CacheWebSocketClient:
         self.ws_thread = None
         self.save_thread = None
         self.stop_save = False
-        self.heartbeat_thread = None
-        self.stop_heartbeat = False
+        # 移除心跳相关变量 - JVQuant服务器不支持心跳
+        # self.heartbeat_thread = None
+        # self.stop_heartbeat = False
         self.monitor_thread = None
         self.stop_monitor = False
+        self.trading_time_thread = None
+        self.stop_trading_time_check = False
         
         # 统计信息
         self.connection_count = 0
@@ -593,9 +744,11 @@ class ETF159506CacheWebSocketClient:
         self.last_data_time = None
         self.start_time = datetime.now()
         
-        # 配置
-        self.save_interval = 60  # 1分钟保存一次
-        self.heartbeat_interval = 30  # 30秒心跳一次
+        # 配置 - 优化为高频模式
+        self.save_interval = 10  # 10秒保存一次（提高保存频率）
+        # 移除心跳间隔 - JVQuant服务器不支持心跳
+        # self.heartbeat_interval = 10  # 10秒心跳一次（提高心跳频率）
+        self.trading_time_check_interval = 30  # 30秒检查一次交易时间
         self.catalog_path = f"catalog/etf_159506_cache"
         
         logger.info(f"初始化159506 ETF Cache WebSocket客户端")
@@ -617,7 +770,7 @@ class ETF159506CacheWebSocketClient:
         self.ws = websocket.WebSocketApp(
             ws_url,
             on_open=self.on_open,
-            on_data=self.on_message,
+            on_message=self.on_message,
             on_error=self.on_error,
             on_close=self.on_close
         )
@@ -628,10 +781,10 @@ class ETF159506CacheWebSocketClient:
         self.ws_thread.start()
         
         # 等待连接建立或超时
-        timeout = 30  # 30秒超时
+        timeout = 10  # 减少到10秒超时
         start_time = time.time()
         while not self.is_connected and (time.time() - start_time) < timeout:
-            time.sleep(0.1)
+            time.sleep(0.01)  # 减少到0.01秒检查间隔
         
         if self.is_connected:
             logger.info("WebSocket连接成功建立")
@@ -650,34 +803,74 @@ class ETF159506CacheWebSocketClient:
         ws.send(subscription)
         logger.info(f"已订阅: {subscription}")
         
-        self.start_heartbeat(ws)
+        # 移除心跳机制 - JVQuant服务器不支持心跳
+        # self.start_heartbeat(ws)
         self.start_auto_save()
         self.start_diagnostic_monitor()
+        self.start_trading_time_check()
     
-    def on_message(self, ws, message, type, flag):
+    def on_message(self, ws, message, *args):
         """接收消息回调"""
         try:
-            if type == websocket.ABNF.OPCODE_TEXT:
-                logger.info(f"收到文本消息: {message}")
-            
-            elif type == websocket.ABNF.OPCODE_BINARY:
-                decompressed = zlib.decompress(message, -zlib.MAX_WBITS)
-                data_str = decompressed.decode("utf-8")
-                
-                self.data_receive_count += 1
-                self.last_data_time = datetime.now()
-                
-                # 减少日志输出，只在每10条数据时输出一次
-                if self.data_receive_count % 10 == 0:
-                    logger.info(f"收到二进制数据 (第{self.data_receive_count}条): {data_str[:100]}...")
-                
-                lines = data_str.strip().split('\n')
-                for line in lines:
-                    if line.strip():
-                        self.process_market_data(line)
+            # 尝试解析消息类型
+            if isinstance(message, str):
+                logger.debug(f"收到文本消息: {message}")
+                # 处理文本消息（如心跳响应等）
+                if message.startswith('-1#'):
+                    logger.error(f"收到服务器错误消息: {message}")
+                    if "账户连接数已达并发上限" in message:
+                        logger.error("⚠️  账户连接数已达并发上限！")
+                        logger.error("解决方案:")
+                        logger.error("1. 关闭其他使用相同token的连接")
+                        logger.error("2. 等待一段时间后重试")
+                        logger.error("3. 充值提升连接额度: https://jvquant.com/home.html#charge")
+                        logger.error("4. 计算公式: 每100余额可增加1个并发连接额度")
+                        # 主动关闭连接
+                        ws.close()
+                        return
+                elif message.startswith('lv1_'):
+                    # 处理Level1数据
+                    self.data_receive_count += 1
+                    self.last_data_time = datetime.now()
+                    self.process_market_data(message)
+                elif message == 'pong':
+                    logger.debug("收到心跳响应")
+                elif message == "":
+                    logger.debug("收到空消息（心跳响应）")
+                else:
+                    logger.debug(f"收到其他文本消息: {message}")
+            else:
+                # 处理二进制数据
+                try:
+                    decompressed = zlib.decompress(message, -zlib.MAX_WBITS)
+                    data_str = decompressed.decode("utf-8")
+                    
+                    self.data_receive_count += 1
+                    self.last_data_time = datetime.now()
+                    
+                    # 减少日志输出，只在每50条数据时输出一次（减少日志开销）
+                    if self.data_receive_count % 50 == 0:
+                        logger.info(f"收到二进制数据 (第{self.data_receive_count}条): {data_str[:100]}...")
+                    
+                    lines = data_str.strip().split('\n')
+                    for line in lines:
+                        if line.strip():
+                            self.process_market_data(line)
+                            
+                except Exception as decompress_error:
+                    logger.error(f"解压缩数据失败: {decompress_error}")
+                    # 尝试作为文本处理
+                    try:
+                        data_str = message.decode("utf-8")
+                        logger.info(f"收到文本数据: {data_str[:100]}...")
+                        self.process_market_data(data_str)
+                    except:
+                        logger.error(f"无法解析消息: {message[:100]}...")
                         
         except Exception as e:
             logger.error(f"处理消息失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
     
     def process_market_data(self, data: str):
         """处理市场数据"""
@@ -688,20 +881,115 @@ class ETF159506CacheWebSocketClient:
         """错误回调"""
         self.disconnection_count += 1
         self.is_connected = False
-        self.stop_heartbeat = True
-        logger.error(f"WebSocket错误 (第{self.disconnection_count}次断开): {error}")
         
-        if "Connection to remote host was lost" in str(error):
-            logger.info("连接丢失，尝试重连...")
-            time.sleep(5)
-            self.reconnect()
+        # 记录详细的错误信息
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        error_str = str(error)
+        error_type = type(error).__name__
+        
+        logger.error(f"[{current_time}] WebSocket错误 (第{self.disconnection_count}次断开)")
+        logger.error(f"错误类型: {error_type}")
+        logger.error(f"错误详情: {error_str}")
+        logger.error(f"连接状态: {self.is_connected}")
+        logger.error(f"数据接收计数: {self.data_receive_count}")
+        
+        # 分析错误类型并提供详细说明
+        if "Connection to remote host was lost" in error_str:
+            logger.error("错误分析: 远程主机连接丢失")
+            logger.error("可能原因: 网络中断、服务器重启、防火墙阻止")
+            logger.error("处理策略: 等待交易时间检查线程自动重连")
+        elif "timeout" in error_str.lower():
+            logger.error("错误分析: 连接超时")
+            logger.error("可能原因: 网络延迟、服务器响应慢、心跳包丢失")
+            logger.error("处理策略: 等待交易时间检查线程自动重连")
+        elif "Connection refused" in error_str:
+            logger.error("错误分析: 连接被拒绝")
+            logger.error("可能原因: 服务器未启动、端口被占用、认证失败")
+            logger.error("处理策略: 等待交易时间检查线程自动重连")
+        elif "SSL" in error_str or "TLS" in error_str:
+            logger.error("错误分析: SSL/TLS连接错误")
+            logger.error("可能原因: 证书问题、协议版本不匹配")
+            logger.error("处理策略: 等待交易时间检查线程自动重连")
+        else:
+            logger.error(f"错误分析: 其他未知错误")
+            logger.error(f"错误详情: {error_str}")
+            logger.error("处理策略: 等待交易时间检查线程自动重连")
+        
+        # 记录当前系统状态
+        if hasattr(self, 'last_data_time') and self.last_data_time:
+            time_since_last_data = datetime.now() - self.last_data_time
+            logger.error(f"距离最后数据接收: {time_since_last_data}")
+        else:
+            logger.error("最后数据接收: 无数据")
+        
+        # 记录线程状态
+        logger.error(f"心跳线程状态: {'运行中' if not self.stop_heartbeat else '已停止'}")
+        logger.error(f"保存线程状态: {'运行中' if not self.stop_save else '已停止'}")
+        logger.error(f"监控线程状态: {'运行中' if not self.stop_monitor else '已停止'}")
+        
+        logger.error("=" * 60)
+        
+        # 移除心跳相关处理 - JVQuant服务器不支持心跳
+        # def delayed_stop_heartbeat():
+        #     time.sleep(2)  # 等待2秒
+        #     if not self.is_connected:
+        #         self.stop_heartbeat = True
+        #         logger.info("延迟停止心跳线程")
+        # 
+        # threading.Thread(target=delayed_stop_heartbeat, daemon=True).start()
     
     def on_close(self, ws, code, msg):
         """连接关闭回调"""
-        logger.info(f"WebSocket连接已关闭: {code} - {msg}")
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        logger.error(f"[{current_time}] WebSocket连接已关闭")
+        logger.error(f"关闭代码: {code}")
+        logger.error(f"关闭消息: {msg}")
+        logger.error(f"连接状态: 已断开")
+        logger.error(f"数据接收计数: {self.data_receive_count}")
+        
+        # 分析关闭代码
+        if code == 1000:
+            logger.error("关闭分析: 正常关闭")
+            logger.error("可能原因: 服务器主动关闭、客户端主动断开")
+        elif code == 1001:
+            logger.error("关闭分析: 端点离开")
+            logger.error("可能原因: 服务器关闭、网络中断")
+        elif code == 1002:
+            logger.error("关闭分析: 协议错误")
+            logger.error("可能原因: 协议版本不匹配、消息格式错误")
+        elif code == 1003:
+            logger.error("关闭分析: 不支持的数据类型")
+            logger.error("可能原因: 消息类型不支持")
+        elif code == 1006:
+            logger.error("关闭分析: 异常关闭")
+            logger.error("可能原因: 网络中断、服务器崩溃")
+        elif code == 1009:
+            logger.error("关闭分析: 消息过大")
+            logger.error("可能原因: 单条消息超过限制")
+        elif code == 1011:
+            logger.error("关闭分析: 服务器错误")
+            logger.error("可能原因: 服务器内部错误")
+        else:
+            logger.error(f"关闭分析: 未知关闭代码 {code}")
+        
+        # 记录当前系统状态
+        if hasattr(self, 'last_data_time') and self.last_data_time:
+            time_since_last_data = datetime.now() - self.last_data_time
+            logger.error(f"距离最后数据接收: {time_since_last_data}")
+        else:
+            logger.error("最后数据接收: 无数据")
+        
+        # 记录线程状态
+        # logger.error(f"心跳线程状态: 已停止")  # 移除心跳线程状态
+        logger.error(f"保存线程状态: 已停止")
+        logger.error(f"监控线程状态: {'运行中' if not self.stop_monitor else '已停止'}")
+        
+        logger.error("=" * 60)
+        
         self.is_connected = False
         self.stop_save = True
-        self.stop_heartbeat = True
+        # self.stop_heartbeat = True  # 移除心跳停止
     
     def start_auto_save(self):
         """启动自动保存线程"""
@@ -710,12 +998,13 @@ class ETF159506CacheWebSocketClient:
         self.save_thread.start()
         logger.info("自动保存线程已启动")
     
-    def start_heartbeat(self, ws):
-        """启动心跳线程"""
-        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, args=(ws,))
-        self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
-        logger.info("心跳线程已启动")
+    # 移除心跳机制 - JVQuant服务器不支持心跳
+    # def start_heartbeat(self, ws):
+    #     """启动心跳线程"""
+    #     self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, args=(ws,))
+    #     self.heartbeat_thread.daemon = True
+    #     self.heartbeat_thread.start()
+    #     logger.info("心跳线程已启动")
     
     def start_diagnostic_monitor(self):
         """启动诊断监控线程"""
@@ -724,11 +1013,19 @@ class ETF159506CacheWebSocketClient:
         self.monitor_thread.start()
         logger.info("诊断监控线程已启动")
     
+    def start_trading_time_check(self):
+        """启动交易时间检查线程"""
+        if self.enable_trading_time_control and self.trading_time_manager:
+            self.trading_time_thread = threading.Thread(target=self.trading_time_check_loop)
+            self.trading_time_thread.daemon = True
+            self.trading_time_thread.start()
+            logger.info("交易时间检查线程已启动")
+    
     def diagnostic_monitor_loop(self):
         """诊断监控循环"""
         while not self.stop_monitor:
             try:
-                time.sleep(300)  # 每5分钟输出一次诊断状态
+                time.sleep(60)  # 每1分钟输出一次诊断状态（提高监控频率）
                 
                 if not self.stop_monitor:
                     self.print_diagnostic_status()
@@ -737,10 +1034,43 @@ class ETF159506CacheWebSocketClient:
                 logger.error(f"诊断监控循环错误: {e}")
                 break
     
+    def trading_time_check_loop(self):
+        """交易时间检查循环"""
+        while not self.stop_trading_time_check:
+            try:
+                time.sleep(self.trading_time_check_interval)
+                
+                if not self.stop_trading_time_check and self.trading_time_manager:
+                    current_status = self.trading_time_manager.get_trading_status()
+                    
+                    # 如果当前是交易时间但未连接，则连接
+                    if current_status['is_trading_time'] and not self.is_connected:
+                        logger.info(f"检测到交易时间，开始连接: {current_status['current_time']}")
+                        # 重置停止标志
+                        self.stop_heartbeat = False
+                        self.stop_save = False
+                        self.stop_monitor = False
+                        self.connect()
+                    
+                    # 如果当前不是交易时间但已连接，则断开
+                    elif not current_status['is_trading_time'] and self.is_connected:
+                        logger.info(f"检测到非交易时间，断开连接: {current_status['current_time']}")
+                        logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
+                        self.disconnect()
+                    
+                    # 每5分钟输出一次交易时间状态
+                    if int(time.time()) % 300 == 0:  # 5分钟 = 300秒
+                        logger.info(f"交易时间状态: {current_status}")
+                    
+            except Exception as e:
+                logger.error(f"交易时间检查循环错误: {e}")
+                break
+    
     def print_diagnostic_status(self):
         """打印诊断状态信息"""
         runtime = datetime.now() - self.start_time
         last_data_ago = "无数据" if not self.last_data_time else str(datetime.now() - self.last_data_time)
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # 获取Cache状态
         cache_status = self.cache_manager.get_latest_data()
@@ -760,40 +1090,64 @@ class ETF159506CacheWebSocketClient:
         if latest_trade:
             trade_price = f"成交价: {float(latest_trade.price):.4f}"
         
+        # 基础状态信息
         status = f"""
-=== WebSocket Cache诊断状态 ===
-运行时间: {runtime}
-连接状态: {'已连接' if self.is_connected else '未连接'}
+============================================================
+[{current_time}] 详细状态信息:
+连接状态: {self.is_connected}
 连接次数: {self.connection_count}
 断开次数: {self.disconnection_count}
 数据接收: {self.data_receive_count} 条
-最后数据: {last_data_ago} 前
+交易时间控制: {'启用' if self.enable_trading_time_control else '禁用'}"""
+        
+        # 如果连接状态为False，添加详细的调试信息
+        if not self.is_connected:
+            status += f"""
+⚠️  连接断开状态详细分析:
+  断开时间: {current_time}
+  运行时间: {runtime}
+  最后数据接收: {last_data_ago} 前
+  线程状态:
+    # 心跳线程: {'运行中' if not self.stop_heartbeat else '已停止'}  # 移除心跳线程状态
+    保存线程: {'运行中' if not self.stop_save else '已停止'}
+    监控线程: {'运行中' if not self.stop_monitor else '已停止'}
+    交易时间检查线程: {'运行中' if not self.stop_trading_time_check else '已停止'}
+  
+  连接历史:
+    总连接次数: {self.connection_count}
+    总断开次数: {self.disconnection_count}
+    连接成功率: {(self.connection_count/(self.connection_count + self.disconnection_count)*100) if (self.connection_count + self.disconnection_count) > 0 else 0.0:.1f}%
+  
+  数据统计:
+    累计接收数据: {self.data_receive_count} 条
+    平均数据接收率: {self.data_receive_count/max(runtime.total_seconds()/3600, 1):.1f} 条/小时"""
+        
+        # 添加交易时间状态
+        if self.trading_time_manager:
+            trading_status = self.trading_time_manager.get_trading_status()
+            status += f"""
+交易时间状态:
+  当前时间: {trading_status['current_time']}
+  是否为交易日: {trading_status['is_trading_day']}
+  是否为交易时间: {trading_status['is_trading_time']}
+  下一个交易时间: {trading_status['next_trading_time']}
+  距离下次交易: {trading_status['time_until_next']}"""
+        
+        # 添加Cache统计
+        status += f"""
 Cache统计:
   总tick数: {cache_status.get('tick_count', 0)}
-  总K线数: {cache_status.get('bar_count', 0)}
   报价数: {cache_status.get('quote_count', 0)}
   交易数: {cache_status.get('trade_count', 0)}
-最新数据:
-  {trade_price}
-  {spread_info}
-===============================
-"""
+最新数据: {trade_price}, {spread_info}
+============================================================"""
+        
         logger.info(status)
     
-    def heartbeat_loop(self, ws):
-        """心跳循环"""
-        while not self.stop_heartbeat and self.is_connected:
-            try:
-                time.sleep(self.heartbeat_interval)
-                
-                if not self.stop_heartbeat and self.is_connected:
-                    heartbeat_msg = "ping"
-                    ws.send(heartbeat_msg)
-                    logger.debug("发送心跳包")
-                    
-            except Exception as e:
-                logger.error(f"心跳发送失败: {e}")
-                break
+    # 移除心跳机制 - JVQuant服务器不支持心跳
+    # def heartbeat_loop(self, ws):
+    #     """心跳循环"""
+    #     # 完整的心跳循环代码已移除
     
     def auto_save_loop(self):
         """自动保存循环"""
@@ -823,6 +1177,12 @@ Cache统计:
     def get_status(self) -> Dict:
         """获取状态信息"""
         cache_status = self.cache_manager.get_latest_data()
+        
+        # 获取交易时间状态
+        trading_status = None
+        if self.trading_time_manager:
+            trading_status = self.trading_time_manager.get_trading_status()
+        
         return {
             'connected': self.is_connected,
             'stock_code': self.stock_code,
@@ -830,15 +1190,18 @@ Cache统计:
             'disconnection_count': self.disconnection_count,
             'data_receive_count': self.data_receive_count,
             'last_data_time': self.last_data_time.isoformat() if self.last_data_time else None,
-            'cache_status': cache_status
+            'cache_status': cache_status,
+            'trading_time_control_enabled': self.enable_trading_time_control,
+            'trading_status': trading_status
         }
     
     def disconnect(self):
         """断开连接"""
         logger.info("正在断开连接...")
         self.stop_save = True
-        self.stop_heartbeat = True
+        # self.stop_heartbeat = True  # 移除心跳停止
         self.stop_monitor = True
+        self.stop_trading_time_check = True
         if self.ws:
             self.ws.close()
         
@@ -857,16 +1220,19 @@ Cache统计:
         """重连方法"""
         try:
             logger.info("开始重连...")
-            self.stop_heartbeat = True
+            # self.stop_heartbeat = True  # 移除心跳停止
             self.stop_save = True
             self.stop_monitor = True
+            self.stop_trading_time_check = True
             
-            if self.heartbeat_thread:
-                self.heartbeat_thread.join(timeout=2)
+            # if self.heartbeat_thread:  # 移除心跳线程处理
+            #     self.heartbeat_thread.join(timeout=2)
             if self.save_thread:
                 self.save_thread.join(timeout=2)
             if self.monitor_thread:
                 self.monitor_thread.join(timeout=2)
+            if self.trading_time_thread:
+                self.trading_time_thread.join(timeout=2)
             
             self.connect()
             
@@ -883,6 +1249,12 @@ def main():
     REDIS_HOST = "localhost"
     REDIS_PORT = 6379
     
+    # 交易时间控制配置
+    ENABLE_TRADING_TIME_CONTROL = True  # 启用交易时间控制
+    
+    # 高频模式配置
+    HIGH_FREQUENCY_MODE = True  # 启用高频模式
+    
     print("=" * 60)
     print("159506 ETF基于NautilusTrader Cache的实时数据采集器")
     print("=" * 60)
@@ -891,79 +1263,199 @@ def main():
     print(f"Redis持久化: {USE_REDIS}")
     if USE_REDIS:
         print(f"Redis地址: {REDIS_HOST}:{REDIS_PORT}")
+    print(f"交易时间控制: {'启用' if ENABLE_TRADING_TIME_CONTROL else '禁用'}")
     print(f"Catalog路径: catalog/etf_159506_cache")
+    print(f"高频模式: {'启用' if HIGH_FREQUENCY_MODE else '禁用'}")
     print("=" * 60)
     
     # 创建WebSocket客户端
     client = ETF159506CacheWebSocketClient(
-        TOKEN, STOCK_CODE, USE_REDIS, REDIS_HOST, REDIS_PORT
+        TOKEN, STOCK_CODE, USE_REDIS, REDIS_HOST, REDIS_PORT, ENABLE_TRADING_TIME_CONTROL
     )
     
     try:
+        # 如果启用交易时间控制，先检查当前是否为交易时间
+        if ENABLE_TRADING_TIME_CONTROL:
+            trading_manager = TradingTimeManager()
+            current_status = trading_manager.get_trading_status()
+            
+            print(f"当前时间: {current_status['current_time']}")
+            print(f"是否为交易日: {current_status['is_trading_day']}")
+            print(f"是否为交易时间: {current_status['is_trading_time']}")
+            
+            if not current_status['is_trading_time']:
+                print(f"当前非交易时间，下一个交易时间: {current_status['next_trading_time']}")
+                print(f"等待时间: {current_status['time_until_next']}")
+                print("系统将在交易时间自动连接...")
+                
+                # 等待直到交易时间
+                trading_manager.wait_until_trading_time()
+        
         if client.connect():
             print("Cache数据采集系统运行中... 按Ctrl+C退出")
             print("数据将自动保存到Cache和catalog/etf_159506_cache目录")
             
-            while client.is_connected:
-                time.sleep(1)
-                
-                # 每10秒打印一次数据状态
-                if int(time.time()) % 10 == 0:
-                    status = client.get_status()
-                    cache_status = status.get('cache_status', {})
+            # 主循环 - 根据是否启用交易时间控制来决定循环条件
+            if ENABLE_TRADING_TIME_CONTROL:
+                # 启用交易时间控制时，持续运行直到用户中断
+                while True:
+                    time.sleep(0.1)  # 减少到0.1秒检查间隔
                     
-                    # 获取最新价格信息
-                    latest_quote = cache_status.get('latest_quote')
-                    latest_trade = cache_status.get('latest_trade')
+                    # 每5秒打印一次数据状态（提高监控频率）
+                    if int(time.time()) % 5 == 0:
+                        status = client.get_status()
+                        cache_status = status.get('cache_status', {})
+                        trading_status = status.get('trading_status')
+                        
+                        # 获取最新价格信息
+                        latest_quote = cache_status.get('latest_quote')
+                        latest_trade = cache_status.get('latest_trade')
+                        
+                        # 显示价格信息
+                        price_info = ""
+                        if latest_trade:
+                            price_info = f"成交价: {float(latest_trade.price):.4f}"
+                        
+                        if latest_quote:
+                            spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
+                            price_info += f", 价差: {spread:.4f}"
+                        
+                        # 显示交易时间状态
+                        trading_info = ""
+                        if trading_status:
+                            trading_info = f", 交易时间: {'是' if trading_status['is_trading_time'] else '否'}"
+                        
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        print(f"[{current_time}] 数据状态: 连接={status['connected']}, "
+                              f"总tick数={cache_status.get('tick_count', 0)}, "
+                              f"报价数={cache_status.get('quote_count', 0)}, "
+                              f"交易数={cache_status.get('trade_count', 0)}, "
+                              f"{price_info}{trading_info}")
                     
-                    # 显示价格信息
-                    price_info = ""
-                    if latest_trade:
-                        price_info = f"成交价: {float(latest_trade.price):.4f}"
+                    # 每30秒打印一次详细状态信息（提高监控频率）
+                    if int(time.time()) % 30 == 0:
+                        status = client.get_status()
+                        cache_status = status.get('cache_status', {})
+                        trading_status = status.get('trading_status')
+                        
+                        # 获取最新价格信息
+                        latest_quote = cache_status.get('latest_quote')
+                        latest_trade = cache_status.get('latest_trade')
+                        
+                        # 显示价格信息
+                        price_info = ""
+                        if latest_trade:
+                            price_info = f"成交价: {float(latest_trade.price):.4f}"
+                        
+                        if latest_quote:
+                            spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
+                            price_info += f", 价差: {spread:.4f}"
+                        
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        print(f"\n{'='*60}")
+                        print(f"[{current_time}] 详细状态信息:")
+                        print(f"连接状态: {status['connected']}")
+                        print(f"连接次数: {status['connection_count']}")
+                        print(f"断开次数: {status['disconnection_count']}")
+                        print(f"数据接收: {status['data_receive_count']} 条")
+                        print(f"交易时间控制: {'启用' if status['trading_time_control_enabled'] else '禁用'}")
+                        if trading_status:
+                            print(f"交易时间状态:")
+                            print(f"  当前时间: {trading_status['current_time']}")
+                            print(f"  是否为交易日: {trading_status['is_trading_day']}")
+                            print(f"  是否为交易时间: {trading_status['is_trading_time']}")
+                            print(f"  下一个交易时间: {trading_status['next_trading_time']}")
+                            print(f"  距离下次交易: {trading_status['time_until_next']}")
+                        print(f"Cache统计:")
+                        print(f"  总tick数: {cache_status.get('tick_count', 0)}")
+                        print(f"  报价数: {cache_status.get('quote_count', 0)}")
+                        print(f"  交易数: {cache_status.get('trade_count', 0)}")
+                        print(f"最新数据: {price_info}")
+                        print(f"{'='*60}\n")
                     
-                    if latest_quote:
-                        spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
-                        price_info += f", 价差: {spread:.4f}"
+                    # 检查用户中断
+                    try:
+                        # 这里可以添加其他检查逻辑
+                        pass
+                    except KeyboardInterrupt:
+                        raise
+            else:
+                # 不启用交易时间控制时，只在连接状态下运行
+                while client.is_connected:
+                    time.sleep(0.1)  # 减少到0.1秒检查间隔
                     
-                    current_time = datetime.now().strftime('%H:%M:%S')
-                    print(f"[{current_time}] 数据状态: 连接={status['connected']}, "
-                          f"总tick数={cache_status.get('tick_count', 0)}, "
-                          f"报价数={cache_status.get('quote_count', 0)}, "
-                          f"交易数={cache_status.get('trade_count', 0)}, "
-                          f"{price_info}")
-                
-                # 每1分钟打印一次详细状态信息
-                if int(time.time()) % 60 == 0:
-                    status = client.get_status()
-                    cache_status = status.get('cache_status', {})
+                    # 每5秒打印一次数据状态（提高监控频率）
+                    if int(time.time()) % 5 == 0:
+                        status = client.get_status()
+                        cache_status = status.get('cache_status', {})
+                        trading_status = status.get('trading_status')
+                        
+                        # 获取最新价格信息
+                        latest_quote = cache_status.get('latest_quote')
+                        latest_trade = cache_status.get('latest_trade')
+                        
+                        # 显示价格信息
+                        price_info = ""
+                        if latest_trade:
+                            price_info = f"成交价: {float(latest_trade.price):.4f}"
+                        
+                        if latest_quote:
+                            spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
+                            price_info += f", 价差: {spread:.4f}"
+                        
+                        # 显示交易时间状态
+                        trading_info = ""
+                        if trading_status:
+                            trading_info = f", 交易时间: {'是' if trading_status['is_trading_time'] else '否'}"
+                        
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        print(f"[{current_time}] 数据状态: 连接={status['connected']}, "
+                              f"总tick数={cache_status.get('tick_count', 0)}, "
+                              f"报价数={cache_status.get('quote_count', 0)}, "
+                              f"交易数={cache_status.get('trade_count', 0)}, "
+                              f"{price_info}{trading_info}")
                     
-                    # 获取最新价格信息
-                    latest_quote = cache_status.get('latest_quote')
-                    latest_trade = cache_status.get('latest_trade')
+                    # 每30秒打印一次详细状态信息（提高监控频率）
+                    if int(time.time()) % 30 == 0:
+                        status = client.get_status()
+                        cache_status = status.get('cache_status', {})
+                        trading_status = status.get('trading_status')
+                        
+                        # 获取最新价格信息
+                        latest_quote = cache_status.get('latest_quote')
+                        latest_trade = cache_status.get('latest_trade')
+                        
+                        # 显示价格信息
+                        price_info = ""
+                        if latest_trade:
+                            price_info = f"成交价: {float(latest_trade.price):.4f}"
+                        
+                        if latest_quote:
+                            spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
+                            price_info += f", 价差: {spread:.4f}"
+                        
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        print(f"\n{'='*60}")
+                        print(f"[{current_time}] 详细状态信息:")
+                        print(f"连接状态: {status['connected']}")
+                        print(f"连接次数: {status['connection_count']}")
+                        print(f"断开次数: {status['disconnection_count']}")
+                        print(f"数据接收: {status['data_receive_count']} 条")
+                        print(f"交易时间控制: {'启用' if status['trading_time_control_enabled'] else '禁用'}")
+                        if trading_status:
+                            print(f"交易时间状态:")
+                            print(f"  当前时间: {trading_status['current_time']}")
+                            print(f"  是否为交易日: {trading_status['is_trading_day']}")
+                            print(f"  是否为交易时间: {trading_status['is_trading_time']}")
+                            print(f"  下一个交易时间: {trading_status['next_trading_time']}")
+                            print(f"  距离下次交易: {trading_status['time_until_next']}")
+                        print(f"Cache统计:")
+                        print(f"  总tick数: {cache_status.get('tick_count', 0)}")
+                        print(f"  报价数: {cache_status.get('quote_count', 0)}")
+                        print(f"  交易数: {cache_status.get('trade_count', 0)}")
+                        print(f"最新数据: {price_info}")
+                        print(f"{'='*60}\n")
                     
-                    # 显示价格信息
-                    price_info = ""
-                    if latest_trade:
-                        price_info = f"成交价: {float(latest_trade.price):.4f}"
-                    
-                    if latest_quote:
-                        spread = float(latest_quote.ask_price) - float(latest_quote.bid_price)
-                        price_info += f", 价差: {spread:.4f}"
-                    
-                    current_time = datetime.now().strftime('%H:%M:%S')
-                    print(f"\n{'='*60}")
-                    print(f"[{current_time}] 详细状态信息:")
-                    print(f"连接状态: {status['connected']}")
-                    print(f"连接次数: {status['connection_count']}")
-                    print(f"断开次数: {status['disconnection_count']}")
-                    print(f"数据接收: {status['data_receive_count']} 条")
-                    print(f"Cache统计:")
-                    print(f"  总tick数: {cache_status.get('tick_count', 0)}")
-                    print(f"  报价数: {cache_status.get('quote_count', 0)}")
-                    print(f"  交易数: {cache_status.get('trade_count', 0)}")
-                    print(f"最新数据: {price_info}")
-                    print(f"{'='*60}\n")
-                
     except KeyboardInterrupt:
         print("\n用户中断，正在保存数据...")
         client.disconnect()

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 """
-159506 ETF Catalog数据加载器
-专门用于加载和分析159506 ETF的catalog数据，支持回测和数据分析
-支持从Redis读取实时数据并生成K线图
+159506 ETF Redis K线生成器
+专门用于从Redis读取实时数据并生成K线图
 """
 
 import pandas as pd
@@ -11,12 +10,17 @@ import numpy as np
 from pathlib import Path
 import json
 import matplotlib.pyplot as plt
+import mplfinance as mpf
 import seaborn as sns
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 import logging
 import time
 import threading
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
 # Redis连接检测
 REDIS_AVAILABLE = False
@@ -25,7 +29,7 @@ try:
     REDIS_AVAILABLE = True
     print("[Redis] redis-py已安装，支持Redis数据读取")
 except ImportError:
-    print("[Redis] 未安装redis-py，将使用文件数据模式")
+    print("[Redis] 未安装redis-py，无法使用Redis功能")
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -55,18 +59,19 @@ try:
     print("[NautilusTrader] 已安装，支持Redis数据读取和K线生成")
 except ImportError as e:
     print(f"[NautilusTrader] 未安装或导入失败: {e}")
-    print("[NautilusTrader] 将使用文件数据模式")
+    print("[NautilusTrader] 无法使用Redis功能")
 
 
 class ETF159506RedisKlineGenerator:
     """159506 ETF Redis K线生成器"""
     
-    def __init__(self, redis_host: str = "localhost", redis_port: int = 6379):
+    def __init__(self, redis_host: str = "localhost", redis_port: int = 6379, catalog_path: str = "catalog/etf_159506_cache"):
         if not REDIS_AVAILABLE or not NAUTILUS_AVAILABLE:
             raise RuntimeError("Redis或NautilusTrader不可用")
         
         self.redis_host = redis_host
         self.redis_port = redis_port
+        self.catalog_path = Path(catalog_path)
         self.cache = None
         self.instrument_id = None
         self.clock = LiveClock()
@@ -81,6 +86,7 @@ class ETF159506RedisKlineGenerator:
         self.last_update_time = None
         
         logger.info(f"Redis K线生成器初始化完成: {redis_host}:{redis_port}")
+        logger.info(f"Catalog路径: {self.catalog_path}")
     
     def _init_redis_cache(self):
         """初始化Redis Cache"""
@@ -141,12 +147,16 @@ class ETF159506RedisKlineGenerator:
             latest_quote = self.cache.quote_tick(self.instrument_id)
             latest_trade = self.cache.trade_tick(self.instrument_id)
             
+            # 创建BarType用于获取bar_count
+            bar_spec = BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
+            bar_type = BarType(self.instrument_id, bar_spec)
+            
             return {
                 'latest_quote': latest_quote,
                 'latest_trade': latest_trade,
                 'quote_count': self.cache.quote_tick_count(self.instrument_id),
                 'trade_count': self.cache.trade_tick_count(self.instrument_id),
-                'bar_count': self.cache.bar_count(self.instrument_id),
+                'bar_count': self.cache.bar_count(bar_type),
                 'timestamp': datetime.now().isoformat()
             }
         except Exception as e:
@@ -198,521 +208,411 @@ class ETF159506RedisKlineGenerator:
         if len(trade_ticks) == 0:
             return []
         
-        # 根据bar_type的时间窗口来聚合数据
-        # 对于1分钟K线，获取最近1分钟的数据
-        current_time = trade_ticks[-1].ts_event
-        window_start = current_time - (60 * 1_000_000_000)  # 1分钟 = 60秒 * 10^9纳秒
+        # 获取当前时间
+        current_time = self.clock.timestamp_ns()
+        
+        # 根据bar_type确定时间窗口
+        if bar_type.spec.aggregation == BarAggregation.MINUTE:
+            window_ns = 60 * 1_000_000_000  # 1分钟
+        elif bar_type.spec.aggregation == BarAggregation.HOUR:
+            window_ns = 60 * 60 * 1_000_000_000  # 1小时
+        elif bar_type.spec.aggregation == BarAggregation.DAY:
+            window_ns = 24 * 60 * 60 * 1_000_000_000  # 1天
+        else:
+            window_ns = 60 * 1_000_000_000  # 默认1分钟
         
         # 过滤时间窗口内的数据
+        window_start = current_time - window_ns
         window_trades = [tick for tick in trade_ticks if tick.ts_event >= window_start]
-        
-        # 如果数据量过大，进一步限制
-        max_records = 100
-        if len(window_trades) > max_records:
-            window_trades = window_trades[-max_records:]
         
         return window_trades
     
     def get_kline_data(self, limit: int = 100) -> List[Dict]:
         """获取K线数据"""
         try:
-            bars = self.cache.bars(self.instrument_id)[-limit:]
+            # 首先尝试从Redis获取数据
+            if self.cache:
+                # 获取交易tick数据
+                trade_ticks = self.cache.trade_ticks(self.instrument_id)
+                if len(trade_ticks) > 0:
+                    # 转换为K线数据格式
+                    kline_data = []
+                    for tick in trade_ticks[-limit:]:
+                        kline_data.append({
+                            'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+                            'price': float(tick.price),
+                            'volume': int(tick.size),
+                            'trade_id': str(tick.trade_id)
+                        })
+                    return kline_data
             
-            kline_data = []
-            for bar in bars:
-                kline_data.append({
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'open': float(bar.open),
-                    'high': float(bar.high),
-                    'low': float(bar.low),
-                    'close': float(bar.close),
-                    'volume': int(bar.volume),
-                    'bar_type': str(bar.bar_type)
-                })
-            
-            return kline_data
+            # 如果Redis没有数据，尝试从catalog文件读取
+            return self._get_kline_from_catalog()
             
         except Exception as e:
             logger.error(f"获取K线数据失败: {e}")
             return []
     
+    def _get_kline_from_catalog(self) -> List[Dict]:
+        """从catalog文件获取K线数据"""
+        try:
+            if not self.catalog_path.exists():
+                logger.warning(f"Catalog路径不存在: {self.catalog_path}")
+                return []
+            
+            # 查找最新的parquet文件
+            parquet_files = list(self.catalog_path.glob("*.parquet"))
+            if not parquet_files:
+                logger.warning(f"Catalog目录中没有parquet文件: {self.catalog_path}")
+                return []
+            
+            # 按修改时间排序，获取最新文件
+            latest_file = max(parquet_files, key=lambda x: x.stat().st_mtime)
+            logger.info(f"从文件读取数据: {latest_file}")
+            
+            # 读取数据
+            df = pd.read_parquet(latest_file)
+            
+            # 转换为K线数据格式
+            kline_data = []
+            for _, row in df.iterrows():
+                kline_data.append({
+                    'timestamp': row['timestamp'],
+                    'price': float(row['price']) if pd.notna(row['price']) else None,
+                    'volume': int(row['size']) if pd.notna(row['size']) else 0,
+                    'trade_id': str(row.get('trade_id', ''))
+                })
+            
+            return kline_data
+            
+        except Exception as e:
+            logger.error(f"从catalog文件读取数据失败: {e}")
+            return []
+    
+    def get_today_kline_data(self) -> List[Dict]:
+        """获取今日K线数据"""
+        try:
+            today = datetime.now().date()
+            all_data = []
+            
+            # 首先尝试从Redis获取今日数据
+            if self.cache:
+                try:
+                    # 获取交易tick数据
+                    trade_ticks = self.cache.trade_ticks(self.instrument_id)
+                    if len(trade_ticks) > 0:
+                        # 过滤今日数据
+                        for tick in trade_ticks:
+                            tick_time = pd.to_datetime(tick.ts_event, unit='ns')
+                            if tick_time.date() == today:
+                                all_data.append({
+                                    'timestamp': tick_time,
+                                    'price': float(tick.price),
+                                    'volume': int(tick.size),
+                                    'trade_id': str(tick.trade_id),
+                                    'source': 'redis'
+                                })
+                        
+                        logger.info(f"从Redis获取到 {len(all_data)} 条今日数据")
+                except Exception as e:
+                    logger.warning(f"从Redis获取数据失败: {e}")
+            
+            # 从catalog文件补充数据
+            catalog_data = self._get_today_data_from_catalog()
+            if catalog_data:
+                # 过滤掉Redis中已有的数据（避免重复）
+                redis_times = {item['timestamp'] for item in all_data}
+                for item in catalog_data:
+                    if item['timestamp'] not in redis_times:
+                        item['source'] = 'catalog'
+                        all_data.append(item)
+                
+                logger.info(f"从catalog补充 {len(catalog_data)} 条数据")
+            
+            # 按时间排序
+            all_data.sort(key=lambda x: x['timestamp'])
+            
+            logger.info(f"总共获取到 {len(all_data)} 条今日数据")
+            return all_data
+            
+        except Exception as e:
+            logger.error(f"获取今日K线数据失败: {e}")
+            return []
+    
+    def _get_today_data_from_catalog(self) -> List[Dict]:
+        """从catalog文件获取今日数据"""
+        try:
+            if not self.catalog_path.exists():
+                logger.warning(f"Catalog路径不存在: {self.catalog_path}")
+                return []
+            
+            # 查找所有parquet文件
+            parquet_files = list(self.catalog_path.glob("*.parquet"))
+            if not parquet_files:
+                logger.warning(f"Catalog目录中没有parquet文件: {self.catalog_path}")
+                return []
+            
+            # 获取今日日期
+            today = datetime.now().date()
+            logger.info(f"查找今日({today})的数据文件...")
+            
+            # 读取所有文件并合并数据
+            all_dataframes = []
+            today_files = []
+            
+            for file_path in parquet_files:
+                try:
+                    # 读取数据
+                    df = pd.read_parquet(file_path)
+                    
+                    # 确保timestamp列存在
+                    if 'timestamp' not in df.columns:
+                        continue
+                    
+                    # 转换timestamp
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    
+                    # 检查是否需要时区转换
+                    if df['timestamp'].dt.tz is None:
+                        # 假设数据是UTC时间，转换为北京时间
+                        import pytz
+                        utc_tz = pytz.UTC
+                        beijing_tz = pytz.timezone('Asia/Shanghai')
+                        
+                        # 添加UTC时区信息
+                        df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                        # 转换为北京时间
+                        df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                    
+                    # 检查是否包含今日数据
+                    file_dates = df['timestamp'].dt.date.unique()
+                    if today in file_dates:
+                        all_dataframes.append(df)
+                        today_files.append(file_path.name)
+                        logger.info(f"找到今日数据文件: {file_path.name}")
+                
+                except Exception as e:
+                    logger.warning(f"读取文件 {file_path} 失败: {e}")
+                    continue
+            
+            if not all_dataframes:
+                logger.warning(f"没有找到今日({today})的数据文件")
+                return []
+            
+            # 合并所有数据
+            combined_df = pd.concat(all_dataframes, ignore_index=True)
+            logger.info(f"合并了 {len(today_files)} 个文件的数据")
+            
+            # 去重（按timestamp和trade_id）
+            combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
+            logger.info(f"去重后数据量: {len(combined_df)} 条")
+            
+            # 过滤今日数据（使用北京时间）
+            today_data = combined_df[combined_df['timestamp'].dt.date == today]
+            
+            if today_data.empty:
+                logger.warning(f"合并后没有今日({today})的数据")
+                return []
+            
+            logger.info(f"读取到 {len(today_data)} 条今日数据")
+            
+            # 转换为K线数据格式 - 只处理trade类型的数据
+            kline_data = []
+            for _, row in today_data.iterrows():
+                if row['type'] == 'trade' and pd.notna(row['price']):
+                    kline_data.append({
+                        'timestamp': row['timestamp'],
+                        'price': float(row['price']),
+                        'volume': int(row['size']) if pd.notna(row['size']) else 0,
+                        'trade_id': str(row.get('trade_id', ''))
+                    })
+            
+            logger.info(f"从文件读取到 {len(kline_data)} 条今日交易数据")
+            return kline_data
+            
+        except Exception as e:
+            logger.error(f"从catalog文件读取今日数据失败: {e}")
+            return []
+    
     def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True):
         """创建实时K线图"""
-        if not auto_refresh:
+        if auto_refresh:
+            self._start_realtime_chart(save_path)
+        else:
             self._plot_kline_chart(save_path)
-            return
-        
-        # 实时更新模式
-        self._start_realtime_chart(save_path)
     
     def _plot_kline_chart(self, save_path: str = None):
-        """绘制K线图"""
+        """绘制今日价格走势图"""
         try:
-            kline_data = self.get_kline_data(100)  # 获取最近100根K线
+            # 获取今日数据
+            kline_data = self.get_today_kline_data()
             
             if not kline_data:
-                logger.warning("没有K线数据可绘制")
+                logger.warning("没有今日数据可绘制")
                 return
             
+            # 转换为DataFrame
             df = pd.DataFrame(kline_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
             
-            # 创建K线图
-            fig, axes = plt.subplots(2, 1, figsize=(15, 10))
-            fig.suptitle('159506 ETF 实时K线图', fontsize=16)
+            # 检查是否需要时区转换
+            if df['timestamp'].dt.tz is None:
+                # 假设是UTC时间，转换为北京时间
+                import pytz
+                utc_tz = pytz.UTC
+                beijing_tz = pytz.timezone('Asia/Shanghai')
+                
+                # 添加UTC时区信息
+                df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                # 转换为北京时间
+                df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                logger.info("已将UTC时间转换为北京时间")
             
-            # K线图
-            ax1 = axes[0]
-            self._plot_candlestick(ax1, df)
-            ax1.set_title('K线图')
+            df = df.sort_values('timestamp')
+            
+            # 检查数据时间范围
+            start_time = df['timestamp'].min()
+            end_time = df['timestamp'].max()
+            logger.info(f"数据时间范围: {start_time} 到 {end_time}")
+            logger.info(f"数据条数: {len(df)}")
+            
+            # 过滤交易时间内的数据（9:30-15:00）
+            from datetime import time as datetime_time
+            trading_start = datetime_time(9, 30)
+            trading_end = datetime_time(15, 0)
+            
+            trading_data = df[
+                (df['timestamp'].dt.time >= trading_start) & 
+                (df['timestamp'].dt.time <= trading_end)
+            ]
+            
+            if len(trading_data) == 0:
+                logger.warning("没有交易时间内的数据可绘制")
+                return
+            
+            logger.info(f"交易时间内的数据: {len(trading_data)} 条")
+            
+            # 使用交易数据的时间作为索引
+            trading_data = trading_data.set_index('timestamp')
+            
+            # 直接使用原始数据，不进行reindex操作
+            complete_df = trading_data.copy()
+            
+            # 获取时间范围用于图表显示
+            data_start = complete_df.index.min()
+            data_end = complete_df.index.max()
+            
+            # 创建图表
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), height_ratios=[3, 1])
+            
+            # 设置标题 - 显示交易时间内的北京时间
+            import pytz
+            beijing_tz = pytz.timezone('Asia/Shanghai')
+            beijing_now = datetime.now(beijing_tz)
+            today_str = beijing_now.strftime('%Y-%m-%d')
+            time_range_str = f"{data_start.strftime('%H:%M')} - {data_end.strftime('%H:%M')}"
+            fig.suptitle(f'159506 ETF 今日交易时间价格走势 ({today_str} {time_range_str} 北京时间)', fontsize=16)
+            
+            # 绘制价格走势
+            ax1.plot(complete_df.index, complete_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
+            
+            # 标记关键价格点
+            valid_prices = complete_df['price'].dropna()
+            if len(valid_prices) > 0:
+                # 开盘价（第一个有效价格）
+                open_price = valid_prices.iloc[0]
+                open_time = valid_prices.index[0]
+                ax1.scatter(open_time, open_price, color='green', s=100, marker='o', label='开盘')
+                
+                # 当前价（最后一个有效价格）
+                current_price = valid_prices.iloc[-1]
+                current_time = valid_prices.index[-1]
+                ax1.scatter(current_time, current_price, color='red', s=100, marker='o', label='当前')
+                
+                # 最高价
+                high_price = valid_prices.max()
+                high_time = valid_prices.idxmax()
+                ax1.scatter(high_time, high_price, color='orange', s=80, marker='^', label='最高')
+                
+                # 最低价
+                low_price = valid_prices.min()
+                low_time = valid_prices.idxmin()
+                ax1.scatter(low_time, low_price, color='purple', s=80, marker='v', label='最低')
+                
+                # 添加价格信息 - 显示北京时间
+                price_info = f'开盘: {open_price:.4f} ({open_time.strftime("%H:%M")})\n'
+                price_info += f'当前: {current_price:.4f} ({current_time.strftime("%H:%M")})\n'
+                price_info += f'最高: {high_price:.4f} ({high_time.strftime("%H:%M")})\n'
+                price_info += f'最低: {low_price:.4f} ({low_time.strftime("%H:%M")})'
+                
+                ax1.text(0.02, 0.98, price_info, 
+                       transform=ax1.transAxes, verticalalignment='top', 
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            ax1.set_title('价格走势 (北京时间)')
             ax1.set_ylabel('价格')
             ax1.grid(True, alpha=0.3)
+            ax1.legend()
             
-            # 成交量图
-            ax2 = axes[1]
-            ax2.bar(df['timestamp'], df['volume'], alpha=0.6, width=0.001)
-            ax2.set_title('成交量')
+            # 设置x轴格式 - 显示北京时间
+            ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=15))  # 每15分钟一个刻度
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # 添加x轴标签
+            ax1.set_xlabel('时间 (北京时间)')
+            
+            # 绘制成交量
+            ax2.bar(complete_df.index, complete_df['volume'], alpha=0.6, color='blue', width=0.0001)
+            ax2.set_title('成交量 (北京时间)')
             ax2.set_ylabel('成交量')
-            ax2.set_xlabel('时间')
+            ax2.set_xlabel('时间 (北京时间)')
             ax2.grid(True, alpha=0.3)
+            
+            # 设置x轴格式 - 显示北京时间
+            ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=15))  # 每15分钟一个刻度
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
             plt.tight_layout()
             
             if save_path:
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                logger.info(f"K线图已保存到: {save_path}")
+                logger.info(f"价格走势图已保存到: {save_path}")
             
             plt.show()
             
         except Exception as e:
-            logger.error(f"绘制K线图失败: {e}")
-    
-    def _plot_candlestick(self, ax, df):
-        """绘制蜡烛图"""
-        for i, row in df.iterrows():
-            timestamp = row['timestamp']
-            open_price = row['open']
-            high_price = row['high']
-            low_price = row['low']
-            close_price = row['close']
-            
-            # 判断涨跌
-            if close_price >= open_price:
-                color = 'red'  # 上涨
-                body_bottom = open_price
-                body_top = close_price
-            else:
-                color = 'green'  # 下跌
-                body_bottom = close_price
-                body_top = open_price
-            
-            # 绘制实体
-            ax.bar(timestamp, body_top - body_bottom, bottom=body_bottom, 
-                   color=color, alpha=0.7, width=0.0005)
-            
-            # 绘制影线
-            ax.plot([timestamp, timestamp], [low_price, high_price], 
-                   color='black', linewidth=1)
+            logger.error(f"绘制价格走势图失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
     
     def _start_realtime_chart(self, save_path: str = None):
         """启动实时图表更新"""
         def update_chart():
             while True:
                 try:
-                    # 生成新的K线
-                    bar_spec = BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST)
-                    bar_type = BarType(self.instrument_id, bar_spec)
-                    
-                    new_bar = self.generate_kline_from_ticks(bar_type)
-                    if new_bar:
-                        self.cache.add_bar(new_bar)
-                        logger.info(f"生成新K线: {float(new_bar.close):.4f}")
-                    
-                    # 更新图表
+                    time.sleep(30)  # 每30秒更新一次
                     self._plot_kline_chart(save_path)
-                    
-                    # 等待1分钟
-                    time.sleep(60)
-                    
-                except KeyboardInterrupt:
-                    logger.info("实时图表更新已停止")
-                    break
+                    logger.info("实时K线图已更新")
                 except Exception as e:
                     logger.error(f"实时图表更新失败: {e}")
-                    time.sleep(10)
+                    break
         
-        # 在后台线程中运行
-        chart_thread = threading.Thread(target=update_chart, daemon=True)
-        chart_thread.start()
+        # 启动更新线程
+        update_thread = threading.Thread(target=update_chart, daemon=True)
+        update_thread.start()
         logger.info("实时K线图更新已启动")
-
-
-class ETF159506CatalogLoader:
-    """159506 ETF Catalog数据加载器"""
-    
-    def __init__(self, catalog_path: str = "catalog/etf_159506"):
-        self.catalog_path = Path(catalog_path)
-        self.metadata = None
-        self.data_files = []
-        
-        logger.info(f"初始化159506 ETF Catalog加载器: {self.catalog_path}")
-        
-        # 检查目录是否存在
-        if not self.catalog_path.exists():
-            logger.warning(f"Catalog目录不存在: {self.catalog_path}")
-            return
-        
-        # 加载元数据
-        self._load_metadata()
-        
-        # 扫描数据文件
-        self._scan_data_files()
-    
-    def _load_metadata(self):
-        """加载元数据"""
-        metadata_file = self.catalog_path / 'metadata.json'
-        if metadata_file.exists():
-            try:
-                with open(metadata_file, 'r', encoding='utf-8') as f:
-                    self.metadata = json.load(f)
-                logger.info(f"加载元数据成功: {self.metadata}")
-            except Exception as e:
-                logger.error(f"加载元数据失败: {e}")
-        else:
-            logger.warning("元数据文件不存在")
-    
-    def _scan_data_files(self):
-        """扫描数据文件"""
-        try:
-            # 查找所有parquet文件
-            parquet_files = list(self.catalog_path.glob("*.parquet"))
-            self.data_files = sorted(parquet_files)
-            
-            logger.info(f"找到 {len(self.data_files)} 个数据文件")
-            for file in self.data_files:
-                logger.info(f"  - {file.name}")
-                
-        except Exception as e:
-            logger.error(f"扫描数据文件失败: {e}")
-    
-    def get_data_files_info(self) -> List[Dict]:
-        """获取数据文件信息"""
-        file_info = []
-        
-        for file in self.data_files:
-            try:
-                # 读取文件基本信息
-                df = pd.read_parquet(file)
-                
-                info = {
-                    'filename': file.name,
-                    'filepath': str(file),
-                    'size_mb': file.stat().st_size / (1024 * 1024),
-                    'records': len(df),
-                    'start_time': df['timestamp'].min() if 'timestamp' in df.columns else None,
-                    'end_time': df['timestamp'].max() if 'timestamp' in df.columns else None,
-                    'columns': list(df.columns)
-                }
-                file_info.append(info)
-                
-            except Exception as e:
-                logger.error(f"读取文件信息失败 {file.name}: {e}")
-        
-        return file_info
-    
-    def load_all_data(self) -> pd.DataFrame:
-        """加载所有数据"""
-        all_data = []
-        
-        for file in self.data_files:
-            try:
-                logger.info(f"加载数据文件: {file.name}")
-                df = pd.read_parquet(file)
-                all_data.append(df)
-                
-            except Exception as e:
-                logger.error(f"加载文件失败 {file.name}: {e}")
-        
-        if all_data:
-            # 合并所有数据
-            combined_df = pd.concat(all_data, ignore_index=True)
-            
-            # 去重和排序
-            combined_df = combined_df.drop_duplicates(subset=['timestamp', 'stock_code'])
-            combined_df = combined_df.sort_values('timestamp')
-            
-            logger.info(f"数据加载完成: {len(combined_df)} 条记录")
-            return combined_df
-        else:
-            logger.warning("没有数据可加载")
-            return pd.DataFrame()
-    
-    def load_data_by_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """按日期范围加载数据"""
-        try:
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
-            
-            all_data = []
-            
-            for file in self.data_files:
-                try:
-                    df = pd.read_parquet(file)
-                    
-                    # 过滤日期范围
-                    if 'timestamp' in df.columns:
-                        df['timestamp'] = pd.to_datetime(df['timestamp'])
-                        mask = (df['timestamp'] >= start_dt) & (df['timestamp'] <= end_dt)
-                        df_filtered = df[mask]
-                        
-                        if len(df_filtered) > 0:
-                            all_data.append(df_filtered)
-                            
-                except Exception as e:
-                    logger.error(f"加载文件失败 {file.name}: {e}")
-            
-            if all_data:
-                combined_df = pd.concat(all_data, ignore_index=True)
-                combined_df = combined_df.drop_duplicates(subset=['timestamp', 'stock_code'])
-                combined_df = combined_df.sort_values('timestamp')
-                
-                logger.info(f"按日期范围加载数据完成: {len(combined_df)} 条记录")
-                return combined_df
-            else:
-                logger.warning(f"在指定日期范围内没有找到数据: {start_date} 到 {end_date}")
-                return pd.DataFrame()
-                
-        except Exception as e:
-            logger.error(f"按日期范围加载数据失败: {e}")
-            return pd.DataFrame()
-    
-    def analyze_data(self, df: pd.DataFrame) -> Dict:
-        """分析数据"""
-        if df.empty:
-            return {}
-        
-        try:
-            analysis = {
-                'basic_info': {
-                    'total_records': len(df),
-                    'date_range': {
-                        'start': df['timestamp'].min().isoformat(),
-                        'end': df['timestamp'].max().isoformat()
-                    },
-                    'unique_days': df['timestamp'].dt.date.nunique(),
-                    'columns': list(df.columns)
-                },
-                'price_analysis': {
-                    'price_range': {
-                        'min': float(df['price'].min()),
-                        'max': float(df['price'].max()),
-                        'mean': float(df['price'].mean()),
-                        'std': float(df['price'].std())
-                    },
-                    'volume_analysis': {
-                        'total_volume': float(df['volume'].sum()),
-                        'avg_volume': float(df['volume'].mean()),
-                        'max_volume': float(df['volume'].max())
-                    }
-                },
-                'time_analysis': {
-                    'trading_hours': df['timestamp'].dt.hour.value_counts().to_dict(),
-                    'weekday_distribution': df['timestamp'].dt.dayofweek.value_counts().to_dict()
-                }
-            }
-            
-            # 计算价格变化统计
-            if len(df) > 1:
-                df_sorted = df.sort_values('timestamp')
-                price_changes = df_sorted['price'].diff().dropna()
-                
-                analysis['price_analysis']['price_changes'] = {
-                    'positive_changes': int((price_changes > 0).sum()),
-                    'negative_changes': int((price_changes < 0).sum()),
-                    'no_changes': int((price_changes == 0).sum()),
-                    'max_change': float(price_changes.max()),
-                    'min_change': float(price_changes.min()),
-                    'avg_change': float(price_changes.mean())
-                }
-            
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"数据分析失败: {e}")
-            return {}
-    
-    def generate_summary_report(self) -> str:
-        """生成摘要报告"""
-        try:
-            # 获取文件信息
-            file_info = self.get_data_files_info()
-            
-            # 加载所有数据
-            df = self.load_all_data()
-            
-            if df.empty:
-                return "没有数据可分析"
-            
-            # 分析数据
-            analysis = self.analyze_data(df)
-            
-            # 生成报告
-            report = []
-            report.append("=" * 60)
-            report.append("159506 ETF Catalog数据摘要报告")
-            report.append("=" * 60)
-            
-            # 文件信息
-            report.append(f"\n📁 数据文件信息:")
-            report.append(f"   目录: {self.catalog_path}")
-            report.append(f"   文件数量: {len(file_info)}")
-            
-            total_size = sum(info['size_mb'] for info in file_info)
-            total_records = sum(info['records'] for info in file_info)
-            report.append(f"   总大小: {total_size:.2f} MB")
-            report.append(f"   总记录数: {total_records}")
-            
-            # 数据文件详情
-            for info in file_info:
-                report.append(f"   - {info['filename']}: {info['records']} 条记录, {info['size_mb']:.2f} MB")
-            
-            # 基本统计
-            if analysis:
-                basic_info = analysis['basic_info']
-                report.append(f"\n📊 基本统计:")
-                report.append(f"   总记录数: {basic_info['total_records']}")
-                report.append(f"   时间范围: {basic_info['date_range']['start']} 到 {basic_info['date_range']['end']}")
-                report.append(f"   交易日数: {basic_info['unique_days']}")
-                
-                # 价格分析
-                price_analysis = analysis['price_analysis']
-                report.append(f"\n💰 价格分析:")
-                report.append(f"   价格范围: {price_analysis['price_range']['min']:.4f} - {price_analysis['price_range']['max']:.4f}")
-                report.append(f"   平均价格: {price_analysis['price_range']['mean']:.4f}")
-                report.append(f"   价格标准差: {price_analysis['price_range']['std']:.4f}")
-                
-                # 成交量分析
-                volume_analysis = price_analysis['volume_analysis']
-                report.append(f"\n📈 成交量分析:")
-                report.append(f"   总成交量: {volume_analysis['total_volume']:,.0f}")
-                report.append(f"   平均成交量: {volume_analysis['avg_volume']:,.0f}")
-                report.append(f"   最大成交量: {volume_analysis['max_volume']:,.0f}")
-                
-                # 价格变化分析
-                if 'price_changes' in price_analysis:
-                    changes = price_analysis['price_changes']
-                    report.append(f"\n📉 价格变化分析:")
-                    report.append(f"   上涨次数: {changes['positive_changes']}")
-                    report.append(f"   下跌次数: {changes['negative_changes']}")
-                    report.append(f"   平盘次数: {changes['no_changes']}")
-                    report.append(f"   最大涨幅: {changes['max_change']:.4f}")
-                    report.append(f"   最大跌幅: {changes['min_change']:.4f}")
-                    report.append(f"   平均变化: {changes['avg_change']:.4f}")
-            
-            report.append("\n" + "=" * 60)
-            
-            return "\n".join(report)
-            
-        except Exception as e:
-            logger.error(f"生成摘要报告失败: {e}")
-            return f"生成报告失败: {e}"
-    
-    def plot_price_chart(self, df: pd.DataFrame, save_path: str = None):
-        """绘制价格图表"""
-        try:
-            if df.empty:
-                logger.warning("没有数据可绘制")
-                return
-            
-            # 准备数据
-            df_plot = df.copy()
-            df_plot['timestamp'] = pd.to_datetime(df_plot['timestamp'])
-            df_plot = df_plot.sort_values('timestamp')
-            
-            # 创建图表
-            fig, axes = plt.subplots(2, 1, figsize=(15, 10))
-            fig.suptitle('159506 ETF 价格和成交量分析', fontsize=16)
-            
-            # 价格图
-            ax1 = axes[0]
-            ax1.plot(df_plot['timestamp'], df_plot['price'], linewidth=1, alpha=0.8)
-            ax1.set_title('价格走势')
-            ax1.set_ylabel('价格')
-            ax1.grid(True, alpha=0.3)
-            
-            # 成交量图
-            ax2 = axes[1]
-            ax2.bar(df_plot['timestamp'], df_plot['volume'], alpha=0.6, width=0.001)
-            ax2.set_title('成交量')
-            ax2.set_ylabel('成交量')
-            ax2.set_xlabel('时间')
-            ax2.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                logger.info(f"图表已保存到: {save_path}")
-            
-            plt.show()
-            
-        except Exception as e:
-            logger.error(f"绘制价格图表失败: {e}")
-    
-    def export_to_csv(self, df: pd.DataFrame, output_path: str):
-        """导出数据到CSV"""
-        try:
-            df.to_csv(output_path, index=False, encoding='utf-8-sig')
-            logger.info(f"数据已导出到: {output_path}")
-        except Exception as e:
-            logger.error(f"导出CSV失败: {e}")
 
 
 def main():
     """主函数"""
     print("=" * 60)
-    print("159506 ETF Catalog数据加载器 & Redis K线生成器")
-    print("=" * 60)
-    
-    # 检查是否支持Redis模式
-    if REDIS_AVAILABLE and NAUTILUS_AVAILABLE:
-        print("✅ 支持Redis实时K线生成模式")
-        
-        # 询问用户选择模式
-        print("\n请选择运行模式:")
-        print("1. Redis实时K线生成模式")
-        print("2. 文件数据分析模式")
-        
-        try:
-            choice = input("请输入选择 (1 或 2): ").strip()
-            
-            if choice == "1":
-                run_redis_kline_mode()
-            elif choice == "2":
-                run_file_analysis_mode()
-            else:
-                print("无效选择，默认使用文件分析模式")
-                run_file_analysis_mode()
-                
-        except KeyboardInterrupt:
-            print("\n用户中断，退出程序")
-        except Exception as e:
-            print(f"选择模式失败: {e}")
-            run_file_analysis_mode()
-    else:
-        print("⚠️  Redis或NautilusTrader不可用，使用文件分析模式")
-        run_file_analysis_mode()
-    
-    print("\n" + "=" * 60)
-
-
-def run_redis_kline_mode():
-    """运行Redis实时K线生成模式"""
-    print("\n" + "=" * 60)
-    print("Redis实时K线生成模式")
+    print("159506 ETF K线图表生成器")
     print("=" * 60)
     
     try:
-        # 创建Redis K线生成器
+        # 创建K线生成器
         kline_generator = ETF159506RedisKlineGenerator()
         
         # 获取最新数据状态
@@ -728,88 +628,18 @@ def run_redis_kline_mode():
             if latest_trade:
                 print(f"   最新成交价: {float(latest_trade.price):.4f}")
         else:
-            print("⚠️  Redis中没有数据，请先运行数据采集器")
-            return
+            print("⚠️  Redis中没有数据，将使用catalog文件数据")
         
-        # 询问用户选择
-        print("\n请选择操作:")
-        print("1. 生成单次K线图")
-        print("2. 启动实时K线图更新")
-        print("3. 查看K线数据")
+        # 直接生成K线图
+        print("\n正在生成今日K线图...")
+        kline_generator.create_realtime_kline_chart("etf_159506_today_kline.png", auto_refresh=False)
         
-        choice = input("请输入选择 (1, 2, 或 3): ").strip()
-        
-        if choice == "1":
-            # 生成单次K线图
-            print("正在生成K线图...")
-            kline_generator.create_realtime_kline_chart("etf_159506_realtime_kline.png", auto_refresh=False)
-            
-        elif choice == "2":
-            # 启动实时更新
-            print("启动实时K线图更新...")
-            print("按Ctrl+C停止更新")
-            kline_generator.create_realtime_kline_chart("etf_159506_realtime_kline.png", auto_refresh=True)
-            
-            # 保持程序运行
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print("\n实时更新已停止")
-                
-        elif choice == "3":
-            # 查看K线数据
-            kline_data = kline_generator.get_kline_data(20)  # 获取最近20根K线
-            if kline_data:
-                df = pd.DataFrame(kline_data)
-                print(f"\n最近{len(df)}根K线数据:")
-                print(df.to_string(index=False))
-            else:
-                print("没有K线数据")
-        else:
-            print("无效选择")
-            
     except Exception as e:
-        print(f"❌ Redis模式运行失败: {e}")
-
-
-def run_file_analysis_mode():
-    """运行文件数据分析模式"""
+        print(f"❌ 运行失败: {e}")
+        import traceback
+        traceback.print_exc()
+    
     print("\n" + "=" * 60)
-    print("文件数据分析模式")
-    print("=" * 60)
-    
-    # 创建加载器
-    loader = ETF159506CatalogLoader()
-    
-    # 生成摘要报告
-    report = loader.generate_summary_report()
-    print(report)
-    
-    # 加载所有数据
-    print("\n正在加载数据...")
-    df = loader.load_all_data()
-    
-    if not df.empty:
-        print(f"✅ 数据加载成功: {len(df)} 条记录")
-        
-        # 显示前几行数据
-        print("\n前5行数据:")
-        print(df.head())
-        
-        # 显示数据列信息
-        print(f"\n数据列: {list(df.columns)}")
-        
-        # 绘制价格图表
-        print("\n正在生成价格图表...")
-        loader.plot_price_chart(df, "etf_159506_price_chart.png")
-        
-        # 导出数据
-        print("\n正在导出数据...")
-        loader.export_to_csv(df, "etf_159506_data.csv")
-        
-    else:
-        print("❌ 没有数据可加载")
 
 
 if __name__ == "__main__":
