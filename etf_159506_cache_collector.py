@@ -744,12 +744,16 @@ class ETF159506CacheWebSocketClient:
         self.last_data_time = None
         self.start_time = datetime.now()
         
-        # 配置 - 优化为高频模式
-        self.save_interval = 10  # 10秒保存一次（提高保存频率）
-        # 移除心跳间隔 - JVQuant服务器不支持心跳
-        # self.heartbeat_interval = 10  # 10秒心跳一次（提高心跳频率）
+        # 配置 - 优化数据保存
+        self.save_interval = 10  # 5分钟保存一次（减少文件数量）
+        self.merge_interval = 3600  # 1小时合并一次文件
         self.trading_time_check_interval = 30  # 30秒检查一次交易时间
         self.catalog_path = f"catalog/etf_159506_cache"
+        
+        # 数据缓冲区
+        self.data_buffer = []
+        self.last_save_time = None
+        self.last_merge_time = None
         
         logger.info(f"初始化159506 ETF Cache WebSocket客户端")
     
@@ -1157,22 +1161,130 @@ Cache统计:
                 
                 if not self.stop_save:
                     # 保存数据到Parquet文件
-                    catalog_dir = Path(self.catalog_path)
-                    catalog_dir.mkdir(parents=True, exist_ok=True)
+                    self._save_buffer_data()
                     
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    filename = f"cache_data_{timestamp}.parquet"
-                    filepath = catalog_dir / filename
-                    
-                    saved_file = self.cache_manager.save_to_parquet(str(filepath))
-                    if saved_file:
-                        logger.info(f"自动保存完成: {saved_file}")
+                    # 检查是否需要合并文件
+                    self._merge_files_if_needed()
                     
                     # 清理旧数据（保留24小时）
                     self.cache_manager.clear_old_data(24)
                     
             except Exception as e:
                 logger.error(f"自动保存失败: {e}")
+    
+    def _save_buffer_data(self):
+        """保存缓冲区数据"""
+        try:
+            # 获取当前缓存数据
+            cache_data = self.cache_manager.get_historical_data(limit=10000)
+            
+            if not cache_data or not cache_data.get('trade_ticks'):
+                return
+            
+            # 转换为DataFrame格式
+            trade_data = []
+            for tick in cache_data['trade_ticks']:
+                trade_data.append({
+                    'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+                    'price': float(tick.price),
+                    'size': int(tick.size),
+                    'trade_id': str(tick.trade_id),
+                    'type': 'trade'
+                })
+            
+            if not trade_data:
+                return
+            
+            # 按日期分组保存
+            today = datetime.now().date()
+            filename = f"cache_data_{today.strftime('%Y%m%d')}.parquet"
+            filepath = Path(self.catalog_path) / filename
+            
+            # 确保目录存在
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 如果文件已存在，读取并合并
+            if filepath.exists():
+                existing_df = pd.read_parquet(filepath)
+                new_df = pd.DataFrame(trade_data)
+                
+                # 合并数据，去重
+                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
+                combined_df = combined_df.sort_values('timestamp')
+            else:
+                combined_df = pd.DataFrame(trade_data)
+            
+            # 保存文件
+            combined_df.to_parquet(filepath, index=False)
+            
+            logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
+            self.last_save_time = datetime.now()
+            
+        except Exception as e:
+            logger.error(f"保存缓冲区数据失败: {e}")
+    
+    def _merge_files_if_needed(self):
+        """如果需要，合并文件"""
+        current_time = datetime.now()
+        
+        # 每小时合并一次
+        if (self.last_merge_time is None or 
+            (current_time - self.last_merge_time).total_seconds() >= self.merge_interval):
+            
+            self._merge_daily_files()
+            self.last_merge_time = current_time
+    
+    def _merge_daily_files(self):
+        """合并当天的文件"""
+        try:
+            today = datetime.now().date()
+            today_str = today.strftime('%Y%m%d')
+            
+            # 查找当天的所有文件
+            pattern = f"cache_data_{today_str}*.parquet"
+            files = list(Path(self.catalog_path).glob(pattern))
+            
+            if len(files) <= 1:
+                return  # 只有一个文件或没有文件，不需要合并
+            
+            logger.info(f"开始合并 {len(files)} 个文件...")
+            
+            # 读取所有文件
+            all_dataframes = []
+            for file_path in files:
+                try:
+                    df = pd.read_parquet(file_path)
+                    all_dataframes.append(df)
+                except Exception as e:
+                    logger.warning(f"读取文件失败 {file_path}: {e}")
+                    continue
+            
+            if not all_dataframes:
+                return
+            
+            # 合并数据
+            combined_df = pd.concat(all_dataframes, ignore_index=True)
+            combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
+            combined_df = combined_df.sort_values('timestamp')
+            
+            # 保存合并后的文件
+            merged_filename = f"cache_data_{today_str}_merged.parquet"
+            merged_filepath = Path(self.catalog_path) / merged_filename
+            combined_df.to_parquet(merged_filepath, index=False)
+            
+            # 删除原始文件
+            for file_path in files:
+                try:
+                    file_path.unlink()
+                    logger.info(f"删除原始文件: {file_path.name}")
+                except Exception as e:
+                    logger.warning(f"删除文件失败 {file_path}: {e}")
+            
+            logger.info(f"文件合并完成: {merged_filename} ({len(combined_df)} 条记录)")
+            
+        except Exception as e:
+            logger.error(f"合并文件失败: {e}")
     
     def get_status(self) -> Dict:
         """获取状态信息"""
@@ -1206,12 +1318,7 @@ Cache统计:
             self.ws.close()
         
         # 保存最终数据
-        catalog_dir = Path(self.catalog_path)
-        catalog_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"final_cache_data_{timestamp}.parquet"
-        filepath = catalog_dir / filename
-        self.cache_manager.save_to_parquet(str(filepath))
+        self._save_buffer_data()
         
         self.print_diagnostic_status()
         logger.info("连接已断开")

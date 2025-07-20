@@ -35,6 +35,16 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 导入TradingTimeManager
+try:
+    from etf_159506_cache_collector import TradingTimeManager
+    TRADING_TIME_MANAGER_AVAILABLE = True
+    print("[TradingTimeManager] 已导入，支持交易日判断")
+except ImportError as e:
+    print(f"[TradingTimeManager] 导入失败: {e}")
+    print("[TradingTimeManager] 将使用简单的工作日判断")
+    TRADING_TIME_MANAGER_AVAILABLE = False
+
 # NautilusTrader imports (如果可用)
 NAUTILUS_AVAILABLE = False
 try:
@@ -163,7 +173,7 @@ class ETF159506RedisKlineGenerator:
             logger.error(f"获取最新数据失败: {e}")
             return {}
     
-    def generate_kline_from_ticks(self, bar_type: BarType) -> Optional[Bar]:
+    def generate_kline_from_ticks(self, bar_type) -> Optional['Bar']:
         """从tick数据生成K线"""
         try:
             # 获取交易tick数据
@@ -290,21 +300,43 @@ class ETF159506RedisKlineGenerator:
             return []
     
     def get_today_kline_data(self) -> List[Dict]:
-        """获取今日K线数据"""
+        """获取今日K线数据，如果不是交易日则获取上一个交易日数据"""
         try:
-            today = datetime.now().date()
+            # 创建交易时间管理器
+            trading_manager = TradingTimeManager()
+            current_date = datetime.now().date()
+            
+            # 判断当前是否为交易日
+            if TRADING_TIME_MANAGER_AVAILABLE:
+                if trading_manager.is_trading_day(datetime.now()):
+                    target_date = current_date
+                    logger.info(f"当前是交易日，获取今日({target_date})数据")
+                else:
+                    # 获取上一个交易日
+                    target_date = self._get_previous_trading_day(current_date)
+                    logger.info(f"当前不是交易日，获取上一个交易日({target_date})数据")
+            else:
+                # 简单的备用实现：检查是否为工作日
+                if current_date.weekday() < 5:  # 周一到周五
+                    target_date = current_date
+                    logger.info(f"当前是工作日，获取今日({target_date})数据")
+                else:
+                    # 获取上一个工作日
+                    target_date = self._get_previous_trading_day(current_date)
+                    logger.info(f"当前不是工作日，获取上一个工作日({target_date})数据")
+            
             all_data = []
             
-            # 首先尝试从Redis获取今日数据
+            # 首先尝试从Redis获取数据
             if self.cache:
                 try:
                     # 获取交易tick数据
                     trade_ticks = self.cache.trade_ticks(self.instrument_id)
                     if len(trade_ticks) > 0:
-                        # 过滤今日数据
+                        # 过滤目标日期数据
                         for tick in trade_ticks:
                             tick_time = pd.to_datetime(tick.ts_event, unit='ns')
-                            if tick_time.date() == today:
+                            if tick_time.date() == target_date:
                                 all_data.append({
                                     'timestamp': tick_time,
                                     'price': float(tick.price),
@@ -313,12 +345,12 @@ class ETF159506RedisKlineGenerator:
                                     'source': 'redis'
                                 })
                         
-                        logger.info(f"从Redis获取到 {len(all_data)} 条今日数据")
+                        logger.info(f"从Redis获取到 {len(all_data)} 条{target_date}数据")
                 except Exception as e:
                     logger.warning(f"从Redis获取数据失败: {e}")
             
             # 从catalog文件补充数据
-            catalog_data = self._get_today_data_from_catalog()
+            catalog_data = self._get_data_from_catalog(target_date)
             if catalog_data:
                 # 过滤掉Redis中已有的数据（避免重复）
                 redis_times = {item['timestamp'] for item in all_data}
@@ -332,15 +364,37 @@ class ETF159506RedisKlineGenerator:
             # 按时间排序
             all_data.sort(key=lambda x: x['timestamp'])
             
-            logger.info(f"总共获取到 {len(all_data)} 条今日数据")
+            logger.info(f"总共获取到 {len(all_data)} 条{target_date}数据")
             return all_data
             
         except Exception as e:
-            logger.error(f"获取今日K线数据失败: {e}")
+            logger.error(f"获取K线数据失败: {e}")
             return []
     
-    def _get_today_data_from_catalog(self) -> List[Dict]:
-        """从catalog文件获取今日数据"""
+    def _get_previous_trading_day(self, current_date: datetime.date) -> datetime.date:
+        """获取上一个交易日"""
+        if TRADING_TIME_MANAGER_AVAILABLE:
+            trading_manager = TradingTimeManager()
+            
+            # 从当前日期往前查找，直到找到交易日
+            previous_date = current_date - timedelta(days=1)
+            while not trading_manager.is_trading_day(datetime.combine(previous_date, datetime.min.time())):
+                previous_date -= timedelta(days=1)
+            
+            return previous_date
+        else:
+            # 简单的备用实现：跳过周末
+            previous_date = current_date - timedelta(days=1)
+            
+            # 跳过周末（周六=5, 周日=6）
+            while previous_date.weekday() >= 5:
+                previous_date -= timedelta(days=1)
+            
+            logger.warning(f"使用简单工作日判断，上一个交易日: {previous_date}")
+            return previous_date
+    
+    def _get_data_from_catalog(self, target_date: datetime.date) -> List[Dict]:
+        """从catalog文件获取指定日期的数据"""
         try:
             if not self.catalog_path.exists():
                 logger.warning(f"Catalog路径不存在: {self.catalog_path}")
@@ -352,13 +406,11 @@ class ETF159506RedisKlineGenerator:
                 logger.warning(f"Catalog目录中没有parquet文件: {self.catalog_path}")
                 return []
             
-            # 获取今日日期
-            today = datetime.now().date()
-            logger.info(f"查找今日({today})的数据文件...")
+            logger.info(f"查找{target_date}的数据文件...")
             
             # 读取所有文件并合并数据
             all_dataframes = []
-            today_files = []
+            target_files = []
             
             for file_path in parquet_files:
                 try:
@@ -384,41 +436,41 @@ class ETF159506RedisKlineGenerator:
                         # 转换为北京时间
                         df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
                     
-                    # 检查是否包含今日数据
+                    # 检查是否包含目标日期数据
                     file_dates = df['timestamp'].dt.date.unique()
-                    if today in file_dates:
+                    if target_date in file_dates:
                         all_dataframes.append(df)
-                        today_files.append(file_path.name)
-                        logger.info(f"找到今日数据文件: {file_path.name}")
+                        target_files.append(file_path.name)
+                        logger.info(f"找到{target_date}数据文件: {file_path.name}")
                 
                 except Exception as e:
                     logger.warning(f"读取文件 {file_path} 失败: {e}")
                     continue
             
             if not all_dataframes:
-                logger.warning(f"没有找到今日({today})的数据文件")
+                logger.warning(f"没有找到{target_date}的数据文件")
                 return []
             
             # 合并所有数据
             combined_df = pd.concat(all_dataframes, ignore_index=True)
-            logger.info(f"合并了 {len(today_files)} 个文件的数据")
+            logger.info(f"合并了 {len(target_files)} 个文件的数据")
             
             # 去重（按timestamp和trade_id）
             combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
             logger.info(f"去重后数据量: {len(combined_df)} 条")
             
-            # 过滤今日数据（使用北京时间）
-            today_data = combined_df[combined_df['timestamp'].dt.date == today]
+            # 过滤目标日期数据（使用北京时间）
+            target_data = combined_df[combined_df['timestamp'].dt.date == target_date]
             
-            if today_data.empty:
-                logger.warning(f"合并后没有今日({today})的数据")
+            if target_data.empty:
+                logger.warning(f"合并后没有{target_date}的数据")
                 return []
             
-            logger.info(f"读取到 {len(today_data)} 条今日数据")
+            logger.info(f"读取到 {len(target_data)} 条{target_date}数据")
             
             # 转换为K线数据格式 - 只处理trade类型的数据
             kline_data = []
-            for _, row in today_data.iterrows():
+            for _, row in target_data.iterrows():
                 if row['type'] == 'trade' and pd.notna(row['price']):
                     kline_data.append({
                         'timestamp': row['timestamp'],
@@ -427,12 +479,16 @@ class ETF159506RedisKlineGenerator:
                         'trade_id': str(row.get('trade_id', ''))
                     })
             
-            logger.info(f"从文件读取到 {len(kline_data)} 条今日交易数据")
+            logger.info(f"从文件读取到 {len(kline_data)} 条{target_date}交易数据")
             return kline_data
             
         except Exception as e:
-            logger.error(f"从catalog文件读取今日数据失败: {e}")
+            logger.error(f"从catalog文件读取{target_date}数据失败: {e}")
             return []
+    
+    def _get_today_data_from_catalog(self) -> List[Dict]:
+        """从catalog文件获取今日数据（保持向后兼容）"""
+        return self._get_data_from_catalog(datetime.now().date())
     
     def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True):
         """创建实时K线图"""
@@ -442,13 +498,13 @@ class ETF159506RedisKlineGenerator:
             self._plot_kline_chart(save_path)
     
     def _plot_kline_chart(self, save_path: str = None):
-        """绘制今日价格走势图"""
+        """绘制价格走势图"""
         try:
-            # 获取今日数据
+            # 获取数据
             kline_data = self.get_today_kline_data()
             
             if not kline_data:
-                logger.warning("没有今日数据可绘制")
+                logger.warning("没有数据可绘制")
                 return
             
             # 转换为DataFrame
@@ -473,6 +529,7 @@ class ETF159506RedisKlineGenerator:
             # 检查数据时间范围
             start_time = df['timestamp'].min()
             end_time = df['timestamp'].max()
+            data_date = start_time.date()
             logger.info(f"数据时间范围: {start_time} 到 {end_time}")
             logger.info(f"数据条数: {len(df)}")
             
@@ -505,13 +562,20 @@ class ETF159506RedisKlineGenerator:
             # 创建图表
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), height_ratios=[3, 1])
             
-            # 设置标题 - 显示交易时间内的北京时间
+            # 设置标题 - 显示数据日期和交易时间
             import pytz
             beijing_tz = pytz.timezone('Asia/Shanghai')
             beijing_now = datetime.now(beijing_tz)
-            today_str = beijing_now.strftime('%Y-%m-%d')
+            current_date = beijing_now.date()
+            
+            # 判断显示标题
+            if data_date == current_date:
+                title_date = "今日"
+            else:
+                title_date = f"{data_date.strftime('%Y-%m-%d')}"
+            
             time_range_str = f"{data_start.strftime('%H:%M')} - {data_end.strftime('%H:%M')}"
-            fig.suptitle(f'159506 ETF 今日交易时间价格走势 ({today_str} {time_range_str} 北京时间)', fontsize=16)
+            fig.suptitle(f'159506 ETF {title_date}交易时间价格走势 ({data_date} {time_range_str} 北京时间)', fontsize=16)
             
             # 绘制价格走势
             ax1.plot(complete_df.index, complete_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')

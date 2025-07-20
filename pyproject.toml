@@ -19,6 +19,7 @@ dependencies = [
     "nautilus-trader @ file:///C:/Users/hedz/Downloads/nautilus_trader-develop",
     "seaborn>=0.13.2",
     "redis",
+    "pyarrow>=20.0.0",
 ]
 
 [build-system]
