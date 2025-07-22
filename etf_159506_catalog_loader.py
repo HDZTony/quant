@@ -552,31 +552,16 @@ class ETF159506RedisKlineGenerator:
             # 使用交易数据的时间作为索引
             trading_data = trading_data.set_index('timestamp')
             
-            # 直接使用原始数据，不进行reindex操作
+            # 确保索引为升序、唯一、无NaN
             complete_df = trading_data.copy()
-            
-            # 获取时间范围用于图表显示
-            data_start = complete_df.index.min()
-            data_end = complete_df.index.max()
-            
-            # 创建图表
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 12), height_ratios=[3, 1])
-            
-            # 设置标题 - 显示数据日期和交易时间
-            import pytz
-            beijing_tz = pytz.timezone('Asia/Shanghai')
-            beijing_now = datetime.now(beijing_tz)
-            current_date = beijing_now.date()
-            
-            # 判断显示标题
-            if data_date == current_date:
-                title_date = "今日"
-            else:
-                title_date = f"{data_date.strftime('%Y-%m-%d')}"
-            
-            time_range_str = f"{data_start.strftime('%H:%M')} - {data_end.strftime('%H:%M')}"
-            fig.suptitle(f'159506 ETF {title_date}交易时间价格走势 ({data_date} {time_range_str} 北京时间)', fontsize=16)
-            
+            complete_df = complete_df.sort_index()
+            complete_df = complete_df[~complete_df.index.duplicated(keep='first')]
+            complete_df = complete_df[complete_df.index.notnull()]
+
+            # 创建五联图，图片高度更大
+            fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(20, 40), height_ratios=[3, 1, 1, 1, 1])
+
+            # ====== ax1主图（价格走势） ======
             # 绘制价格走势
             ax1.plot(complete_df.index, complete_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
             
@@ -603,11 +588,11 @@ class ETF159506RedisKlineGenerator:
                 low_time = valid_prices.idxmin()
                 ax1.scatter(low_time, low_price, color='purple', s=80, marker='v', label='最低')
                 
-                # 添加价格信息 - 显示北京时间
-                price_info = f'开盘: {open_price:.4f} ({open_time.strftime("%H:%M")})\n'
-                price_info += f'当前: {current_price:.4f} ({current_time.strftime("%H:%M")})\n'
-                price_info += f'最高: {high_price:.4f} ({high_time.strftime("%H:%M")})\n'
-                price_info += f'最低: {low_price:.4f} ({low_time.strftime("%H:%M")})'
+                # 添加价格信息 - 显示北京时间，精确到三位小数
+                price_info = f'开盘: {open_price:.3f} ({open_time.strftime("%H:%M")})\n'
+                price_info += f'当前: {current_price:.3f} ({current_time.strftime("%H:%M")})\n'
+                price_info += f'最高: {high_price:.3f} ({high_time.strftime("%H:%M")})\n'
+                price_info += f'最低: {low_price:.3f} ({low_time.strftime("%H:%M")})'
                 
                 ax1.text(0.02, 0.98, price_info, 
                        transform=ax1.transAxes, verticalalignment='top', 
@@ -620,26 +605,131 @@ class ETF159506RedisKlineGenerator:
             
             # 设置x轴格式 - 显示北京时间
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=15))  # 每15分钟一个刻度
+            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
-            # 添加x轴标签
-            ax1.set_xlabel('时间 (北京时间)')
+            # 设置y轴格式 - 价格三位小数
+            import matplotlib.ticker as mticker
+            ax1.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+
+            # 添加x轴标签（明确标注北京时间）
+            ax1.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             
-            # 绘制成交量
-            ax2.bar(complete_df.index, complete_df['volume'], alpha=0.6, color='blue', width=0.0001)
+            # ====== ax2成交量 ======
+            # 跳过第一条（因为是累积成交量）
+            vol_df = complete_df.iloc[1:].copy()
+            if len(vol_df) == 0:
+                logger.warning("成交量数据不足，无法绘制")
+                return
+            
+            # 计算涨跌颜色
+            price_arr = vol_df['price'].values
+            prev_price_arr = complete_df['price'].values[:-1]
+            colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+            
+            # 绘制成交量柱状图
+            ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=1/1440)
             ax2.set_title('成交量 (北京时间)')
             ax2.set_ylabel('成交量')
-            ax2.set_xlabel('时间 (北京时间)')
+            ax2.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax2.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax2.grid(True, alpha=0.3)
             
             # 设置x轴格式 - 显示北京时间
             ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=15))  # 每15分钟一个刻度
+            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
+            # ====== 生成1分钟K线收盘价序列，用于技术指标 ======
+            minute_close = complete_df['price'].resample('1min').last().dropna()
+            minute_index = minute_close.index
+
+            # ====== ax3 MACD副图（用1分钟K线收盘价） ======
+            ema12 = minute_close.ewm(span=12, adjust=False).mean()
+            ema26 = minute_close.ewm(span=26, adjust=False).mean()
+            dif = ema12 - ema26  # DIF
+            dea = dif.ewm(span=9, adjust=False).mean()  # DEA
+            macd_hist = 2 * (dif - dea)  # MACD柱子
+            macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
+            ax3.bar(minute_index, macd_hist, color=macd_colors, width=1/1440, alpha=0.7, label='MACD柱')
+            ax3.plot(minute_index, dif, color='orange', label='DIF线')      # DIF橙色
+            ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线') # DEA天蓝色
+            ax3.set_title('MACD指标 (12,26,9)')
+            ax3.set_ylabel('MACD')
+            ax3.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax3.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+
+            # ====== 计算RSI(6), RSI(12), RSI(24)（用1分钟K线收盘价） ======
+            def calc_rsi(series, period):
+                delta = series.diff()
+                gain = delta.where(delta > 0, 0.0)
+                loss = -delta.where(delta < 0, 0.0)
+                avg_gain = gain.rolling(window=period, min_periods=period).mean()
+                avg_loss = loss.rolling(window=period, min_periods=period).mean()
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+                return rsi
+            rsi6 = calc_rsi(minute_close, 6)
+            rsi12 = calc_rsi(minute_close, 12)
+            rsi24 = calc_rsi(minute_close, 24)
+
+            # ====== ax4 RSI副图（6,12,24三线，用1分钟K线收盘价） ======
+            ax4.plot(minute_index, rsi6, color='orange', label='RSI(6)')         # 橙色
+            ax4.plot(minute_index, rsi12, color='deepskyblue', label='RSI(12)')  # 天蓝色
+            ax4.plot(minute_index, rsi24, color='purple', label='RSI(24)')       # 紫色
+            ax4.axhline(70, color='red', linestyle='--', linewidth=1, label='超买70')
+            ax4.axhline(30, color='green', linestyle='--', linewidth=1, label='超卖30')
+            ax4.set_title('RSI指标 (6,12,24)')
+            ax4.set_ylabel('RSI')
+            ax4.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax4.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            ax4.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax4.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
+            ax4.set_ylim(0, 100)
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+
+            # ====== 计算KDJ(9,3,3)（用1分钟K线收盘价） ======
+            def calc_kdj(close, n=9, k_period=3, d_period=3):
+                low_list = close.rolling(window=n, min_periods=1).min()
+                high_list = close.rolling(window=n, min_periods=1).max()
+                rsv = (close - low_list) / (high_list - low_list) * 100
+                k = rsv.ewm(com=(k_period-1), adjust=False).mean()
+                d = k.ewm(com=(d_period-1), adjust=False).mean()
+                j = 3 * k - 2 * d
+                return k, d, j
+            kdj_k, kdj_d, kdj_j = calc_kdj(minute_close, n=9, k_period=3, d_period=3)
+
+            # ====== ax5 KDJ副图（用1分钟K线收盘价） ======
+            ax5.plot(minute_index, kdj_k, color='orange', label='K')         # 橙色
+            ax5.plot(minute_index, kdj_d, color='deepskyblue', label='D')    # 天蓝色
+            ax5.plot(minute_index, kdj_j, color='purple', label='J')         # 紫色
+            ax5.set_title('KDJ指标 (9,3,3)')
+            ax5.set_ylabel('KDJ')
+            ax5.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax5.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            ax5.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax5.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45)
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+
+            # 统一x轴格式化，防止内容错乱
+            for ax in [ax1, ax2, ax3, ax4, ax5]:
+                ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+
             plt.tight_layout()
             
+            # 只生成一张图，且只show一次
             if save_path:
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
                 logger.info(f"价格走势图已保存到: {save_path}")

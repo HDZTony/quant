@@ -1313,7 +1313,7 @@ Cache统计:
         self.stop_save = True
         # self.stop_heartbeat = True  # 移除心跳停止
         self.stop_monitor = True
-        self.stop_trading_time_check = True
+        # self.stop_trading_time_check = True   # 不要停止交易时间检测线程
         if self.ws:
             self.ws.close()
         
