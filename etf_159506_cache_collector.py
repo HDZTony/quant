@@ -927,7 +927,7 @@ class ETF159506CacheWebSocketClient:
             logger.error("最后数据接收: 无数据")
         
         # 记录线程状态
-        logger.error(f"心跳线程状态: {'运行中' if not self.stop_heartbeat else '已停止'}")
+        # logger.error(f"心跳线程状态: 已移除 (JVQuant服务器不支持心跳)")
         logger.error(f"保存线程状态: {'运行中' if not self.stop_save else '已停止'}")
         logger.error(f"监控线程状态: {'运行中' if not self.stop_monitor else '已停止'}")
         
@@ -988,12 +988,14 @@ class ETF159506CacheWebSocketClient:
         # logger.error(f"心跳线程状态: 已停止")  # 移除心跳线程状态
         logger.error(f"保存线程状态: 已停止")
         logger.error(f"监控线程状态: {'运行中' if not self.stop_monitor else '已停止'}")
+        logger.error(f"交易时间检查线程状态: {'运行中' if not self.stop_trading_time_check else '已停止'}")
         
         logger.error("=" * 60)
         
         self.is_connected = False
         self.stop_save = True
         # self.stop_heartbeat = True  # 移除心跳停止
+        # 不要停止交易时间检查线程，让它继续监控并自动重连
     
     def start_auto_save(self):
         """启动自动保存线程"""
@@ -1049,22 +1051,36 @@ class ETF159506CacheWebSocketClient:
                     
                     # 如果当前是交易时间但未连接，则连接
                     if current_status['is_trading_time'] and not self.is_connected:
-                        logger.info(f"检测到交易时间，开始连接: {current_status['current_time']}")
+                        logger.info(f"🔗 检测到交易时间，开始连接: {current_status['current_time']}")
+                        logger.info(f"   当前连接状态: {self.is_connected}")
+                        logger.info(f"   停止标志状态: save={self.stop_save}, monitor={self.stop_monitor}, trading_check={self.stop_trading_time_check}")
+                        
                         # 重置停止标志
-                        self.stop_heartbeat = False
+                        # self.stop_heartbeat = False  # 移除心跳标志
                         self.stop_save = False
                         self.stop_monitor = False
-                        self.connect()
+                        # 确保交易时间检查线程继续运行
+                        self.stop_trading_time_check = False
+                        logger.info("✅ 重置所有线程停止标志，准备重新连接")
+                        
+                        # 尝试连接
+                        connect_result = self.connect()
+                        if connect_result:
+                            logger.info("✅ 自动重连成功")
+                        else:
+                            logger.error("❌ 自动重连失败")
                     
                     # 如果当前不是交易时间但已连接，则断开
                     elif not current_status['is_trading_time'] and self.is_connected:
-                        logger.info(f"检测到非交易时间，断开连接: {current_status['current_time']}")
+                        logger.info(f"🔌 检测到非交易时间，断开连接: {current_status['current_time']}")
                         logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
                         self.disconnect()
                     
                     # 每5分钟输出一次交易时间状态
                     if int(time.time()) % 300 == 0:  # 5分钟 = 300秒
-                        logger.info(f"交易时间状态: {current_status}")
+                        logger.info(f"📊 交易时间状态: {current_status}")
+                        logger.info(f"   连接状态: {self.is_connected}")
+                        logger.info(f"   停止标志: save={self.stop_save}, monitor={self.stop_monitor}, trading_check={self.stop_trading_time_check}")
                     
             except Exception as e:
                 logger.error(f"交易时间检查循环错误: {e}")
@@ -1112,10 +1128,15 @@ class ETF159506CacheWebSocketClient:
   运行时间: {runtime}
   最后数据接收: {last_data_ago} 前
   线程状态:
-    # 心跳线程: {'运行中' if not self.stop_heartbeat else '已停止'}  # 移除心跳线程状态
+    # 心跳线程: 已移除 (JVQuant服务器不支持心跳)
     保存线程: {'运行中' if not self.stop_save else '已停止'}
     监控线程: {'运行中' if not self.stop_monitor else '已停止'}
     交易时间检查线程: {'运行中' if not self.stop_trading_time_check else '已停止'}
+  
+  重连机制状态:
+    交易时间控制: {'启用' if self.enable_trading_time_control else '禁用'}
+    交易时间管理器: {'可用' if self.trading_time_manager else '不可用'}
+    自动重连: {'启用' if self.enable_trading_time_control and self.trading_time_manager else '禁用'}
   
   连接历史:
     总连接次数: {self.connection_count}
@@ -1313,7 +1334,8 @@ Cache统计:
         self.stop_save = True
         # self.stop_heartbeat = True  # 移除心跳停止
         self.stop_monitor = True
-        # self.stop_trading_time_check = True   # 不要停止交易时间检测线程
+        # 不要停止交易时间检测线程，让它继续监控并自动重连
+        # self.stop_trading_time_check = True
         if self.ws:
             self.ws.close()
         
@@ -1330,7 +1352,8 @@ Cache统计:
             # self.stop_heartbeat = True  # 移除心跳停止
             self.stop_save = True
             self.stop_monitor = True
-            self.stop_trading_time_check = True
+            # 不要停止交易时间检查线程，让它继续监控
+            # self.stop_trading_time_check = True
             
             # if self.heartbeat_thread:  # 移除心跳线程处理
             #     self.heartbeat_thread.join(timeout=2)
@@ -1338,8 +1361,14 @@ Cache统计:
                 self.save_thread.join(timeout=2)
             if self.monitor_thread:
                 self.monitor_thread.join(timeout=2)
-            if self.trading_time_thread:
-                self.trading_time_thread.join(timeout=2)
+            # 不要等待交易时间检查线程结束
+            # if self.trading_time_thread:
+            #     self.trading_time_thread.join(timeout=2)
+            
+            # 重置停止标志
+            self.stop_save = False
+            self.stop_monitor = False
+            # self.stop_heartbeat = False  # 移除心跳标志
             
             self.connect()
             

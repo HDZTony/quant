@@ -558,15 +558,65 @@ class ETF159506RedisKlineGenerator:
             complete_df = complete_df[~complete_df.index.duplicated(keep='first')]
             complete_df = complete_df[complete_df.index.notnull()]
 
+            # 创建连续的时间轴，处理午休时间间隔
+            def create_continuous_time_index(df):
+                """创建连续的时间索引，消除午休时间间隔"""
+                if df.empty:
+                    return df
+                
+                # 获取数据的时间范围
+                start_time = df.index.min()
+                end_time = df.index.max()
+                
+                # 创建连续的时间轴
+                continuous_times = []
+                current_time = start_time
+                
+                while current_time <= end_time:
+                    current_hour = current_time.hour
+                    current_minute = current_time.minute
+                    
+                    # 跳过午休时间 (11:30-13:00)
+                    if current_hour == 11 and current_minute >= 30:
+                        # 跳到13:00
+                        current_time = current_time.replace(hour=13, minute=0)
+                        continue
+                    elif current_hour == 12:
+                        # 跳过整个12点
+                        current_time = current_time.replace(hour=13, minute=0)
+                        continue
+                    
+                    # 只保留交易时间内的数据 (9:30-15:00)
+                    if (current_hour == 9 and current_minute >= 30) or \
+                       (current_hour >= 10 and current_hour < 15) or \
+                       (current_hour == 15 and current_minute == 0):
+                        continuous_times.append(current_time)
+                    
+                    # 增加1分钟
+                    current_time += pd.Timedelta(minutes=1)
+                
+                return pd.DatetimeIndex(continuous_times)
+
+            # 创建连续时间索引
+            continuous_index = create_continuous_time_index(complete_df)
+            
+            # 重新索引数据，使用连续时间
+            complete_df_continuous = complete_df.reindex(continuous_index)
+            
+            # 如果连续索引为空，使用原始数据
+            if complete_df_continuous.empty:
+                complete_df_continuous = complete_df.copy()
+                logger.warning("连续时间索引创建失败，使用原始数据")
+            
             # 创建五联图，图片高度更大
             fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(20, 40), height_ratios=[3, 1, 1, 1, 1])
 
             # ====== ax1主图（价格走势） ======
-            # 绘制价格走势
-            ax1.plot(complete_df.index, complete_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
+            # 绘制价格走势 - 使用连续时间索引
+            ax1.plot(complete_df_continuous.index, complete_df_continuous['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
             
             # 标记关键价格点
-            valid_prices = complete_df['price'].dropna()
+            valid_prices = complete_df_continuous['price'].dropna()
             if len(valid_prices) > 0:
                 # 开盘价（第一个有效价格）
                 open_price = valid_prices.iloc[0]
@@ -603,6 +653,10 @@ class ETF159506RedisKlineGenerator:
             ax1.grid(True, alpha=0.3)
             ax1.legend()
             
+            # 创建交易时间范围
+            trading_start_time = complete_df_continuous.index.min().replace(hour=9, minute=30)
+            trading_end_time = complete_df_continuous.index.max().replace(hour=15, minute=0)
+            
             # 设置x轴格式 - 显示北京时间
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
@@ -618,14 +672,14 @@ class ETF159506RedisKlineGenerator:
             
             # ====== ax2成交量 ======
             # 跳过第一条（因为是累积成交量）
-            vol_df = complete_df.iloc[1:].copy()
+            vol_df = complete_df_continuous.iloc[1:].copy()
             if len(vol_df) == 0:
                 logger.warning("成交量数据不足，无法绘制")
                 return
             
             # 计算涨跌颜色
             price_arr = vol_df['price'].values
-            prev_price_arr = complete_df['price'].values[:-1]
+            prev_price_arr = complete_df_continuous['price'].values[:-1]
             colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
             
             # 绘制成交量柱状图
@@ -636,13 +690,15 @@ class ETF159506RedisKlineGenerator:
             ax2.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax2.grid(True, alpha=0.3)
             
+
+            
             # 设置x轴格式 - 显示北京时间
             ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
             # ====== 生成1分钟K线收盘价序列，用于技术指标 ======
-            minute_close = complete_df['price'].resample('1min').last().dropna()
+            minute_close = complete_df_continuous['price'].resample('1min').last().dropna()
             minute_index = minute_close.index
 
             # ====== ax3 MACD副图（用1分钟K线收盘价） ======
@@ -659,6 +715,9 @@ class ETF159506RedisKlineGenerator:
             ax3.set_ylabel('MACD')
             ax3.set_xlabel('时间 (北京时间)', fontsize=13)
             ax3.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            
+
+            
             ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
@@ -689,6 +748,9 @@ class ETF159506RedisKlineGenerator:
             ax4.set_ylabel('RSI')
             ax4.set_xlabel('时间 (北京时间)', fontsize=13)
             ax4.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            
+
+            
             ax4.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax4.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
@@ -715,6 +777,9 @@ class ETF159506RedisKlineGenerator:
             ax5.set_ylabel('KDJ')
             ax5.set_xlabel('时间 (北京时间)', fontsize=13)
             ax5.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            
+
+            
             ax5.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax5.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45)
@@ -723,6 +788,9 @@ class ETF159506RedisKlineGenerator:
 
             # 统一x轴格式化，防止内容错乱
             for ax in [ax1, ax2, ax3, ax4, ax5]:
+                # 设置x轴范围 - 确保从9:30到15:00完整显示
+                ax.set_xlim(trading_start_time, trading_end_time)
+                # 设置x轴格式
                 ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
                 ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
                 plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
