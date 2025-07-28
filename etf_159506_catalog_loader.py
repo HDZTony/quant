@@ -543,21 +543,34 @@ class ETF159506RedisKlineGenerator:
             else:
                 chart_title = f'159506 ETF {data_date} 价格走势 (北京时间)'
             
-            # 过滤交易时间内的数据（9:30-15:00）
+            # 过滤交易时间内的数据，正确处理午休时间
             from datetime import time as datetime_time
-            trading_start = datetime_time(9, 30)
-            trading_end = datetime_time(15, 0)
+            morning_start = datetime_time(9, 30)
+            morning_end = datetime_time(11, 30)
+            afternoon_start = datetime_time(13, 0)
+            afternoon_end = datetime_time(15, 0)
             
-            trading_data = df[
-                (df['timestamp'].dt.time >= trading_start) & 
-                (df['timestamp'].dt.time <= trading_end)
+            # 分别获取上午和下午的数据
+            morning_data = df[
+                (df['timestamp'].dt.time >= morning_start) & 
+                (df['timestamp'].dt.time <= morning_end)
             ]
+            
+            afternoon_data = df[
+                (df['timestamp'].dt.time >= afternoon_start) & 
+                (df['timestamp'].dt.time <= afternoon_end)
+            ]
+            
+            # 合并上午和下午数据
+            trading_data = pd.concat([morning_data, afternoon_data])
             
             if len(trading_data) == 0:
                 logger.warning("没有交易时间内的数据可绘制")
                 return
             
-            logger.info(f"交易时间内的数据: {len(trading_data)} 条")
+            logger.info(f"上午数据: {len(morning_data)} 条")
+            logger.info(f"下午数据: {len(afternoon_data)} 条")
+            logger.info(f"总交易数据: {len(trading_data)} 条")
             
             # 使用交易数据的时间作为索引
             trading_data = trading_data.set_index('timestamp')
@@ -571,12 +584,54 @@ class ETF159506RedisKlineGenerator:
             # 创建五联图，图片高度更大
             fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(20, 40), height_ratios=[3, 1, 1, 1, 1])
 
+            # 创建时间轴映射，跳过午休时间
+            def create_time_mapping(df):
+                """创建时间轴映射，跳过午休时间"""
+                # 创建新的时间索引
+                new_times = []
+                time_mapping = {}
+                
+                for idx in df.index:
+                    current_time = idx.time()
+                    
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        new_time = idx
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间）
+                        new_time = idx - timedelta(hours=1, minutes=30)
+                    else:
+                        # 午休时间的数据跳过
+                        continue
+                    
+                    new_times.append(new_time)
+                    time_mapping[idx] = new_time
+                
+                return pd.DatetimeIndex(new_times), time_mapping
+            
+            # 创建时间映射
+            new_index, time_mapping = create_time_mapping(complete_df)
+            
+            # 重新索引数据
+            mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
+            mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
+            
+            # 设置x轴范围
+            x_min = new_index.min()
+            x_max = new_index.max()
+            
+            # 为每个子图设置相同的x轴范围
+            for ax in [ax1, ax2, ax3, ax4, ax5]:
+                ax.set_xlim(x_min, x_max)
+            
+
+
             # ====== ax1主图（价格走势） ======
             # 绘制价格走势
-            ax1.plot(complete_df.index, complete_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
+            ax1.plot(mapped_df.index, mapped_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
             
             # 标记关键价格点
-            valid_prices = complete_df['price'].dropna()
+            valid_prices = mapped_df['price'].dropna()
             if len(valid_prices) > 0:
                 # 开盘价（第一个有效价格）
                 open_price = valid_prices.iloc[0]
@@ -628,18 +683,18 @@ class ETF159506RedisKlineGenerator:
             
             # ====== ax2成交量 ======
             # 跳过第一条（因为是累积成交量）
-            vol_df = complete_df.iloc[1:].copy()
+            vol_df = mapped_df.iloc[1:].copy()
             if len(vol_df) == 0:
                 logger.warning("成交量数据不足，无法绘制")
                 return
             
             # 计算涨跌颜色
             price_arr = vol_df['price'].values
-            prev_price_arr = complete_df['price'].values[:-1]
+            prev_price_arr = mapped_df['price'].values[:-1]
             colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
             
-            # 绘制成交量柱状图
-            ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=1/1440)
+            # 绘制成交量柱状图，使用更小的宽度避免重叠
+            ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
             if target_date:
                 ax2.set_title(f'成交量 {target_date} (北京时间)')
             else:
@@ -655,7 +710,8 @@ class ETF159506RedisKlineGenerator:
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
             # ====== 生成1分钟K线收盘价序列，用于技术指标 ======
-            minute_close = complete_df['price'].resample('1min').last().dropna()
+            # 使用映射后的数据重新采样，上午和下午数据直接连接
+            minute_close = mapped_df['price'].resample('1min').last().dropna()
             minute_index = minute_close.index
 
             # ====== ax3 MACD副图（用1分钟K线收盘价） ======
@@ -665,7 +721,7 @@ class ETF159506RedisKlineGenerator:
             dea = dif.ewm(span=9, adjust=False).mean()  # DEA
             macd_hist = dif - dea # MACD柱子
             macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
-            ax3.bar(minute_index, macd_hist, color=macd_colors, width=1/1440, alpha=0.7, label='MACD柱')
+            ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
             ax3.plot(minute_index, dif, color='orange', label='DIF线')      # DIF橙色
             ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线') # DEA天蓝色
             if target_date:
@@ -746,7 +802,15 @@ class ETF159506RedisKlineGenerator:
             # 统一x轴格式化，防止内容错乱
             for ax in [ax1, ax2, ax3, ax4, ax5]:
                 ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-                ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                # 根据数据时间跨度调整刻度间隔
+                time_span = x_max - x_min
+                if time_span.total_seconds() < 3600:  # 小于1小时
+                    interval = 5  # 每5分钟
+                elif time_span.total_seconds() < 7200:  # 小于2小时
+                    interval = 10  # 每10分钟
+                else:
+                    interval = 15  # 每15分钟
+                ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=interval))
                 plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
 
             plt.tight_layout()
@@ -768,7 +832,7 @@ class ETF159506RedisKlineGenerator:
         def update_chart():
             while True:
                 try:
-                    time.sleep(30)  # 每30秒更新一次
+                    time.sleep(1)  # 每30秒更新一次
                     self._plot_kline_chart(save_path, target_date)
                     logger.info("实时K线图已更新")
                 except Exception as e:
