@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Any
 import logging
 import time
 import threading
+import argparse
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
@@ -299,31 +300,34 @@ class ETF159506RedisKlineGenerator:
             logger.error(f"从catalog文件读取数据失败: {e}")
             return []
     
-    def get_today_kline_data(self) -> List[Dict]:
-        """获取今日K线数据，如果不是交易日则获取上一个交易日数据"""
+    def get_today_kline_data(self, target_date: datetime.date = None) -> List[Dict]:
+        """获取指定日期的K线数据，如果不指定则获取今日数据，如果不是交易日则获取上一个交易日数据"""
         try:
-            # 创建交易时间管理器
-            trading_manager = TradingTimeManager()
-            current_date = datetime.now().date()
-            
-            # 判断当前是否为交易日
-            if TRADING_TIME_MANAGER_AVAILABLE:
-                if trading_manager.is_trading_day(datetime.now()):
-                    target_date = current_date
-                    logger.info(f"当前是交易日，获取今日({target_date})数据")
+            # 如果没有指定日期，使用当前日期
+            if target_date is None:
+                current_date = datetime.now().date()
+                
+                # 判断当前是否为交易日
+                if TRADING_TIME_MANAGER_AVAILABLE:
+                    trading_manager = TradingTimeManager()
+                    if trading_manager.is_trading_day(datetime.now()):
+                        target_date = current_date
+                        logger.info(f"当前是交易日，获取今日({target_date})数据")
+                    else:
+                        # 获取上一个交易日
+                        target_date = self._get_previous_trading_day(current_date)
+                        logger.info(f"当前不是交易日，获取上一个交易日({target_date})数据")
                 else:
-                    # 获取上一个交易日
-                    target_date = self._get_previous_trading_day(current_date)
-                    logger.info(f"当前不是交易日，获取上一个交易日({target_date})数据")
+                    # 简单的备用实现：检查是否为工作日
+                    if current_date.weekday() < 5:  # 周一到周五
+                        target_date = current_date
+                        logger.info(f"当前是工作日，获取今日({target_date})数据")
+                    else:
+                        # 获取上一个工作日
+                        target_date = self._get_previous_trading_day(current_date)
+                        logger.info(f"当前不是工作日，获取上一个工作日({target_date})数据")
             else:
-                # 简单的备用实现：检查是否为工作日
-                if current_date.weekday() < 5:  # 周一到周五
-                    target_date = current_date
-                    logger.info(f"当前是工作日，获取今日({target_date})数据")
-                else:
-                    # 获取上一个工作日
-                    target_date = self._get_previous_trading_day(current_date)
-                    logger.info(f"当前不是工作日，获取上一个工作日({target_date})数据")
+                logger.info(f"获取指定日期({target_date})数据")
             
             all_data = []
             
@@ -490,18 +494,18 @@ class ETF159506RedisKlineGenerator:
         """从catalog文件获取今日数据（保持向后兼容）"""
         return self._get_data_from_catalog(datetime.now().date())
     
-    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True):
+    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None):
         """创建实时K线图"""
         if auto_refresh:
-            self._start_realtime_chart(save_path)
+            self._start_realtime_chart(save_path, target_date)
         else:
-            self._plot_kline_chart(save_path)
+            self._plot_kline_chart(save_path, target_date)
     
-    def _plot_kline_chart(self, save_path: str = None):
+    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None):
         """绘制价格走势图"""
         try:
             # 获取数据
-            kline_data = self.get_today_kline_data()
+            kline_data = self.get_today_kline_data(target_date)
             
             if not kline_data:
                 logger.warning("没有数据可绘制")
@@ -532,6 +536,12 @@ class ETF159506RedisKlineGenerator:
             data_date = start_time.date()
             logger.info(f"数据时间范围: {start_time} 到 {end_time}")
             logger.info(f"数据条数: {len(df)}")
+            
+            # 确定图表标题
+            if target_date:
+                chart_title = f'159506 ETF {target_date} 价格走势 (北京时间)'
+            else:
+                chart_title = f'159506 ETF {data_date} 价格走势 (北京时间)'
             
             # 过滤交易时间内的数据（9:30-15:00）
             from datetime import time as datetime_time
@@ -598,7 +608,7 @@ class ETF159506RedisKlineGenerator:
                        transform=ax1.transAxes, verticalalignment='top', 
                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
             
-            ax1.set_title('价格走势 (北京时间)')
+            ax1.set_title(chart_title)
             ax1.set_ylabel('价格')
             ax1.grid(True, alpha=0.3)
             ax1.legend()
@@ -630,7 +640,10 @@ class ETF159506RedisKlineGenerator:
             
             # 绘制成交量柱状图
             ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=1/1440)
-            ax2.set_title('成交量 (北京时间)')
+            if target_date:
+                ax2.set_title(f'成交量 {target_date} (北京时间)')
+            else:
+                ax2.set_title(f'成交量 {data_date} (北京时间)')
             ax2.set_ylabel('成交量')
             ax2.set_xlabel('时间 (北京时间)', fontsize=13)
             ax2.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
@@ -655,7 +668,10 @@ class ETF159506RedisKlineGenerator:
             ax3.bar(minute_index, macd_hist, color=macd_colors, width=1/1440, alpha=0.7, label='MACD柱')
             ax3.plot(minute_index, dif, color='orange', label='DIF线')      # DIF橙色
             ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线') # DEA天蓝色
-            ax3.set_title('MACD指标 (12,26,9)')
+            if target_date:
+                ax3.set_title(f'MACD指标 {target_date} (12,26,9)')
+            else:
+                ax3.set_title(f'MACD指标 {data_date} (12,26,9)')
             ax3.set_ylabel('MACD')
             ax3.set_xlabel('时间 (北京时间)', fontsize=13)
             ax3.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
@@ -685,7 +701,10 @@ class ETF159506RedisKlineGenerator:
             ax4.plot(minute_index, rsi24, color='purple', label='RSI(24)')       # 紫色
             ax4.axhline(70, color='red', linestyle='--', linewidth=1, label='超买70')
             ax4.axhline(30, color='green', linestyle='--', linewidth=1, label='超卖30')
-            ax4.set_title('RSI指标 (6,12,24)')
+            if target_date:
+                ax4.set_title(f'RSI指标 {target_date} (6,12,24)')
+            else:
+                ax4.set_title(f'RSI指标 {data_date} (6,12,24)')
             ax4.set_ylabel('RSI')
             ax4.set_xlabel('时间 (北京时间)', fontsize=13)
             ax4.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
@@ -711,7 +730,10 @@ class ETF159506RedisKlineGenerator:
             ax5.plot(minute_index, kdj_k, color='orange', label='K')         # 橙色
             ax5.plot(minute_index, kdj_d, color='deepskyblue', label='D')    # 天蓝色
             ax5.plot(minute_index, kdj_j, color='purple', label='J')         # 紫色
-            ax5.set_title('KDJ指标 (9,3,3)')
+            if target_date:
+                ax5.set_title(f'KDJ指标 {target_date} (9,3,3)')
+            else:
+                ax5.set_title(f'KDJ指标 {data_date} (9,3,3)')
             ax5.set_ylabel('KDJ')
             ax5.set_xlabel('时间 (北京时间)', fontsize=13)
             ax5.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
@@ -741,13 +763,13 @@ class ETF159506RedisKlineGenerator:
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
     
-    def _start_realtime_chart(self, save_path: str = None):
+    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None):
         """启动实时图表更新"""
         def update_chart():
             while True:
                 try:
                     time.sleep(30)  # 每30秒更新一次
-                    self._plot_kline_chart(save_path)
+                    self._plot_kline_chart(save_path, target_date)
                     logger.info("实时K线图已更新")
                 except Exception as e:
                     logger.error(f"实时图表更新失败: {e}")
@@ -761,8 +783,125 @@ class ETF159506RedisKlineGenerator:
 
 def main():
     """主函数"""
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description="159506 ETF K线图表生成器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  python etf_159506_catalog_loader.py                    # 生成今日K线图
+  python etf_159506_catalog_loader.py --date 2024-01-15  # 生成指定日期K线图
+  python etf_159506_catalog_loader.py -d 2024-01-15      # 简写形式
+  python etf_159506_catalog_loader.py --output my_chart.png  # 指定输出文件名
+  python etf_159506_catalog_loader.py --date 2024-01-15 --output 2024-01-15_chart.png
+        """
+    )
+    
+    parser.add_argument(
+        '--date', '-d',
+        type=str,
+        help='指定日期 (格式: YYYY-MM-DD，例如: 2024-01-15)'
+    )
+    
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        help='输出文件名 (默认: etf_159506_today_kline.png)'
+    )
+    
+    parser.add_argument(
+        '--realtime', '-r',
+        action='store_true',
+        help='启用实时更新模式 (每30秒自动更新)'
+    )
+    
+    args = parser.parse_args()
+    
+    # 解析日期参数
+    target_date = None
+    if args.date:
+        try:
+            target_date = datetime.strptime(args.date, '%Y-%m-%d').date()
+            print(f"📅 指定日期: {target_date}")
+        except ValueError:
+            print(f"❌ 日期格式错误: {args.date}")
+            print("   请使用 YYYY-MM-DD 格式，例如: 2024-01-15")
+            return
+    else:
+        # 交互式输入日期
+        print("\n📅 请选择操作:")
+        print("1. 生成今日/最近交易日的K线图")
+        print("2. 生成指定日期的K线图")
+        
+        while True:
+            try:
+                choice = input("\n请输入选择 (1 或 2): ").strip()
+                if choice == "1":
+                    print("✅ 将生成今日/最近交易日的K线图")
+                    break
+                elif choice == "2":
+                    while True:
+                        date_input = input("请输入日期 (格式: YYYY-MM-DD，例如: 2024-01-15): ").strip()
+                        if not date_input:
+                            print("❌ 日期不能为空，请重新输入")
+                            continue
+                        
+                        try:
+                            target_date = datetime.strptime(date_input, '%Y-%m-%d').date()
+                            print(f"✅ 指定日期: {target_date}")
+                            break
+                        except ValueError:
+                            print(f"❌ 日期格式错误: {date_input}")
+                            print("   请使用 YYYY-MM-DD 格式，例如: 2024-01-15")
+                    break
+                else:
+                    print("❌ 无效选择，请输入 1 或 2")
+            except KeyboardInterrupt:
+                print("\n\n👋 用户取消操作")
+                return
+            except EOFError:
+                print("\n\n👋 用户取消操作")
+                return
+    
+    # 处理输出文件名
+    output_filename = args.output
+    if not output_filename:
+        # 交互式输入输出文件名
+        if target_date:
+            default_filename = f"etf_159506_{target_date}_kline.png"
+        else:
+            default_filename = "etf_159506_today_kline.png"
+        
+        print(f"\n💾 输出文件名设置:")
+        print(f"默认文件名: {default_filename}")
+        
+        while True:
+            try:
+                filename_input = input(f"请输入输出文件名 (直接回车使用默认): ").strip()
+                if not filename_input:
+                    output_filename = default_filename
+                    print(f"✅ 使用默认文件名: {output_filename}")
+                    break
+                else:
+                    # 确保文件名有.png后缀
+                    if not filename_input.lower().endswith('.png'):
+                        filename_input += '.png'
+                    output_filename = filename_input
+                    print(f"✅ 输出文件名: {output_filename}")
+                    break
+            except KeyboardInterrupt:
+                print("\n\n👋 用户取消操作")
+                return
+            except EOFError:
+                print("\n\n👋 用户取消操作")
+                return
+    
     print("=" * 60)
     print("159506 ETF K线图表生成器")
+    if target_date:
+        print(f"目标日期: {target_date}")
+    else:
+        print("目标日期: 今日/最近交易日")
     print("=" * 60)
     
     try:
@@ -784,9 +923,17 @@ def main():
         else:
             print("⚠️  Redis中没有数据，将使用catalog文件数据")
         
-        # 直接生成K线图
-        print("\n正在生成今日K线图...")
-        kline_generator.create_realtime_kline_chart("etf_159506_today_kline.png", auto_refresh=False)
+        # 生成K线图
+        if target_date:
+            print(f"\n正在生成 {target_date} 的K线图...")
+        else:
+            print("\n正在生成今日K线图...")
+        
+        kline_generator.create_realtime_kline_chart(
+            save_path=output_filename,
+            auto_refresh=args.realtime,
+            target_date=target_date
+        )
         
     except Exception as e:
         print(f"❌ 运行失败: {e}")
