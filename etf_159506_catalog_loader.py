@@ -719,7 +719,7 @@ class ETF159506RedisKlineGenerator:
             ema26 = minute_close.ewm(span=26, adjust=False).mean()
             dif = ema12 - ema26  # DIF
             dea = dif.ewm(span=9, adjust=False).mean()  # DEA
-            macd_hist = dif - dea # MACD柱子
+            macd_hist = 2 * (dif - dea) # MACD柱子
             macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
             ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
             ax3.plot(minute_index, dif, color='orange', label='DIF线')      # DIF橙色
