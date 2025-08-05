@@ -494,14 +494,14 @@ class ETF159506RedisKlineGenerator:
         """从catalog文件获取今日数据（保持向后兼容）"""
         return self._get_data_from_catalog(datetime.now().date())
     
-    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None):
+    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None, trade_signals: List[Dict] = None):
         """创建实时K线图"""
         if auto_refresh:
-            self._start_realtime_chart(save_path, target_date)
+            self._start_realtime_chart(save_path, target_date, trade_signals)
         else:
-            self._plot_kline_chart(save_path, target_date)
+            self._plot_kline_chart(save_path, target_date, trade_signals)
     
-    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None):
+    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
         """绘制价格走势图"""
         try:
             # 获取数据
@@ -681,6 +681,73 @@ class ETF159506RedisKlineGenerator:
             ax1.set_xlabel('时间 (北京时间)', fontsize=13)
             ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             
+            # ====== 添加买卖点标记 ======
+            if trade_signals and len(trade_signals) > 0:
+                buy_signals = []
+                sell_signals = []
+                
+                for signal in trade_signals:
+                    # 转换时间戳为pandas datetime
+                    if isinstance(signal['timestamp'], str):
+                        signal_time = pd.to_datetime(signal['timestamp'])
+                    else:
+                        signal_time = signal['timestamp']
+                    
+                    # 确保时间戳有时区信息，与图表数据保持一致
+                    # 将datetime对象转换为pandas Timestamp
+                    if not isinstance(signal_time, pd.Timestamp):
+                        signal_time = pd.Timestamp(signal_time)
+                    
+                    if signal_time.tz is None:
+                        # 如果没有时区信息，假设是UTC时间，转换为北京时间
+                        import pytz
+                        utc_tz = pytz.UTC
+                        beijing_tz = pytz.timezone('Asia/Shanghai')
+                        signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
+                    
+                    # 检查时间是否在图表范围内
+                    if signal_time >= mapped_df.index.min() and signal_time <= mapped_df.index.max():
+                        if signal['side'] == 'BUY':
+                            buy_signals.append({
+                                'timestamp': signal_time,
+                                'price': signal['price']
+                            })
+                        elif signal['side'] == 'SELL':
+                            sell_signals.append({
+                                'timestamp': signal_time,
+                                'price': signal['price']
+                            })
+                
+                # 绘制买入点（红色三角形向上）
+                if buy_signals:
+                    buy_df = pd.DataFrame(buy_signals)
+                    ax1.scatter(buy_df['timestamp'], buy_df['price'], 
+                               color='red', marker='^', s=150, label='买入信号', zorder=10, alpha=0.8)
+                    # 添加买入点标注
+                    for _, row in buy_df.iterrows():
+                        ax1.annotate(f'买入\n{row["price"]:.3f}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(10, 10), textcoords='offset points',
+                                   fontsize=8, color='red', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='red', alpha=0.2))
+                
+                # 绘制卖出点（绿色三角形向下）
+                if sell_signals:
+                    sell_df = pd.DataFrame(sell_signals)
+                    ax1.scatter(sell_df['timestamp'], sell_df['price'], 
+                               color='green', marker='v', s=150, label='卖出信号', zorder=10, alpha=0.8)
+                    # 添加卖出点标注
+                    for _, row in sell_df.iterrows():
+                        ax1.annotate(f'卖出\n{row["price"]:.3f}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(10, -20), textcoords='offset points',
+                                   fontsize=8, color='green', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='green', alpha=0.2))
+                
+                logger.info(f"添加了 {len(buy_signals)} 个买入点和 {len(sell_signals)} 个卖出点")
+            else:
+                logger.info("没有交易信号数据")
+            
             # ====== ax2成交量 ======
             # 跳过第一条（因为是累积成交量）
             vol_df = mapped_df.iloc[1:].copy()
@@ -827,13 +894,13 @@ class ETF159506RedisKlineGenerator:
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
     
-    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None):
+    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
         """启动实时图表更新"""
         def update_chart():
             while True:
                 try:
                     time.sleep(1)  # 每30秒更新一次
-                    self._plot_kline_chart(save_path, target_date)
+                    self._plot_kline_chart(save_path, target_date, trade_signals)
                     logger.info("实时K线图已更新")
                 except Exception as e:
                     logger.error(f"实时图表更新失败: {e}")

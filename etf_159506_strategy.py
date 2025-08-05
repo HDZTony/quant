@@ -60,6 +60,9 @@ class ETF159506Strategy(Strategy):
         # 交易状态
         self.last_signal = None  # 记录上一次信号类型
         self.signal_confirmation_bars = 2  # 信号确认K线数
+        
+        # 交易信号记录
+        self.trade_signals = []
 
     def on_start(self):
         """策略启动时调用"""
@@ -79,7 +82,11 @@ class ETF159506Strategy(Strategy):
         # 更新MACD指标
         self.macd.handle_bar(bar)
         
+        # 添加调试信息
+        self._log.info(f"处理K线: 时间={pd.to_datetime(bar.ts_event, unit='ns')}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
+        
         if not self.macd.initialized:
+            self._log.info("MACD指标未初始化，跳过信号检测")
             return
 
         # 更新历史数据
@@ -128,7 +135,11 @@ class ETF159506Strategy(Strategy):
     
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
+        # 添加调试信息
+        self._log.info(f"检查MACD信号: macd_history长度={len(self.macd_history)}, signal_history长度={len(self.signal_history)}")
+        
         if len(self.macd_history) < 3 or len(self.signal_history) < 3:
+            self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.macd_history)}, signal_history={len(self.signal_history)}")
             return
         
         current_macd = self.macd_history[-1]
@@ -146,11 +157,37 @@ class ETF159506Strategy(Strategy):
         if golden_cross:
             self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "golden_cross"
+            
+            # 立即记录买入信号时间
+            buy_signal = {
+                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                'price': bar.close.as_double(),
+                'side': 'BUY',
+                'quantity': 0,  # 暂时设为0，执行时再更新
+                'order_id': 'signal_detected',
+                'signal_type': 'golden_cross'
+            }
+            self.trade_signals.append(buy_signal)
+            self._log.info(f"记录买入信号时间: {buy_signal}")
+            
             self.execute_buy_signal(bar)
         
         elif death_cross:
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "death_cross"
+            
+            # 立即记录卖出信号时间
+            sell_signal = {
+                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                'price': bar.close.as_double(),
+                'side': 'SELL',
+                'quantity': 0,  # 暂时设为0，执行时再更新
+                'order_id': 'signal_detected',
+                'signal_type': 'death_cross'
+            }
+            self.trade_signals.append(sell_signal)
+            self._log.info(f"记录卖出信号时间: {sell_signal}")
+            
             self.execute_sell_signal(bar)
     
     def execute_buy_signal(self, bar: Bar):
@@ -175,7 +212,20 @@ class ETF159506Strategy(Strategy):
             quantity=trade_quantity,
         )
         self.submit_order(order)
+        
+        # 记录买入信号
+        buy_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'BUY',
+            'quantity': trade_quantity.as_double(),
+            'order_id': str(order.client_order_id),
+            'signal_type': 'golden_cross'
+        }
+        self.trade_signals.append(buy_signal)
+        
         self._log.info(f"金叉买入信号: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"记录买入信号: {buy_signal}")
     
     def execute_sell_signal(self, bar: Bar):
         """执行卖出信号"""
@@ -183,8 +233,20 @@ class ETF159506Strategy(Strategy):
             self._log.info("没有持仓，跳过卖出信号")
             return
         
+        # 记录卖出信号
+        sell_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'SELL',
+            'quantity': self.position.quantity.as_double(),
+            'order_id': 'close_position',
+            'signal_type': 'death_cross'
+        }
+        self.trade_signals.append(sell_signal)
+        
         self.close_position(self.position)
         self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}")
+        self._log.info(f"记录卖出信号: {sell_signal}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
