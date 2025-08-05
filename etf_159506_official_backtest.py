@@ -189,25 +189,48 @@ class ETF159506OfficialBacktest:
             logger.error(f"转换数据失败: {e}")
             raise
     
-    def collect_trade_signals(self, result: BacktestResult, engine_instance=None):
+    def collect_trade_signals(self, result: BacktestResult, backtest_node: BacktestNode = None):
         """收集交易信号数据"""
         try:
             logger.info("开始收集交易信号...")
             
-            # 方法1: 从引擎实例获取策略的交易信号
-            if engine_instance and hasattr(engine_instance, 'trader'):
-                logger.info("从引擎实例获取策略交易信号...")
-                
+            # 方法1: 从 BacktestNode 中获取引擎实例
+            if backtest_node:
                 try:
-                    # 获取所有策略实例
-                    strategies = engine_instance.trader.strategies()
-                    for strategy in strategies:
-                        if hasattr(strategy, 'trade_signals') and strategy.trade_signals:
-                            logger.info(f"从策略 {strategy.id} 获取到 {len(strategy.trade_signals)} 个交易信号")
-                            self.trade_signals.extend(strategy.trade_signals)
+                    logger.info("从 BacktestNode 获取引擎实例...")
+                    
+                    # 获取所有引擎
+                    engines = backtest_node.get_engines()
+                    logger.info(f"找到 {len(engines)} 个引擎")
+                    
+                    for engine in engines:
+                        logger.info(f"引擎类型: {type(engine)}")
+                        
+                        if hasattr(engine, 'trader'):
+                            logger.info(f"找到trader属性: {engine.trader}")
+                            strategies = engine.trader.strategies()
+                            logger.info(f"策略列表: {strategies}")
+                            
+                            for strategy in strategies:
+                                logger.info(f"策略ID: {strategy.id}")
+                                logger.info(f"策略属性: {dir(strategy)}")
+                                
+                                # 从策略实例的 trade_signals 获取
+                                if hasattr(strategy, 'trade_signals') and strategy.trade_signals:
+                                    logger.info(f"从策略 {strategy.id} 获取到 {len(strategy.trade_signals)} 个交易信号")
+                                    self.trade_signals.extend(strategy.trade_signals)
+                                
+                                # 从策略实例的 _saved_trade_signals 获取（备用）
+                                if hasattr(strategy, '_saved_trade_signals') and strategy._saved_trade_signals:
+                                    logger.info(f"从策略 {strategy.id} 的保存信号中获取到 {len(strategy._saved_trade_signals)} 个交易信号")
+                                    self.trade_signals.extend(strategy._saved_trade_signals)
+                        else:
+                            logger.warning("引擎没有trader属性")
                             
                 except Exception as e:
-                    logger.warning(f"从引擎获取策略交易信号失败: {e}")
+                    logger.warning(f"从 BacktestNode 获取策略交易信号失败: {e}")
+                    import traceback
+                    logger.warning(f"详细错误: {traceback.format_exc()}")
             
             # 方法2: 如果仍然没有信号，创建模拟信号用于测试
             if not self.trade_signals:
@@ -329,6 +352,7 @@ class ETF159506OfficialBacktest:
                 engine=engine_config,
                 venues=[venue_config],
                 data=[data_config],
+                dispose_on_completion=False,  # 不销毁引擎，以便获取策略实例
             )
             
             return run_config
@@ -337,7 +361,7 @@ class ETF159506OfficialBacktest:
             logger.error(f"创建回测配置失败: {e}")
             raise
     
-    def run_backtest(self, start_date: date, end_date: date) -> BacktestResult:
+    def run_backtest(self, start_date: date, end_date: date) -> tuple[BacktestResult, BacktestNode]:
         """运行回测"""
         try:
             logger.info(f"开始回测: {start_date} 到 {end_date}")
@@ -357,7 +381,7 @@ class ETF159506OfficialBacktest:
             result = results[0]
             logger.info(f"回测完成: {result.run_id}")
             
-            return result
+            return result, backtest_node
             
         except Exception as e:
             logger.error(f"运行回测失败: {e}")
@@ -406,10 +430,10 @@ class ETF159506OfficialBacktest:
             logger.info(f"开始 7-25 日回测...")
             
             # 运行回测
-            result = self.run_backtest(start_date, end_date)
+            result, backtest_node = self.run_backtest(start_date, end_date)
             
             # 收集交易信号
-            self.collect_trade_signals(result)
+            self.collect_trade_signals(result, backtest_node)
             
             # 分析结果
             self.analyze_results(result)

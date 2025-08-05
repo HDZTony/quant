@@ -75,6 +75,15 @@ class ETF159506Strategy(Strategy):
         if self.position and self.position.quantity.as_double() > 0:
             self.close_all_positions(self.config.instrument_id)
         self.unsubscribe_bars(self.config.bar_type)
+        
+        # 保存交易信号到策略实例变量中，供回测系统获取
+        if hasattr(self, 'trade_signals') and self.trade_signals:
+            # 将交易信号保存到策略实例中，这样回测系统可以获取到
+            if not hasattr(self, '_saved_trade_signals'):
+                self._saved_trade_signals = []
+            self._saved_trade_signals.extend(self.trade_signals)
+            self._log.info(f"策略停止时保存了 {len(self.trade_signals)} 个交易信号")
+        
         self._log.info("ETF159506 MACD金叉死叉策略已停止")
 
     def on_bar(self, bar: Bar):
