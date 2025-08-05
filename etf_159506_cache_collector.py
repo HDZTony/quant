@@ -512,6 +512,52 @@ class ETF159506CacheManager:
             
         except Exception as e:
             logger.error(f"清理旧数据失败: {e}")
+    
+    def cleanup_corrupted_files(self, catalog_path: str = None):
+        """清理损坏的Parquet文件"""
+        try:
+            # 如果没有提供catalog_path，使用默认路径
+            if catalog_path is None:
+                catalog_path = "catalog/etf_159506_cache"
+            
+            catalog_path = Path(catalog_path)
+            if not catalog_path.exists():
+                logger.info(f"目录不存在，跳过清理: {catalog_path}")
+                return
+            
+            # 查找所有.parquet文件
+            parquet_files = list(catalog_path.glob("*.parquet"))
+            corrupted_count = 0
+            
+            for file_path in parquet_files:
+                try:
+                    # 检查文件大小
+                    file_size = file_path.stat().st_size
+                    if file_size < 100:  # 小于100字节的文件可能是损坏的
+                        logger.warning(f"发现损坏文件: {file_path} (大小: {file_size}字节)")
+                        # 备份并删除
+                        backup_path = file_path.with_suffix('.corrupted')
+                        file_path.rename(backup_path)
+                        corrupted_count += 1
+                        continue
+                    
+                    # 尝试读取文件验证完整性
+                    pd.read_parquet(file_path)
+                    
+                except Exception as e:
+                    logger.warning(f"发现损坏文件: {file_path} (错误: {e})")
+                    # 备份并删除
+                    backup_path = file_path.with_suffix('.corrupted')
+                    file_path.rename(backup_path)
+                    corrupted_count += 1
+            
+            if corrupted_count > 0:
+                logger.info(f"清理了 {corrupted_count} 个损坏的Parquet文件")
+            else:
+                logger.info("未发现损坏的Parquet文件")
+            
+        except Exception as e:
+            logger.error(f"清理损坏文件失败: {e}")
 
 
 class ETF159506ServerManager:
@@ -526,7 +572,8 @@ class ETF159506ServerManager:
         url = f"{self.base_url}?market={market}&type={type}&token={self.token}"
         
         try:
-            response = requests.get(url, timeout=10)
+            # 移除代理配置，直接连接，避免代理问题
+            response = requests.get(url, timeout=10, proxies=None)
             data = response.json()
             
             if data.get("code") == "0":
@@ -747,7 +794,7 @@ class ETF159506CacheWebSocketClient:
         # 配置 - 优化数据保存
         self.save_interval = 10  # 5分钟保存一次（减少文件数量）
         self.merge_interval = 3600  # 1小时合并一次文件
-        self.trading_time_check_interval = 30  # 30秒检查一次交易时间
+        self.trading_time_check_interval = 60  # 改为60秒检查一次交易时间，减少检查频率
         self.catalog_path = f"catalog/etf_159506_cache"
         
         # 数据缓冲区
@@ -759,6 +806,20 @@ class ETF159506CacheWebSocketClient:
     
     def connect(self):
         """连接WebSocket服务器"""
+        # 先清理之前的连接资源
+        if hasattr(self, 'ws') and self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+            self.ws = None
+        
+        if hasattr(self, 'ws_thread') and self.ws_thread and self.ws_thread.is_alive():
+            try:
+                self.ws_thread.join(timeout=2)
+            except:
+                pass
+        
         server = self.server_manager.get_server("ab", "websocket")
         if not server:
             logger.error("无法获取服务器地址")
@@ -785,16 +846,22 @@ class ETF159506CacheWebSocketClient:
         self.ws_thread.start()
         
         # 等待连接建立或超时
-        timeout = 10  # 减少到10秒超时
+        timeout = 15  # 增加到15秒超时
         start_time = time.time()
         while not self.is_connected and (time.time() - start_time) < timeout:
-            time.sleep(0.01)  # 减少到0.01秒检查间隔
+            time.sleep(0.1)  # 增加到0.1秒检查间隔，减少CPU占用
         
         if self.is_connected:
             logger.info("WebSocket连接成功建立")
             return True
         else:
             logger.error("WebSocket连接超时")
+            # 清理失败的连接
+            if hasattr(self, 'ws') and self.ws:
+                try:
+                    self.ws.close()
+                except:
+                    pass
             return False
     
     def on_open(self, ws):
@@ -809,6 +876,10 @@ class ETF159506CacheWebSocketClient:
         
         # 移除心跳机制 - JVQuant服务器不支持心跳
         # self.start_heartbeat(ws)
+        
+        # 启动时清理损坏的文件
+        self.cache_manager.cleanup_corrupted_files(self.catalog_path)
+        
         self.start_auto_save()
         self.start_diagnostic_monitor()
         self.start_trading_time_check()
@@ -818,8 +889,7 @@ class ETF159506CacheWebSocketClient:
         try:
             # 尝试解析消息类型
             if isinstance(message, str):
-                logger.debug(f"收到文本消息: {message}")
-                # 处理文本消息（如心跳响应等）
+                # 减少日志输出，只记录重要信息
                 if message.startswith('-1#'):
                     logger.error(f"收到服务器错误消息: {message}")
                     if "账户连接数已达并发上限" in message:
@@ -838,9 +908,9 @@ class ETF159506CacheWebSocketClient:
                     self.last_data_time = datetime.now()
                     self.process_market_data(message)
                 elif message == 'pong':
-                    logger.debug("收到心跳响应")
+                    pass  # 静默处理心跳响应
                 elif message == "":
-                    logger.debug("收到空消息（心跳响应）")
+                    pass  # 静默处理空消息
                 else:
                     logger.debug(f"收到其他文本消息: {message}")
             else:
@@ -852,9 +922,9 @@ class ETF159506CacheWebSocketClient:
                     self.data_receive_count += 1
                     self.last_data_time = datetime.now()
                     
-                    # 减少日志输出，只在每50条数据时输出一次（减少日志开销）
-                    if self.data_receive_count % 50 == 0:
-                        logger.info(f"收到二进制数据 (第{self.data_receive_count}条): {data_str[:100]}...")
+                    # 减少日志输出，只在每100条数据时输出一次（进一步减少日志开销）
+                    if self.data_receive_count % 100 == 0:
+                        logger.info(f"收到二进制数据 (第{self.data_receive_count}条): {data_str[:50]}...")
                     
                     lines = data_str.strip().split('\n')
                     for line in lines:
@@ -1031,7 +1101,7 @@ class ETF159506CacheWebSocketClient:
         """诊断监控循环"""
         while not self.stop_monitor:
             try:
-                time.sleep(60)  # 每1分钟输出一次诊断状态（提高监控频率）
+                time.sleep(120)  # 改为每2分钟输出一次诊断状态，减少日志输出频率
                 
                 if not self.stop_monitor:
                     self.print_diagnostic_status()
@@ -1042,49 +1112,69 @@ class ETF159506CacheWebSocketClient:
     
     def trading_time_check_loop(self):
         """交易时间检查循环"""
+        last_reconnect_time = 0
+        reconnect_cooldown = 300  # 5分钟冷却时间，防止疯狂重连
+        consecutive_failures = 0
+        max_consecutive_failures = 3  # 最大连续失败次数
+        
         while not self.stop_trading_time_check:
             try:
                 time.sleep(self.trading_time_check_interval)
                 
                 if not self.stop_trading_time_check and self.trading_time_manager:
                     current_status = self.trading_time_manager.get_trading_status()
+                    current_time = time.time()
                     
-                    # 如果当前是交易时间但未连接，则连接
+                    # 如果当前是交易时间但未连接，则连接（增加冷却时间和失败次数控制）
                     if current_status['is_trading_time'] and not self.is_connected:
+                        # 检查是否在冷却期内
+                        if current_time - last_reconnect_time < reconnect_cooldown:
+                            logger.debug(f"重连冷却中，剩余 {reconnect_cooldown - (current_time - last_reconnect_time):.0f} 秒")
+                            continue
+                        
+                        # 检查连续失败次数
+                        if consecutive_failures >= max_consecutive_failures:
+                            logger.warning(f"连续失败 {consecutive_failures} 次，暂停重连 {reconnect_cooldown} 秒")
+                            last_reconnect_time = current_time
+                            consecutive_failures = 0
+                            continue
+                            
                         logger.info(f"🔗 检测到交易时间，开始连接: {current_status['current_time']}")
                         logger.info(f"   当前连接状态: {self.is_connected}")
-                        logger.info(f"   停止标志状态: save={self.stop_save}, monitor={self.stop_monitor}, trading_check={self.stop_trading_time_check}")
+                        logger.info(f"   连续失败次数: {consecutive_failures}")
                         
                         # 重置停止标志
-                        # self.stop_heartbeat = False  # 移除心跳标志
                         self.stop_save = False
                         self.stop_monitor = False
-                        # 确保交易时间检查线程继续运行
                         self.stop_trading_time_check = False
-                        logger.info("✅ 重置所有线程停止标志，准备重新连接")
                         
                         # 尝试连接
                         connect_result = self.connect()
                         if connect_result:
                             logger.info("✅ 自动重连成功")
+                            consecutive_failures = 0  # 重置失败计数
+                            last_reconnect_time = current_time
                         else:
                             logger.error("❌ 自动重连失败")
+                            consecutive_failures += 1
+                            last_reconnect_time = current_time
                     
                     # 如果当前不是交易时间但已连接，则断开
                     elif not current_status['is_trading_time'] and self.is_connected:
                         logger.info(f"🔌 检测到非交易时间，断开连接: {current_status['current_time']}")
                         logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
                         self.disconnect()
+                        consecutive_failures = 0  # 正常断开时重置失败计数
                     
                     # 每5分钟输出一次交易时间状态
-                    if int(time.time()) % 300 == 0:  # 5分钟 = 300秒
+                    if int(current_time) % 300 == 0:  # 5分钟 = 300秒
                         logger.info(f"📊 交易时间状态: {current_status}")
                         logger.info(f"   连接状态: {self.is_connected}")
-                        logger.info(f"   停止标志: save={self.stop_save}, monitor={self.stop_monitor}, trading_check={self.stop_trading_time_check}")
+                        logger.info(f"   连续失败次数: {consecutive_failures}")
+                        logger.info(f"   距离下次重连: {max(0, reconnect_cooldown - (current_time - last_reconnect_time)):.0f}秒")
                     
             except Exception as e:
                 logger.error(f"交易时间检查循环错误: {e}")
-                break
     
     def print_diagnostic_status(self):
         """打印诊断状态信息"""
@@ -1181,23 +1271,32 @@ Cache统计:
                 time.sleep(self.save_interval)
                 
                 if not self.stop_save:
-                    # 保存数据到Parquet文件
-                    self._save_buffer_data()
+                    # 增加数据量检查，避免频繁保存空数据
+                    cache_data = self.cache_manager.get_historical_data(limit=100)
+                    quote_count = len(cache_data.get('quote_ticks', []))
+                    trade_count = len(cache_data.get('trade_ticks', []))
                     
-                    # 检查是否需要合并文件
-                    self._merge_files_if_needed()
-                    
-                    # 清理旧数据（保留24小时）
-                    self.cache_manager.clear_old_data(24)
+                    if quote_count > 0 or trade_count > 0:
+                        # 保存数据到Parquet文件
+                        self._save_buffer_data()
+                        
+                        # 检查是否需要合并文件
+                        self._merge_files_if_needed()
+                        
+                        # 清理旧数据（保留24小时）
+                        self.cache_manager.clear_old_data(24)
+                    else:
+                        logger.debug("跳过保存：无新数据")
                     
             except Exception as e:
                 logger.error(f"自动保存失败: {e}")
+                time.sleep(30)  # 出错时等待30秒，减少错误频率
     
     def _save_buffer_data(self):
         """保存缓冲区数据"""
         try:
-            # 获取当前缓存数据
-            cache_data = self.cache_manager.get_historical_data(limit=10000)
+            # 获取当前缓存数据，减少数据量避免内存占用过高
+            cache_data = self.cache_manager.get_historical_data(limit=1000)
             
             if not cache_data or not cache_data.get('trade_ticks'):
                 return
@@ -1226,24 +1325,58 @@ Cache统计:
             
             # 如果文件已存在，读取并合并
             if filepath.exists():
-                existing_df = pd.read_parquet(filepath)
-                new_df = pd.DataFrame(trade_data)
-                
-                # 合并数据，去重
-                combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
-                combined_df = combined_df.sort_values('timestamp')
+                try:
+                    # 检查文件大小，如果太小可能是损坏文件
+                    file_size = filepath.stat().st_size
+                    if file_size < 100:  # 小于100字节的文件可能是损坏的
+                        logger.warning(f"文件太小({file_size}字节)，可能是损坏文件，创建新文件")
+                        combined_df = pd.DataFrame(trade_data)
+                    else:
+                        existing_df = pd.read_parquet(filepath)
+                        new_df = pd.DataFrame(trade_data)
+                        
+                        # 合并数据，去重
+                        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                        combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
+                        combined_df = combined_df.sort_values('timestamp')
+                except Exception as read_error:
+                    logger.warning(f"读取现有文件失败，创建新文件: {read_error}")
+                    # 备份损坏的文件
+                    try:
+                        backup_path = filepath.with_suffix('.parquet.bak')
+                        filepath.rename(backup_path)
+                        logger.info(f"已备份损坏文件到: {backup_path}")
+                    except Exception as backup_error:
+                        logger.error(f"备份损坏文件失败: {backup_error}")
+                    combined_df = pd.DataFrame(trade_data)
             else:
                 combined_df = pd.DataFrame(trade_data)
             
-            # 保存文件
-            combined_df.to_parquet(filepath, index=False)
-            
-            logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
+            # 保存文件（使用临时文件避免并发写入问题）
+            temp_filepath = filepath.with_suffix('.tmp')
+            try:
+                combined_df.to_parquet(temp_filepath, index=False)
+                # 原子性替换文件
+                if filepath.exists():
+                    filepath.unlink()  # 删除原文件
+                temp_filepath.rename(filepath)
+                logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
+                self.last_save_time = datetime.now()
+            except Exception as save_error:
+                logger.error(f"保存文件失败: {save_error}")
+                # 清理临时文件
+                if temp_filepath.exists():
+                    temp_filepath.unlink()
+                return
+            finally:
+                # 确保临时文件被清理
+                if temp_filepath.exists():
+                    temp_filepath.unlink()
             self.last_save_time = datetime.now()
             
         except Exception as e:
             logger.error(f"保存缓冲区数据失败: {e}")
+            # 出错时不抛出异常，避免影响主循环
     
     def _merge_files_if_needed(self):
         """如果需要，合并文件"""

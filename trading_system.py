@@ -69,8 +69,8 @@ class JVQuantTradingClient:
             url = f"http://{self.trade_server}/login"
             params = {
                 'token': self.token,
-                'acc': account,
-                'pass': password
+                'acc': account, #541460031518
+                'pass': password #882200
             }
             
             print(f"正在登录交易柜台: {account}")

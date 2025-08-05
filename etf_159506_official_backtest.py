@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+# -*- coding:utf-8 -*-
+"""
+159506 ETF 官方 NautilusTrader 回测系统
+使用官方架构进行生产级回测
+"""
+
+import sys
+from pathlib import Path
+from decimal import Decimal
+from datetime import datetime, date
+import logging
+import pandas as pd
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import numpy as np
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import numpy as np
+
+# NautilusTrader imports
+from nautilus_trader.backtest.node import BacktestNode
+from nautilus_trader.backtest.node import BacktestDataConfig
+from nautilus_trader.backtest.node import BacktestEngineConfig
+from nautilus_trader.backtest.node import BacktestRunConfig
+from nautilus_trader.backtest.node import BacktestVenueConfig
+from nautilus_trader.backtest.results import BacktestResult
+from nautilus_trader.config import LoggingConfig
+from nautilus_trader.config import ImportableStrategyConfig
+from nautilus_trader.model.identifiers import TraderId, Venue, InstrumentId, Symbol
+from nautilus_trader.model.enums import AccountType, OmsType
+from nautilus_trader.model.currencies import CNY
+from nautilus_trader.model.objects import Money
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.data import BarType
+
+# 导入策略和工具
+from etf_159506_strategy import ETF159506Strategy
+from etf_159506_strategy_config import ETF159506Config
+from etf_159506_instrument import create_etf_159506_default, create_etf_159506_bar_type
+from etf_159506_catalog_loader import ETF159506RedisKlineGenerator
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('etf_159506_backtest.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class ETF159506OfficialBacktest:
+    """159506 ETF 官方回测系统"""
+    
+    def __init__(self, catalog_path: str = "catalog/etf_159506_cache"):
+        self.catalog_path = Path(catalog_path)
+        self.catalog = None
+        
+        # 使用 etf_159506_instrument.py 中的工具定义
+        self.instrument = create_etf_159506_default()
+        self.instrument_id = self.instrument.id
+        
+        # 创建BarType
+        bar_type_str = create_etf_159506_bar_type()
+        self.bar_type = BarType.from_str(bar_type_str)
+        
+        # 初始化 catalog
+        self._init_catalog()
+        
+    def _init_catalog(self):
+        """初始化数据 catalog"""
+        try:
+            if not self.catalog_path.exists():
+                raise FileNotFoundError(f"Catalog 路径不存在: {self.catalog_path}")
+            
+            self.catalog = ParquetDataCatalog(self.catalog_path)
+            logger.info(f"Catalog 初始化成功: {self.catalog_path}")
+            
+            # 检查数据
+            instruments = self.catalog.instruments()
+            logger.info(f"Catalog 中的工具数量: {len(instruments)}")
+            
+            quote_ticks = self.catalog.quote_ticks()
+            trade_ticks = self.catalog.trade_ticks()
+            logger.info(f"Quote ticks: {len(quote_ticks)}, Trade ticks: {len(trade_ticks)}")
+            
+            # 确保工具有效
+            if not instruments:
+                logger.info("Catalog 中没有工具，添加工具...")
+                self.catalog.write_data([self.instrument])
+                logger.info("已添加工具到 catalog")
+            
+            # 强制重新加载数据以确保精度一致
+            logger.info("强制重新加载数据以确保精度一致...")
+            self._load_data_with_catalog_loader()
+            
+        except Exception as e:
+            logger.error(f"初始化 Catalog 失败: {e}")
+            raise
+    
+    def _load_data_with_catalog_loader(self):
+        """使用 catalog loader 加载数据"""
+        try:
+            # 创建 catalog loader
+            catalog_loader = ETF159506RedisKlineGenerator(catalog_path=str(self.catalog_path))
+            
+            # 加载 2025-07-25 的数据
+            target_date = datetime(2025, 7, 25).date()
+            logger.info(f"正在加载 {target_date} 的数据...")
+            
+            # 获取数据
+            kline_data = catalog_loader.get_today_kline_data(target_date)
+            logger.info(f"从 catalog loader 获取到 {len(kline_data)} 条数据")
+            
+            if len(kline_data) > 0:
+                # 将数据转换为 NautilusTrader 格式并写入 catalog
+                self._convert_and_write_data(kline_data)
+            else:
+                logger.warning(f"没有找到 {target_date} 的数据")
+                
+        except Exception as e:
+            logger.error(f"使用 catalog loader 加载数据失败: {e}")
+    
+    def _convert_and_write_data(self, kline_data):
+        """将数据转换为 NautilusTrader 格式并写入 catalog"""
+        try:
+            from nautilus_trader.model.data import Bar
+            from nautilus_trader.model.objects import Price, Quantity
+            from nautilus_trader.model.enums import BarAggregation, PriceType
+            
+            logger.info("正在转换数据为1分钟K线格式...")
+            
+            # 检查数据类型
+            if isinstance(kline_data, list):
+                # 如果是列表，转换为 DataFrame
+                df = pd.DataFrame(kline_data)
+            else:
+                df = kline_data
+            
+            # 按1分钟时间窗口聚合数据
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+            
+            # 创建1分钟K线数据
+            bars = []
+            
+            # 按1分钟重采样
+            resampled = df.resample('1T').agg({
+                'price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'
+            }).dropna()
+            
+            # 重命名列
+            resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+            
+            for timestamp, row in resampled.iterrows():
+                try:
+                    # 创建Bar对象
+                    bar = Bar(
+                        bar_type=self.bar_type,
+                        open=Price.from_str(f"{row['open']:.3f}"),
+                        high=Price.from_str(f"{row['high']:.3f}"),
+                        low=Price.from_str(f"{row['low']:.3f}"),
+                        close=Price.from_str(f"{row['close']:.3f}"),
+                        volume=Quantity.from_int(int(row['volume'])),
+                        ts_event=int(timestamp.timestamp() * 1_000_000_000),  # 纳秒
+                        ts_init=int(timestamp.timestamp() * 1_000_000_000),
+                    )
+                    bars.append(bar)
+                    
+                except Exception as e:
+                    logger.warning(f"转换K线数据失败: {e}, 数据: {row}")
+                    continue
+            
+            # 写入K线数据
+            if bars:
+                self.catalog.write_data(bars)
+                logger.info(f"已写入 {len(bars)} 条1分钟K线数据")
+            else:
+                logger.warning("没有成功转换任何K线数据")
+            
+        except Exception as e:
+            logger.error(f"转换数据失败: {e}")
+            raise
+    
+
+    
+    def create_backtest_config(self, start_date: date, end_date: date) -> BacktestRunConfig:
+        """创建回测配置"""
+        try:
+            # 使用 etf_159506_instrument.py 中的 BarType 创建函数
+            bar_type_str = create_etf_159506_bar_type()
+            bar_spec = BarType.from_str(bar_type_str)
+            
+            # 数据配置 - 使用1分钟K线数据
+            data_config = BacktestDataConfig(
+                catalog_path=str(self.catalog_path),
+                data_cls="nautilus_trader.model.data:Bar",
+                instrument_id=self.instrument_id,
+                start_time=datetime.combine(start_date, datetime.min.time()),
+                end_time=datetime.combine(end_date, datetime.max.time()),
+                bar_spec=bar_spec,  # 指定使用1分钟K线
+            )
+            
+            # 交易场所配置
+            venue_config = BacktestVenueConfig(
+                name="SZSE",
+                oms_type="NETTING",
+                account_type="MARGIN",
+                base_currency="CNY",
+                starting_balances=["230000 CNY"]
+            )
+            
+            # 引擎配置
+            engine_config = BacktestEngineConfig(
+                strategies=[
+                    ImportableStrategyConfig(
+                        strategy_path="etf_159506_strategy:ETF159506Strategy",
+                        config_path="etf_159506_strategy_config:ETF159506Config",
+                        config={
+                            "instrument_id": str(self.instrument_id),
+                            "bar_type": str(bar_spec),
+                            "venue": "SZSE",
+                            "trade_size": 1000,  # 固定交易1000股，避免满仓
+                            "fast_ema_period": 12,
+                            "slow_ema_period": 26,
+                            "volume_threshold": 500000,
+                            "stop_loss_pct": 100,  
+                            "take_profit_pct": 100,  
+                            "max_daily_trades": 100,
+                            "lookback_period": 10,
+                            "price_threshold": 0.003,
+                            "emulation_trigger": "NO_TRIGGER",
+                            # 背离检测参数
+                            "dea_trend_period": 5,
+                            "divergence_threshold": 0.0001,  # 降低阈值，增加信号
+                            "advance_trading_bars": 1,  # 减少提前交易K线数
+                            "confirmation_bars": 1,  # 减少确认K线数，提高灵敏度
+                            "max_divergence_duration": 8,  # 减少最大持续时间
+                        },
+                    )
+                ],
+                logging=LoggingConfig(
+                    log_level="INFO",
+                    log_file_name="etf_159506_backtest.log",
+                    log_file_format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                    log_file_max_size=10485760,  # 10MB
+                    log_file_max_backup_count=5,
+                ),
+            )
+            
+            # 回测运行配置
+            run_config = BacktestRunConfig(
+                engine=engine_config,
+                venues=[venue_config],
+                data=[data_config],
+            )
+            
+            return run_config
+            
+        except Exception as e:
+            logger.error(f"创建回测配置失败: {e}")
+            raise
+    
+    def run_backtest(self, start_date: date, end_date: date) -> BacktestResult:
+        """运行回测"""
+        try:
+            logger.info(f"开始回测: {start_date} 到 {end_date}")
+            
+            # 创建回测配置
+            run_config = self.create_backtest_config(start_date, end_date)
+            
+            # 创建回测节点
+            backtest_node = BacktestNode(configs=[run_config])
+            
+            # 运行回测
+            results = backtest_node.run()
+            
+            if not results:
+                raise RuntimeError("回测没有返回结果")
+            
+            result = results[0]
+            logger.info(f"回测完成: {result.run_id}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"运行回测失败: {e}")
+            raise
+    
+    def analyze_results(self, result: BacktestResult):
+        """分析回测结果"""
+        try:
+            logger.info("=" * 60)
+            logger.info("回测结果分析")
+            logger.info("=" * 60)
+            
+            # 基本信息
+            logger.info(f"回测ID: {result.run_id}")
+            logger.info(f"开始时间: {result.backtest_start}")
+            logger.info(f"结束时间: {result.backtest_end}")
+            logger.info(f"运行时间: {result.elapsed_time:.2f} 秒")
+            logger.info(f"总事件数: {result.total_events}")
+            logger.info(f"总订单数: {result.total_orders}")
+            logger.info(f"总持仓数: {result.total_positions}")
+            
+            # 性能指标
+            if result.stats_pnls:
+                for venue, pnl_stats in result.stats_pnls.items():
+                    logger.info(f"\n{venue} 性能指标:")
+                    for metric, value in pnl_stats.items():
+                        logger.info(f"  {metric}: {value:.4f}")
+            
+            if result.stats_returns:
+                logger.info(f"\n收益率统计:")
+                for metric, value in result.stats_returns.items():
+                    logger.info(f"  {metric}: {value:.4f}")
+            
+            logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"分析结果失败: {e}")
+    
+    def run_july_25_backtest(self):
+        """运行 7-25 日的回测"""
+        try:
+            # 设置回测日期
+            start_date = date(2025, 7, 25)
+            end_date = date(2025, 7, 25)
+            
+            logger.info(f"开始 7-25 日回测...")
+            
+            # 运行回测
+            result = self.run_backtest(start_date, end_date)
+            
+            # 分析结果
+            self.analyze_results(result)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"7-25 日回测失败: {e}")
+            raise
+
+
+def main():
+    """主函数"""
+    try:
+        logger.info("159506 ETF 官方回测系统启动")
+        
+        # 创建回测系统
+        backtest_system = ETF159506OfficialBacktest()
+        
+        # 运行 7-25 日回测
+        result = backtest_system.run_july_25_backtest()
+        
+        logger.info("回测完成")
+        
+    except Exception as e:
+        logger.error(f"回测系统运行失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main() 
