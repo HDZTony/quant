@@ -705,16 +705,28 @@ class ETF159506RedisKlineGenerator:
                         beijing_tz = pytz.timezone('Asia/Shanghai')
                         signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
                     
-                    # 检查时间是否在图表范围内
-                    if signal_time >= mapped_df.index.min() and signal_time <= mapped_df.index.max():
+                    # 应用相同的时间映射，跳过午休时间
+                    current_time = signal_time.time()
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        mapped_signal_time = signal_time
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间）
+                        mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
+                    else:
+                        # 午休时间的信号跳过
+                        continue
+                    
+                    # 检查映射后的时间是否在图表范围内
+                    if mapped_signal_time >= mapped_df.index.min() and mapped_signal_time <= mapped_df.index.max():
                         if signal['side'] == 'BUY':
                             buy_signals.append({
-                                'timestamp': signal_time,
+                                'timestamp': mapped_signal_time,
                                 'price': signal['price']
                             })
                         elif signal['side'] == 'SELL':
                             sell_signals.append({
-                                'timestamp': signal_time,
+                                'timestamp': mapped_signal_time,
                                 'price': signal['price']
                             })
                 

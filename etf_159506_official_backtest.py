@@ -271,8 +271,10 @@ class ETF159506OfficialBacktest:
             catalog_loader = ETF159506RedisKlineGenerator(catalog_path=str(self.catalog_path))
             
             # 显示包含买卖点的K线图
+            # 生成图片文件名
+            image_filename = f"etf_159506_backtest_{start_date.strftime('%Y%m%d')}.png"
             catalog_loader.create_realtime_kline_chart(
-                save_path=None,  # 不保存文件，直接显示
+                save_path=image_filename,  # 保存图片文件
                 auto_refresh=False,  # 不自动刷新
                 target_date=start_date,
                 trade_signals=self.trade_signals
