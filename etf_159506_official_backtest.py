@@ -14,9 +14,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import numpy as np
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import numpy as np
 
 # NautilusTrader imports
 from nautilus_trader.backtest.node import BacktestNode
@@ -232,30 +229,6 @@ class ETF159506OfficialBacktest:
                     import traceback
                     logger.warning(f"详细错误: {traceback.format_exc()}")
             
-            # 方法2: 如果仍然没有信号，创建模拟信号用于测试
-            if not self.trade_signals:
-                logger.warning("无法从策略中获取真实交易信号，创建测试信号...")
-                # 创建一些测试信号
-                test_date = datetime(2025, 7, 25, 9, 30, 0)  # 开盘时间
-                self.trade_signals = [
-                    {
-                        'timestamp': test_date + pd.Timedelta(minutes=30),
-                        'price': 1.234,
-                        'side': 'BUY',
-                        'quantity': 1000,
-                        'order_id': 'test_buy_1',
-                        'signal_type': 'golden_cross'
-                    },
-                    {
-                        'timestamp': test_date + pd.Timedelta(minutes=120),
-                        'price': 1.245,
-                        'side': 'SELL',
-                        'quantity': 1000,
-                        'order_id': 'test_sell_1',
-                        'signal_type': 'death_cross'
-                    }
-                ]
-                logger.info("已创建测试交易信号")
             
             logger.info(f"最终收集到 {len(self.trade_signals)} 个交易信号")
             
@@ -288,9 +261,8 @@ class ETF159506OfficialBacktest:
     def create_backtest_config(self, start_date: date, end_date: date) -> BacktestRunConfig:
         """创建回测配置"""
         try:
-            # 使用 etf_159506_instrument.py 中的 BarType 创建函数
-            bar_type_str = create_etf_159506_bar_type()
-            bar_spec = BarType.from_str(bar_type_str)
+            # 使用已创建的 bar_type 实例
+            bar_spec = self.bar_type
             
             # 数据配置 - 使用1分钟K线数据
             data_config = BacktestDataConfig(
@@ -308,7 +280,7 @@ class ETF159506OfficialBacktest:
                 oms_type="NETTING",
                 account_type="MARGIN",
                 base_currency="CNY",
-                starting_balances=["230000 CNY"]
+                starting_balances=["230000 CNY"]  # 恢复初始资金，策略逻辑处理满仓状态
             )
             
             # 引擎配置
@@ -321,7 +293,7 @@ class ETF159506OfficialBacktest:
                             "instrument_id": str(self.instrument_id),
                             "bar_type": str(bar_spec),
                             "venue": "SZSE",
-                            "trade_size": 1000,  # 固定交易1000股，避免满仓
+                            "trade_size": 0,  # 设置为0表示满仓交易
                             "fast_ema_period": 12,
                             "slow_ema_period": 26,
                             "volume_threshold": 500000,
@@ -329,7 +301,7 @@ class ETF159506OfficialBacktest:
                             "take_profit_pct": 100,  
                             "max_daily_trades": 100,
                             "lookback_period": 10,
-                            "price_threshold": 0.003,
+                            "price_threshold": 0.001,
                             "emulation_trigger": "NO_TRIGGER",
                             # 背离检测参数
                             "dea_trend_period": 5,
