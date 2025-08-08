@@ -809,17 +809,22 @@ class ETF159506CacheWebSocketClient:
         # 先清理之前的连接资源
         if hasattr(self, 'ws') and self.ws:
             try:
+                logger.debug("清理之前的WebSocket连接...")
                 self.ws.close()
-            except:
-                pass
-            self.ws = None
+            except Exception as e:
+                logger.debug(f"清理WebSocket连接时出错: {e}")
+            finally:
+                self.ws = None
         
         if hasattr(self, 'ws_thread') and self.ws_thread and self.ws_thread.is_alive():
             try:
+                logger.debug("等待WebSocket线程结束...")
                 self.ws_thread.join(timeout=2)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"等待WebSocket线程时出错: {e}")
         
+        # 获取服务器地址
+        logger.info("获取服务器地址...")
         server = self.server_manager.get_server("ab", "websocket")
         if not server:
             logger.error("无法获取服务器地址")
@@ -832,36 +837,46 @@ class ETF159506CacheWebSocketClient:
         
         logger.info(f"连接到WebSocket服务器: {ws_url}")
         
-        self.ws = websocket.WebSocketApp(
-            ws_url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        
-        # 在后台线程中运行WebSocket连接
-        self.ws_thread = threading.Thread(target=self.ws.run_forever)
-        self.ws_thread.daemon = True
-        self.ws_thread.start()
-        
-        # 等待连接建立或超时
-        timeout = 15  # 增加到15秒超时
-        start_time = time.time()
-        while not self.is_connected and (time.time() - start_time) < timeout:
-            time.sleep(0.1)  # 增加到0.1秒检查间隔，减少CPU占用
-        
-        if self.is_connected:
-            logger.info("WebSocket连接成功建立")
-            return True
-        else:
-            logger.error("WebSocket连接超时")
-            # 清理失败的连接
-            if hasattr(self, 'ws') and self.ws:
-                try:
-                    self.ws.close()
-                except:
-                    pass
+        # 创建WebSocket连接
+        try:
+            self.ws = websocket.WebSocketApp(
+                ws_url,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close
+            )
+            
+            # 在后台线程中运行WebSocket连接
+            self.ws_thread = threading.Thread(target=self.ws.run_forever)
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
+            # 等待连接建立或超时
+            timeout = 15  # 增加到15秒超时
+            start_time = time.time()
+            logger.debug("等待连接建立...")
+            
+            while not self.is_connected and (time.time() - start_time) < timeout:
+                time.sleep(0.1)  # 增加到0.1秒检查间隔，减少CPU占用
+            
+            if self.is_connected:
+                logger.info("WebSocket连接成功建立")
+                return True
+            else:
+                logger.error("WebSocket连接超时")
+                # 清理失败的连接
+                if hasattr(self, 'ws') and self.ws:
+                    try:
+                        self.ws.close()
+                    except Exception as e:
+                        logger.debug(f"清理失败连接时出错: {e}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"创建WebSocket连接失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
             return False
     
     def on_open(self, ws):
@@ -1023,25 +1038,33 @@ class ETF159506CacheWebSocketClient:
         logger.error(f"数据接收计数: {self.data_receive_count}")
         
         # 分析关闭代码
+        close_reason = "未知原因"
         if code == 1000:
+            close_reason = "正常关闭"
             logger.error("关闭分析: 正常关闭")
             logger.error("可能原因: 服务器主动关闭、客户端主动断开")
         elif code == 1001:
+            close_reason = "端点离开"
             logger.error("关闭分析: 端点离开")
             logger.error("可能原因: 服务器关闭、网络中断")
         elif code == 1002:
+            close_reason = "协议错误"
             logger.error("关闭分析: 协议错误")
             logger.error("可能原因: 协议版本不匹配、消息格式错误")
         elif code == 1003:
+            close_reason = "不支持的数据类型"
             logger.error("关闭分析: 不支持的数据类型")
             logger.error("可能原因: 消息类型不支持")
         elif code == 1006:
+            close_reason = "异常关闭"
             logger.error("关闭分析: 异常关闭")
             logger.error("可能原因: 网络中断、服务器崩溃")
         elif code == 1009:
+            close_reason = "消息过大"
             logger.error("关闭分析: 消息过大")
             logger.error("可能原因: 单条消息超过限制")
         elif code == 1011:
+            close_reason = "服务器错误"
             logger.error("关闭分析: 服务器错误")
             logger.error("可能原因: 服务器内部错误")
         else:
@@ -1055,16 +1078,21 @@ class ETF159506CacheWebSocketClient:
             logger.error("最后数据接收: 无数据")
         
         # 记录线程状态
-        # logger.error(f"心跳线程状态: 已停止")  # 移除心跳线程状态
-        logger.error(f"保存线程状态: 已停止")
+        logger.error(f"保存线程状态: {'运行中' if not self.stop_save else '已停止'}")
         logger.error(f"监控线程状态: {'运行中' if not self.stop_monitor else '已停止'}")
         logger.error(f"交易时间检查线程状态: {'运行中' if not self.stop_trading_time_check else '已停止'}")
+        
+        # 记录连接统计
+        logger.error(f"连接统计:")
+        logger.error(f"  - 总连接次数: {self.connection_count}")
+        logger.error(f"  - 总断开次数: {self.disconnection_count}")
+        logger.error(f"  - 连接成功率: {(self.connection_count/(self.connection_count + self.disconnection_count)*100) if (self.connection_count + self.disconnection_count) > 0 else 0.0:.1f}%")
+        logger.error(f"  - 运行时间: {datetime.now() - self.start_time}")
         
         logger.error("=" * 60)
         
         self.is_connected = False
         self.stop_save = True
-        # self.stop_heartbeat = True  # 移除心跳停止
         # 不要停止交易时间检查线程，让它继续监控并自动重连
     
     def start_auto_save(self):
@@ -1129,7 +1157,8 @@ class ETF159506CacheWebSocketClient:
                     if current_status['is_trading_time'] and not self.is_connected:
                         # 检查是否在冷却期内
                         if current_time - last_reconnect_time < reconnect_cooldown:
-                            logger.debug(f"重连冷却中，剩余 {reconnect_cooldown - (current_time - last_reconnect_time):.0f} 秒")
+                            remaining_time = reconnect_cooldown - (current_time - last_reconnect_time)
+                            logger.debug(f"重连冷却中，剩余 {remaining_time:.0f} 秒")
                             continue
                         
                         # 检查连续失败次数
@@ -1142,13 +1171,16 @@ class ETF159506CacheWebSocketClient:
                         logger.info(f"🔗 检测到交易时间，开始连接: {current_status['current_time']}")
                         logger.info(f"   当前连接状态: {self.is_connected}")
                         logger.info(f"   连续失败次数: {consecutive_failures}")
+                        logger.info(f"   距离上次重连: {current_time - last_reconnect_time:.0f} 秒")
                         
                         # 重置停止标志
                         self.stop_save = False
                         self.stop_monitor = False
-                        self.stop_trading_time_check = False
+                        # 不要重置交易时间检查标志，让它继续运行
+                        # self.stop_trading_time_check = False
                         
                         # 尝试连接
+                        logger.info("开始尝试连接...")
                         connect_result = self.connect()
                         if connect_result:
                             logger.info("✅ 自动重连成功")
@@ -1158,6 +1190,13 @@ class ETF159506CacheWebSocketClient:
                             logger.error("❌ 自动重连失败")
                             consecutive_failures += 1
                             last_reconnect_time = current_time
+                            
+                            # 增加详细的失败分析
+                            logger.error(f"重连失败分析:")
+                            logger.error(f"  - 连接状态: {self.is_connected}")
+                            logger.error(f"  - WebSocket对象: {'存在' if self.ws else '不存在'}")
+                            logger.error(f"  - 连续失败次数: {consecutive_failures}")
+                            logger.error(f"  - 下次重连时间: {datetime.fromtimestamp(last_reconnect_time + reconnect_cooldown).strftime('%H:%M:%S')}")
                     
                     # 如果当前不是交易时间但已连接，则断开
                     elif not current_status['is_trading_time'] and self.is_connected:
@@ -1172,9 +1211,22 @@ class ETF159506CacheWebSocketClient:
                         logger.info(f"   连接状态: {self.is_connected}")
                         logger.info(f"   连续失败次数: {consecutive_failures}")
                         logger.info(f"   距离下次重连: {max(0, reconnect_cooldown - (current_time - last_reconnect_time)):.0f}秒")
+                        logger.info(f"   数据接收计数: {self.data_receive_count}")
+                        
+                        # 如果连接断开，输出更多诊断信息
+                        if not self.is_connected:
+                            logger.info(f"   断开原因分析:")
+                            logger.info(f"      - 最后数据时间: {self.last_data_time.strftime('%H:%M:%S') if self.last_data_time else '无数据'}")
+                            logger.info(f"      - 运行时间: {datetime.now() - self.start_time}")
+                            logger.info(f"      - 连接次数: {self.connection_count}")
+                            logger.info(f"      - 断开次数: {self.disconnection_count}")
                     
             except Exception as e:
                 logger.error(f"交易时间检查循环错误: {e}")
+                import traceback
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
+                # 出错时等待一段时间再继续
+                time.sleep(30)
     
     def print_diagnostic_status(self):
         """打印诊断状态信息"""
@@ -1277,6 +1329,7 @@ Cache统计:
                     trade_count = len(cache_data.get('trade_ticks', []))
                     
                     if quote_count > 0 or trade_count > 0:
+                        logger.debug(f"开始自动保存: 报价{quote_count}条, 交易{trade_count}条")
                         # 保存数据到Parquet文件
                         self._save_buffer_data()
                         
@@ -1290,6 +1343,8 @@ Cache统计:
                     
             except Exception as e:
                 logger.error(f"自动保存失败: {e}")
+                import traceback
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
                 time.sleep(30)  # 出错时等待30秒，减少错误频率
     
     def _save_buffer_data(self):
@@ -1299,6 +1354,7 @@ Cache统计:
             cache_data = self.cache_manager.get_historical_data(limit=1000)
             
             if not cache_data or not cache_data.get('trade_ticks'):
+                logger.debug("跳过保存：无交易数据")
                 return
             
             # 转换为DataFrame格式
@@ -1313,6 +1369,7 @@ Cache统计:
                 })
             
             if not trade_data:
+                logger.debug("跳过保存：转换后无数据")
                 return
             
             # 按日期分组保存
@@ -1320,8 +1377,21 @@ Cache统计:
             filename = f"cache_data_{today.strftime('%Y%m%d')}.parquet"
             filepath = Path(self.catalog_path) / filename
             
-            # 确保目录存在
-            filepath.parent.mkdir(parents=True, exist_ok=True)
+            # 确保目录存在 - 使用绝对路径并增加详细日志
+            try:
+                catalog_dir = Path(self.catalog_path).resolve()
+                logger.debug(f"创建目录: {catalog_dir}")
+                catalog_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 验证目录是否真的存在
+                if not catalog_dir.exists():
+                    logger.error(f"目录创建失败: {catalog_dir}")
+                    return
+                
+                logger.debug(f"目录验证成功: {catalog_dir}")
+            except Exception as dir_error:
+                logger.error(f"创建目录失败: {dir_error}")
+                return
             
             # 如果文件已存在，读取并合并
             if filepath.exists():
@@ -1355,27 +1425,58 @@ Cache统计:
             # 保存文件（使用临时文件避免并发写入问题）
             temp_filepath = filepath.with_suffix('.tmp')
             try:
+                logger.debug(f"开始保存数据到临时文件: {temp_filepath}")
                 combined_df.to_parquet(temp_filepath, index=False)
+                
+                # 验证临时文件是否创建成功
+                if not temp_filepath.exists():
+                    logger.error(f"临时文件创建失败: {temp_filepath}")
+                    return
+                
                 # 原子性替换文件
                 if filepath.exists():
+                    logger.debug(f"删除原文件: {filepath}")
                     filepath.unlink()  # 删除原文件
+                
+                logger.debug(f"重命名临时文件: {temp_filepath} -> {filepath}")
                 temp_filepath.rename(filepath)
+                
+                # 验证最终文件是否创建成功
+                if not filepath.exists():
+                    logger.error(f"最终文件创建失败: {filepath}")
+                    return
+                
                 logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
                 self.last_save_time = datetime.now()
+                
             except Exception as save_error:
                 logger.error(f"保存文件失败: {save_error}")
+                logger.error(f"临时文件路径: {temp_filepath}")
+                logger.error(f"目标文件路径: {filepath}")
+                logger.error(f"目录是否存在: {filepath.parent.exists()}")
+                logger.error(f"目录权限: {oct(filepath.parent.stat().st_mode)[-3:] if filepath.parent.exists() else 'N/A'}")
+                
                 # 清理临时文件
                 if temp_filepath.exists():
-                    temp_filepath.unlink()
+                    try:
+                        temp_filepath.unlink()
+                        logger.debug(f"已清理临时文件: {temp_filepath}")
+                    except Exception as cleanup_error:
+                        logger.error(f"清理临时文件失败: {cleanup_error}")
                 return
             finally:
                 # 确保临时文件被清理
                 if temp_filepath.exists():
-                    temp_filepath.unlink()
-            self.last_save_time = datetime.now()
+                    try:
+                        temp_filepath.unlink()
+                        logger.debug(f"最终清理临时文件: {temp_filepath}")
+                    except Exception as final_cleanup_error:
+                        logger.error(f"最终清理临时文件失败: {final_cleanup_error}")
             
         except Exception as e:
             logger.error(f"保存缓冲区数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
             # 出错时不抛出异常，避免影响主循环
     
     def _merge_files_if_needed(self):

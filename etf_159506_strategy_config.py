@@ -64,7 +64,7 @@ class ETF159506Config(StrategyConfig, frozen=True):
     emulation_trigger: str = "NO_TRIGGER"
     
     # 背离检测参数
-    dea_trend_period: PositiveInt = 5  # DEA趋势判断周期
+    dea_trend_period: PositiveInt = 3  # DEA趋势判断周期
     divergence_threshold: PositiveFloat = 0.0002  # 背离检测阈值
     advance_trading_bars: PositiveInt = 2  # 提前交易K线数
     confirmation_bars: PositiveInt = 3  # 确认K线数

@@ -304,7 +304,7 @@ class ETF159506OfficialBacktest:
                             "price_threshold": 0.001,
                             "emulation_trigger": "NO_TRIGGER",
                             # 背离检测参数
-                            "dea_trend_period": 5,
+                            "dea_trend_period": 3,
                             "divergence_threshold": 0.0001,  # 降低阈值，增加信号
                             "advance_trading_bars": 1,  # 减少提前交易K线数
                             "confirmation_bars": 1,  # 减少确认K线数，提高灵敏度
