@@ -32,6 +32,12 @@ class ETF159506Strategy(Strategy):
     def __init__(self, config: ETF159506Config):
         super().__init__(config=config)
         
+        # 添加调试信息
+        self._log.info(f"策略初始化: instrument_id={config.instrument_id}, bar_type={config.bar_type}")
+        self._log.info(f"MACD参数: fast_period={config.fast_ema_period}, slow_period={config.slow_ema_period}")
+        self._log.info(f"风险参数: stop_loss_pct={config.stop_loss_pct}, take_profit_pct={getattr(config, 'take_profit_pct', 0.05)}")
+        self._log.info(f"其他参数: lookback_period={config.lookback_period}")
+        
         # MACD指标 - 使用Nautilus Trader的官方实现
         self.macd = MovingAverageConvergenceDivergence(
             fast_period=config.fast_ema_period,
@@ -56,7 +62,7 @@ class ETF159506Strategy(Strategy):
         # 策略参数
         self.stop_loss_pct = config.stop_loss_pct
         self.take_profit_pct = config.take_profit_pct if hasattr(config, 'take_profit_pct') else 0.05
-        self.lookback_period = config.lookback_period  # 添加lookback_period参数
+        self.lookback_period = config.lookback_period
         
         # 交易状态
         self.last_signal = None  # 记录上一次信号类型
@@ -65,9 +71,6 @@ class ETF159506Strategy(Strategy):
         # 交易信号记录
         self.trade_signals = []
         
-        # 满仓状态管理
-        self.simulated_position_quantity = 0  # 模拟持仓数量
-        self.is_full_position_mode = True  # 满仓模式标志
 
     def on_start(self):
         """策略启动时调用"""
@@ -75,9 +78,7 @@ class ETF159506Strategy(Strategy):
         self.subscribe_bars(bar_type)
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
-        # 设置初始状态：默认满仓股票状态
-        self._log.info("设置初始状态：默认满仓股票状态")
-        self.initial_position_set = False  # 标记是否需要处理初始持仓
+ 
 
     def on_stop(self):
         """策略停止时调用"""
@@ -87,7 +88,6 @@ class ETF159506Strategy(Strategy):
         
         # 保存交易信号到策略实例变量中，供回测系统获取
         if hasattr(self, 'trade_signals') and self.trade_signals:
-            # 将交易信号保存到策略实例中，这样回测系统可以获取到
             if not hasattr(self, '_saved_trade_signals'):
                 self._saved_trade_signals = []
             self._saved_trade_signals.extend(self.trade_signals)
@@ -103,15 +103,10 @@ class ETF159506Strategy(Strategy):
         # 添加调试信息
         self._log.info(f"处理K线: 时间={pd.to_datetime(bar.ts_event, unit='ns')}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
         
-        # 检查是否需要处理初始持仓（默认满仓股票状态）
-        if not hasattr(self, 'initial_position_set') or not self.initial_position_set:
-            self._log.info("处理初始满仓状态：记录满仓持仓...")
-            self.execute_initial_position_setup(bar)
-            self.initial_position_set = True
-            return  # 初始设置后，跳过本次信号检测
+        # 策略始终空仓开始，无需设置初始持仓
         
         if not self.macd.initialized:
-            self._log.info("MACD指标未初始化，跳过信号检测")
+            self._log.info(f"MACD指标未初始化，当前数据点: {len(self.macd_history)}")
             return
 
         # 更新历史数据
@@ -128,6 +123,11 @@ class ETF159506Strategy(Strategy):
         if isinstance(event, PositionOpened):
             self.position = self.cache.position(event.position_id)
             self._log.info(f"持仓已开启: {self.position}")
+    
+    def setup_initial_position(self, bar: Bar):
+        """设置初始持仓 - 已禁用，策略始终空仓开始"""
+        self._log.info("初始持仓设置已禁用，策略始终空仓开始")
+        return
     
     def update_history_data(self, bar: Bar):
         """更新历史数据"""
@@ -150,12 +150,15 @@ class ETF159506Strategy(Strategy):
     
     def calculate_signal_line(self):
         """计算信号线（DEA）- 对DIF的9周期EMA"""
-        if len(self.macd_history) < 9:
-            return 0.0
+        if len(self.macd_history) < 2:
+            # 如果数据不足，返回当前MACD值作为信号线
+            return self.macd_history[-1] if self.macd_history else 0.0
         
-        # 使用pandas的ewm计算EMA
+        # 使用pandas的ewm计算EMA，span=9是标准MACD参数
         dif_series = pd.Series(list(self.macd_history))
-        dea = dif_series.ewm(span=9, adjust=False).mean().iloc[-1]
+        # 如果数据不足9个，使用所有可用数据
+        span = min(9, len(dif_series))
+        dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
         return dea
     
     def check_macd_signals(self, bar: Bar):
@@ -163,9 +166,9 @@ class ETF159506Strategy(Strategy):
         # 添加调试信息
         self._log.info(f"检查MACD信号: macd_history长度={len(self.macd_history)}, signal_history长度={len(self.signal_history)}")
         
-        # 使用lookback_period参数而不是硬编码的值
-        if len(self.macd_history) < self.lookback_period or len(self.signal_history) < self.lookback_period:
-            self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.macd_history)}, signal_history={len(self.signal_history)}, 需要{self.lookback_period}根K线")
+        # 需要至少2个数据点来检测金叉死叉
+        if len(self.macd_history) < 2 or len(self.signal_history) < 2:
+            self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.macd_history)}, signal_history={len(self.signal_history)}, 需要至少2个数据点")
             return
         
         current_macd = self.macd_history[-1]
@@ -184,17 +187,16 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "golden_cross"
             
-            # 检查当前持仓状态，决定是否记录买入信号
-            # 在满仓模式下，优先使用模拟持仓状态
-            has_position = (self.position and self.position.quantity.as_double() > 0) or self.simulated_position_quantity > 0
+            # 检查当前持仓状态
+            has_position = self.position and self.position.quantity.as_double() > 0
             
             if has_position:
-                # 已有持仓，记录"持有"信号而不是"买入"信号
-                current_quantity = self.position.quantity.as_double() if self.position else self.simulated_position_quantity
+                # 已有持仓，记录"持有"信号
+                current_quantity = self.position.quantity.as_double()
                 hold_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
-                    'side': 'HOLD',  # 改为HOLD表示持有
+                    'side': 'HOLD',
                     'quantity': current_quantity,
                     'order_id': 'signal_detected',
                     'signal_type': 'golden_cross_hold'
@@ -207,7 +209,7 @@ class ETF159506Strategy(Strategy):
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
                     'side': 'BUY',
-                    'quantity': 0,  # 暂时设为0，执行时再更新
+                    'quantity': 0,
                     'order_id': 'signal_detected',
                     'signal_type': 'golden_cross'
                 }
@@ -220,13 +222,12 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "death_cross"
             
-            # 检查当前持仓状态，决定是否记录卖出信号
-            # 在满仓模式下，优先使用模拟持仓状态
-            has_position = (self.position and self.position.quantity.as_double() > 0) or self.simulated_position_quantity > 0
+            # 检查当前持仓状态
+            has_position = self.position and self.position.quantity.as_double() > 0
             
             if has_position:
                 # 有持仓，记录卖出信号
-                current_quantity = self.position.quantity.as_double() if self.position else self.simulated_position_quantity
+                current_quantity = self.position.quantity.as_double()
                 sell_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
@@ -242,7 +243,7 @@ class ETF159506Strategy(Strategy):
                 watch_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
-                    'side': 'WATCH',  # 改为WATCH表示观望
+                    'side': 'WATCH',
                     'quantity': 0,
                     'order_id': 'signal_detected',
                     'signal_type': 'death_cross_watch'
@@ -252,40 +253,12 @@ class ETF159506Strategy(Strategy):
             
             self.execute_sell_signal(bar)
     
-    def execute_initial_position_setup(self, bar: Bar):
-        """执行初始持仓设置（默认满仓股票状态）"""
-        self._log.info("开始执行初始满仓状态设置...")
-        
-        # 模拟初始满仓状态：假设有230000元价值的股票
-        initial_capital = 230000  # 初始资金
-        current_price = bar.close.as_double()
-        self.simulated_position_quantity = int(initial_capital / current_price)
-        
-        self._log.info(f"设置初始满仓状态: {self.simulated_position_quantity} 股 (价值约{initial_capital}元)")
-        
-        # 记录初始满仓状态（不创建实际订单，因为初始状态就是满仓）
-        initial_position_signal = {
-            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
-            'side': 'HOLD',  # 改为HOLD表示持有状态
-            'quantity': self.simulated_position_quantity,
-            'order_id': 'initial_position_hold',
-            'signal_type': 'initial_position_hold'
-        }
-        self.trade_signals.append(initial_position_signal)
-        
-        # 不创建实际的订单，因为初始状态就是满仓
-        # 只是记录这个状态，等待后续的MACD信号来决定买卖
-        self._log.info(f"记录初始满仓状态: {self.simulated_position_quantity} 股，等待MACD信号")
-        self._log.info(f"记录初始持仓信号: {initial_position_signal}")
-    
     def execute_buy_signal(self, bar: Bar):
         """执行买入信号"""
-        # 由于默认满仓状态，买入信号通常被跳过
-        # 只有在特殊情况下（如止损后）才可能执行买入
-        has_position = (self.position and self.position.quantity.as_double() > 0) or self.simulated_position_quantity > 0
+        # 检查是否已有持仓
+        has_position = self.position and self.position.quantity.as_double() > 0
         if has_position:
-            self._log.info("已有持仓（默认满仓状态），跳过买入信号")
+            self._log.info("已有持仓，跳过买入信号")
             return
         
         # 计算交易数量
@@ -317,7 +290,7 @@ class ETF159506Strategy(Strategy):
         )
         self.submit_order(order)
         
-        # 更新最近的买入信号记录（如果有的话）
+        # 更新最近的买入信号记录
         for signal in reversed(self.trade_signals):
             if signal.get('signal_type') == 'golden_cross' and signal.get('side') == 'BUY':
                 signal['quantity'] = trade_quantity.as_double()
@@ -325,47 +298,30 @@ class ETF159506Strategy(Strategy):
                 break
         
         self._log.info(f"金叉买入信号: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
-        self._log.info(f"更新买入信号记录: 数量={trade_quantity.as_double()}")
     
     def execute_sell_signal(self, bar: Bar):
         """执行卖出信号"""
-        # 由于默认满仓状态，卖出信号应该能够正常执行
-        has_position = (self.position and self.position.quantity.as_double() > 0) or self.simulated_position_quantity > 0
+        # 检查是否有持仓
+        has_position = self.position and self.position.quantity.as_double() > 0
         if not has_position:
             self._log.info("没有持仓，跳过卖出信号")
             return
         
-        # 更新最近的卖出信号记录（如果有的话）
+        # 更新最近的卖出信号记录
         for signal in reversed(self.trade_signals):
             if signal.get('signal_type') == 'death_cross' and signal.get('side') == 'SELL':
-                signal['quantity'] = self.position.quantity.as_double() if self.position else self.simulated_position_quantity
+                signal['quantity'] = self.position.quantity.as_double()
                 signal['order_id'] = 'close_position'
                 break
         
-        # 更新模拟持仓状态
-        if self.simulated_position_quantity > 0:
-            self.simulated_position_quantity = 0
-            self._log.info("卖出后清空模拟持仓状态")
-        
         # 执行平仓操作
-        if self.position:
-            # 有实际持仓，执行平仓
-            self.close_position(self.position)
-            self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={self.position.quantity.as_double()}")
-        else:
-            # 只有模拟持仓，记录卖出但不执行实际订单（因为初始状态就是满仓）
-            self._log.info(f"死叉卖出信号（模拟持仓）: 价格={bar.close.as_double():.4f}, 数量={self.simulated_position_quantity}")
-            # 这里不执行实际订单，因为初始状态就是满仓，只是记录卖出信号
+        self.close_position(self.position)
+        self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={self.position.quantity.as_double()}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
-        # 由于默认满仓状态，风险管理对持仓很重要
-        has_position = (self.position and self.position.quantity.as_double() > 0) or self.simulated_position_quantity > 0
-        if not has_position:
-            return
-        
-        # 只有在有实际持仓时才进行风险管理
-        if not self.position:
+        # 检查是否有持仓
+        if not self.position or self.position.quantity.as_double() <= 0:
             return
         
         current_price = bar.close.as_double()

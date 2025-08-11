@@ -47,19 +47,21 @@ class ETF159506Config(StrategyConfig, frozen=True):
         价格变化阈值
     emulation_trigger : str, default 'NO_TRIGGER'
         订单模拟触发器
+    initial_position_quantity : int, default 0
+        初始持仓数量（0表示空仓开始）
     """
     
     instrument_id: InstrumentId
     bar_type: BarType
     venue: Venue
     trade_size: Decimal
-    fast_ema_period: PositiveInt = 10
-    slow_ema_period: PositiveInt = 20
+    fast_ema_period: PositiveInt = 12  # 快速EMA周期（标准MACD参数）
+    slow_ema_period: PositiveInt = 26  # 慢速EMA周期（标准MACD参数）
     volume_threshold: PositiveInt = 500000
     stop_loss_pct: PositiveFloat = 0.02
-    take_profit_pct: PositiveFloat = 0.015
-    max_daily_trades: PositiveInt = 10
-    lookback_period: PositiveInt = 10
+    take_profit_pct: PositiveFloat = 0.99
+    max_daily_trades: PositiveInt = 100
+    lookback_period: PositiveInt = 2  # 需要至少2个数据点来检测金叉死叉
     price_threshold: PositiveFloat = 0.003
     emulation_trigger: str = "NO_TRIGGER"
     

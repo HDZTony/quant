@@ -855,8 +855,8 @@ class ETF159506RedisKlineGenerator:
                 low_list = close.rolling(window=n, min_periods=1).min()
                 high_list = close.rolling(window=n, min_periods=1).max()
                 rsv = (close - low_list) / (high_list - low_list) * 100
-                k = rsv.ewm(com=(k_period-1), adjust=False).mean()
-                d = k.ewm(com=(d_period-1), adjust=False).mean()
+                k = rsv.rolling(window=k_period, min_periods=1).mean()  # 使用简单移动平均(MA)
+                d = k.rolling(window=d_period, min_periods=1).mean()    # 使用简单移动平均(MA)
                 j = 3 * k - 2 * d
                 return k, d, j
             kdj_k, kdj_d, kdj_j = calc_kdj(minute_close, n=9, k_period=3, d_period=3)

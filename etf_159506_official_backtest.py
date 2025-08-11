@@ -38,15 +38,23 @@ from etf_159506_instrument import create_etf_159506_default, create_etf_159506_b
 from etf_159506_catalog_loader import ETF159506RedisKlineGenerator
 
 # 配置日志
+import os
+
+# 配置日志 - 输出到根目录，与cache_collector保持一致
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('etf_159506_backtest.log'),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler('etf_159506_backtest.log', mode='w', encoding='utf-8'),  # 根目录
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True  # 强制重新配置日志
 )
 logger = logging.getLogger(__name__)
+
+# 设置其他模块的日志级别
+logging.getLogger('nautilus_trader').setLevel(logging.INFO)
+logging.getLogger('BACKTESTER').setLevel(logging.INFO)
 
 
 class ETF159506OfficialBacktest:
@@ -297,27 +305,31 @@ class ETF159506OfficialBacktest:
                             "fast_ema_period": 12,
                             "slow_ema_period": 26,
                             "volume_threshold": 500000,
-                            "stop_loss_pct": 100,  
-                            "take_profit_pct": 100,  
+                            "stop_loss_pct": 0.02,  # 修复：2%止损
+                            "take_profit_pct": 0.05,  # 修复：5%止盈
                             "max_daily_trades": 100,
-                            "lookback_period": 10,
+                            "lookback_period": 2,  # 修复：需要至少2个数据点
                             "price_threshold": 0.001,
                             "emulation_trigger": "NO_TRIGGER",
+                            "initial_position_quantity": 0,  # 添加：初始持仓数量
                             # 背离检测参数
                             "dea_trend_period": 3,
-                            "divergence_threshold": 0.0001,  # 降低阈值，增加信号
-                            "advance_trading_bars": 1,  # 减少提前交易K线数
-                            "confirmation_bars": 1,  # 减少确认K线数，提高灵敏度
-                            "max_divergence_duration": 8,  # 减少最大持续时间
+                            "divergence_threshold": 0.0001,
+                            "advance_trading_bars": 1,
+                            "confirmation_bars": 1,
+                            "max_divergence_duration": 8,
                         },
                     )
                 ],
                 logging=LoggingConfig(
                     log_level="INFO",
-                    log_file_name="etf_159506_backtest.log",
+                    log_file_name="etf_159506_backtest.log",  # 根目录
                     log_file_format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                     log_file_max_size=10485760,  # 10MB
                     log_file_max_backup_count=5,
+                    log_colors=True,
+                    bypass_logging=False,
+                    print_config=True,  # 打印配置信息
                 ),
             )
             
@@ -341,24 +353,46 @@ class ETF159506OfficialBacktest:
             logger.info(f"开始回测: {start_date} 到 {end_date}")
             
             # 创建回测配置
+            logger.info("创建回测配置...")
             run_config = self.create_backtest_config(start_date, end_date)
+            logger.info("回测配置创建完成")
             
             # 创建回测节点
+            logger.info("创建回测节点...")
             backtest_node = BacktestNode(configs=[run_config])
+            logger.info("回测节点创建完成")
             
             # 运行回测
+            logger.info("开始运行回测...")
             results = backtest_node.run()
+            logger.info("回测运行完成")
             
             if not results:
+                logger.error("回测没有返回结果")
                 raise RuntimeError("回测没有返回结果")
             
             result = results[0]
             logger.info(f"回测完成: {result.run_id}")
             
+            # 输出回测统计信息
+            logger.info("=" * 60)
+            logger.info("回测统计信息")
+            logger.info("=" * 60)
+            logger.info(f"回测ID: {result.run_id}")
+            logger.info(f"开始时间: {result.backtest_start}")
+            logger.info(f"结束时间: {result.backtest_end}")
+            logger.info(f"运行时间: {result.elapsed_time:.2f} 秒")
+            logger.info(f"总事件数: {result.total_events}")
+            logger.info(f"总订单数: {result.total_orders}")
+            logger.info(f"总持仓数: {result.total_positions}")
+            logger.info("=" * 60)
+            
             return result, backtest_node
             
         except Exception as e:
             logger.error(f"运行回测失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
             raise
     
     def analyze_results(self, result: BacktestResult):
@@ -378,21 +412,43 @@ class ETF159506OfficialBacktest:
             logger.info(f"总持仓数: {result.total_positions}")
             
             # 性能指标
-            if result.stats_pnls:
+            if hasattr(result, 'stats_pnls') and result.stats_pnls:
                 for venue, pnl_stats in result.stats_pnls.items():
                     logger.info(f"\n{venue} 性能指标:")
                     for metric, value in pnl_stats.items():
-                        logger.info(f"  {metric}: {value:.4f}")
+                        if isinstance(value, (int, float)):
+                            logger.info(f"  {metric}: {value:.4f}")
+                        else:
+                            logger.info(f"  {metric}: {value}")
+            else:
+                logger.info("未找到PnL统计数据")
             
-            if result.stats_returns:
+            if hasattr(result, 'stats_returns') and result.stats_returns:
                 logger.info(f"\n收益率统计:")
                 for metric, value in result.stats_returns.items():
-                    logger.info(f"  {metric}: {value:.4f}")
+                    if isinstance(value, (int, float)):
+                        logger.info(f"  {metric}: {value:.4f}")
+                    else:
+                        logger.info(f"  {metric}: {value}")
+            else:
+                logger.info("未找到收益率统计数据")
+            
+            # 输出账户信息
+            if hasattr(result, 'account') and result.account:
+                logger.info(f"\n账户信息:")
+                logger.info(f"  账户ID: {result.account.id}")
+                logger.info(f"  账户类型: {result.account.type}")
+                logger.info(f"  基础货币: {result.account.base_currency}")
+                if hasattr(result.account, 'balances') and result.account.balances:
+                    for balance in result.account.balances:
+                        logger.info(f"  余额: {balance}")
             
             logger.info("=" * 60)
             
         except Exception as e:
             logger.error(f"分析结果失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
     
     def run_july_25_backtest(self):
         """运行 7-25 日的回测"""
