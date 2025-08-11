@@ -584,12 +584,12 @@ class ETF159506RedisKlineGenerator:
             # 创建五联图，图片高度更大
             fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(20, 40), height_ratios=[3, 1, 1, 1, 1])
 
-            # 创建时间轴映射，跳过午休时间
+            # 创建时间轴映射，保持时间连续性但保留原始时间信息
             def create_time_mapping(df):
-                """创建时间轴映射，跳过午休时间"""
-                # 创建新的时间索引
+                """创建时间轴映射，保持图表连续性"""
                 new_times = []
                 time_mapping = {}
+                original_time_mapping = {}  # 保存原始时间到映射时间的对应关系
                 
                 for idx in df.index:
                     current_time = idx.time()
@@ -598,7 +598,7 @@ class ETF159506RedisKlineGenerator:
                         # 上午时间保持不变
                         new_time = idx
                     elif current_time > datetime_time(13, 0):
-                        # 下午时间减去1.5小时（午休时间）
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
                         new_time = idx - timedelta(hours=1, minutes=30)
                     else:
                         # 午休时间的数据跳过
@@ -606,11 +606,12 @@ class ETF159506RedisKlineGenerator:
                     
                     new_times.append(new_time)
                     time_mapping[idx] = new_time
+                    original_time_mapping[new_time] = idx  # 反向映射
                 
-                return pd.DatetimeIndex(new_times), time_mapping
+                return pd.DatetimeIndex(new_times), time_mapping, original_time_mapping
             
             # 创建时间映射
-            new_index, time_mapping = create_time_mapping(complete_df)
+            new_index, time_mapping, original_time_mapping = create_time_mapping(complete_df)
             
             # 重新索引数据
             mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
@@ -666,6 +667,19 @@ class ETF159506RedisKlineGenerator:
             ax1.set_title(chart_title)
             ax1.set_ylabel('价格')
             ax1.grid(True, alpha=0.3)
+            
+            # 添加信号类型说明
+            signal_info = "信号说明:\n"
+            signal_info += "🔴 买入信号: 金叉出现，无持仓时买入\n"
+            signal_info += "🟢 卖出信号: 死叉出现，有持仓时卖出\n"
+            signal_info += "🔵 持有信号: 金叉出现，已有持仓时持有\n"
+            signal_info += "🟡 观望信号: 死叉出现，无持仓时观望\n"
+            
+            ax1.text(0.02, 0.85, signal_info, 
+                   transform=ax1.transAxes, verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+                   fontsize=9)
+            
             ax1.legend()
             
             # 设置x轴格式 - 显示北京时间
@@ -685,6 +699,8 @@ class ETF159506RedisKlineGenerator:
             if trade_signals and len(trade_signals) > 0:
                 buy_signals = []
                 sell_signals = []
+                hold_signals = []
+                watch_signals = []
                 
                 for signal in trade_signals:
                     # 转换时间戳为pandas datetime
@@ -694,7 +710,6 @@ class ETF159506RedisKlineGenerator:
                         signal_time = signal['timestamp']
                     
                     # 确保时间戳有时区信息，与图表数据保持一致
-                    # 将datetime对象转换为pandas Timestamp
                     if not isinstance(signal_time, pd.Timestamp):
                         signal_time = pd.Timestamp(signal_time)
                     
@@ -705,13 +720,13 @@ class ETF159506RedisKlineGenerator:
                         beijing_tz = pytz.timezone('Asia/Shanghai')
                         signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
                     
-                    # 应用相同的时间映射，跳过午休时间
+                    # 应用相同的时间映射，保持图表连续性
                     current_time = signal_time.time()
                     if current_time < datetime_time(11, 30):
                         # 上午时间保持不变
                         mapped_signal_time = signal_time
                     elif current_time > datetime_time(13, 0):
-                        # 下午时间减去1.5小时（午休时间）
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
                         mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
                     else:
                         # 午休时间的信号跳过
@@ -722,12 +737,30 @@ class ETF159506RedisKlineGenerator:
                         if signal['side'] == 'BUY':
                             buy_signals.append({
                                 'timestamp': mapped_signal_time,
-                                'price': signal['price']
+                                'price': signal['price'],
+                                'original_time': signal_time,  # 保存原始时间
+                                'signal_type': signal.get('signal_type', 'unknown')
                             })
                         elif signal['side'] == 'SELL':
                             sell_signals.append({
                                 'timestamp': mapped_signal_time,
-                                'price': signal['price']
+                                'price': signal['price'],
+                                'original_time': signal_time,  # 保存原始时间
+                                'signal_type': signal.get('signal_type', 'unknown')
+                            })
+                        elif signal['side'] == 'HOLD':
+                            hold_signals.append({
+                                'timestamp': mapped_signal_time,
+                                'price': signal['price'],
+                                'original_time': signal_time,  # 保存原始时间
+                                'signal_type': signal.get('signal_type', 'unknown')
+                            })
+                        elif signal['side'] == 'WATCH':
+                            watch_signals.append({
+                                'timestamp': mapped_signal_time,
+                                'price': signal['price'],
+                                'original_time': signal_time,  # 保存原始时间
+                                'signal_type': signal.get('signal_type', 'unknown')
                             })
                 
                 # 绘制买入点（红色三角形向上）
@@ -737,7 +770,9 @@ class ETF159506RedisKlineGenerator:
                                color='red', marker='^', s=150, label='买入信号', zorder=10, alpha=0.8)
                     # 添加买入点标注
                     for _, row in buy_df.iterrows():
-                        ax1.annotate(f'买入\n{row["price"]:.3f}', 
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        ax1.annotate(f'买入\n{row["price"]:.3f}\n{original_time_str}', 
                                    xy=(row['timestamp'], row['price']),
                                    xytext=(10, 10), textcoords='offset points',
                                    fontsize=8, color='red', weight='bold',
@@ -750,13 +785,43 @@ class ETF159506RedisKlineGenerator:
                                color='green', marker='v', s=150, label='卖出信号', zorder=10, alpha=0.8)
                     # 添加卖出点标注
                     for _, row in sell_df.iterrows():
-                        ax1.annotate(f'卖出\n{row["price"]:.3f}', 
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        ax1.annotate(f'卖出\n{row["price"]:.3f}\n{original_time_str}', 
                                    xy=(row['timestamp'], row['price']),
                                    xytext=(10, -20), textcoords='offset points',
                                    fontsize=8, color='green', weight='bold',
                                    bbox=dict(boxstyle='round,pad=0.3', facecolor='green', alpha=0.2))
                 
-                logger.info(f"添加了 {len(buy_signals)} 个买入点和 {len(sell_signals)} 个卖出点")
+                # 绘制持有点（蓝色圆点）
+                if hold_signals:
+                    hold_df = pd.DataFrame(hold_signals)
+                    ax1.scatter(hold_df['timestamp'], hold_df['price'], 
+                               color='blue', marker='o', s=100, label='持有信号', zorder=10, alpha=0.8)
+                    # 添加持有点标注
+                    for _, row in hold_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        ax1.annotate(f'持有\n{row["price"]:.3f}\n{original_time_str}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(10, 0), textcoords='offset points',
+                                   fontsize=8, color='blue', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='blue', alpha=0.2))
+                
+                # 绘制观望点（黄色方块）
+                if watch_signals:
+                    watch_df = pd.DataFrame(watch_signals)
+                    ax1.scatter(watch_df['timestamp'], watch_df['price'], 
+                               color='orange', marker='s', s=100, label='观望信号', zorder=10, alpha=0.8)
+                    # 添加观望点标注
+                    for _, row in watch_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        ax1.annotate(f'观望\n{row["price"]:.3f}\n{original_time_str}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(10, 0), textcoords='offset points',
+                                   fontsize=8, color='orange', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.3', facecolor='orange', alpha=0.2))
+                
+                logger.info(f"添加了 {len(buy_signals)} 个买入点、{len(sell_signals)} 个卖出点、{len(hold_signals)} 个持有点、{len(watch_signals)} 个观望点")
             else:
                 logger.info("没有交易信号数据")
             

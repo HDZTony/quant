@@ -12,7 +12,7 @@ from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import PriceType
-from nautilus_trader.model.events import PositionOpened
+from nautilus_trader.model.events import PositionOpened, PositionChanged, PositionClosed, OrderFilled
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.trading.strategy import StrategyConfig
 from nautilus_trader.model import Quantity
@@ -78,12 +78,22 @@ class ETF159506Strategy(Strategy):
         self.subscribe_bars(bar_type)
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
- 
+        # 策略始终空仓开始
+        self._log.info("策略配置为空仓开始，等待交易信号")
+        
+        # 检查初始持仓状态
+        initial_position = self.get_current_position()
+        if initial_position:
+            self._log.info(f"检测到初始持仓: {initial_position.quantity.as_double()} 股")
+        else:
+            self._log.info("确认初始状态：无持仓")
 
     def on_stop(self):
         """策略停止时调用"""
-        if self.position and self.position.quantity.as_double() > 0:
+        current_position = self.get_current_position()
+        if current_position is not None:
             self.close_all_positions(self.config.instrument_id)
+            self._log.info(f"策略停止时关闭持仓: {current_position.quantity.as_double()} 股")
         self.unsubscribe_bars(self.config.bar_type)
         
         # 保存交易信号到策略实例变量中，供回测系统获取
@@ -117,12 +127,38 @@ class ETF159506Strategy(Strategy):
         
         # 检查止损止盈
         self.check_risk_management(bar)
+        
+        # 定期监控持仓状态（每10个K线记录一次）
+        if len(self.macd_history) % 10 == 0:
+            current_position = self.get_current_position()
+            if current_position:
+                self._log.info(f"持仓状态监控: {current_position.quantity.as_double()} 股, 成本: {current_position.avg_px_open:.4f}")
+            else:
+                self._log.info("持仓状态监控: 无持仓")
 
     def on_event(self, event: Event):
-        """处理事件"""
-        if isinstance(event, PositionOpened):
-            self.position = self.cache.position(event.position_id)
-            self._log.info(f"持仓已开启: {self.position}")
+        """处理所有事件"""
+        pass  # 通用事件处理，具体事件由专门方法处理
+    
+    def on_position_opened(self, event: PositionOpened) -> None:
+        """持仓开启事件处理"""
+        self.position = self.cache.position(event.position_id)
+        self._log.info(f"持仓已开启: {self.position}")
+    
+    def on_position_changed(self, event: PositionChanged) -> None:
+        """持仓变化事件处理"""
+        self.position = self.cache.position(event.position_id)
+        self._log.info(f"持仓已变化: {self.position}")
+    
+    def on_position_closed(self, event: PositionClosed) -> None:
+        """持仓关闭事件处理"""
+        self.position = None
+        self._log.info("持仓已关闭")
+    
+    def on_order_filled(self, event: OrderFilled) -> None:
+        """订单成交事件处理"""
+        self._log.info(f"订单成交: {event.client_order_id}, 数量: {event.last_qty}, 价格: {event.last_px}")
+        # 订单成交后，持仓状态会在下一个持仓事件中更新
     
     def setup_initial_position(self, bar: Bar):
         """设置初始持仓 - 已禁用，策略始终空仓开始"""
@@ -187,12 +223,13 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "golden_cross"
             
-            # 检查当前持仓状态
-            has_position = self.position and self.position.quantity.as_double() > 0
+            # 检查当前持仓状态 - 使用可靠的持仓查询方法
+            current_position = self.get_current_position()
+            has_position = current_position is not None
             
             if has_position:
                 # 已有持仓，记录"持有"信号
-                current_quantity = self.position.quantity.as_double()
+                current_quantity = current_position.quantity.as_double()
                 hold_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
@@ -222,12 +259,13 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             self.last_signal = "death_cross"
             
-            # 检查当前持仓状态
-            has_position = self.position and self.position.quantity.as_double() > 0
+            # 检查当前持仓状态 - 使用可靠的持仓查询方法
+            current_position = self.get_current_position()
+            has_position = current_position is not None
             
             if has_position:
                 # 有持仓，记录卖出信号
-                current_quantity = self.position.quantity.as_double()
+                current_quantity = current_position.quantity.as_double()
                 sell_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
                     'price': bar.close.as_double(),
@@ -255,10 +293,10 @@ class ETF159506Strategy(Strategy):
     
     def execute_buy_signal(self, bar: Bar):
         """执行买入信号"""
-        # 检查是否已有持仓
-        has_position = self.position and self.position.quantity.as_double() > 0
-        if has_position:
-            self._log.info("已有持仓，跳过买入信号")
+        # 检查是否已有持仓 - 使用可靠的持仓查询方法
+        current_position = self.get_current_position()
+        if current_position is not None:
+            self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过买入信号")
             return
         
         # 计算交易数量
@@ -301,44 +339,78 @@ class ETF159506Strategy(Strategy):
     
     def execute_sell_signal(self, bar: Bar):
         """执行卖出信号"""
-        # 检查是否有持仓
-        has_position = self.position and self.position.quantity.as_double() > 0
-        if not has_position:
+        # 检查是否有持仓 - 使用可靠的持仓查询方法
+        current_position = self.get_current_position()
+        if current_position is None:
             self._log.info("没有持仓，跳过卖出信号")
             return
         
         # 更新最近的卖出信号记录
         for signal in reversed(self.trade_signals):
             if signal.get('signal_type') == 'death_cross' and signal.get('side') == 'SELL':
-                signal['quantity'] = self.position.quantity.as_double()
+                signal['quantity'] = current_position.quantity.as_double()
                 signal['order_id'] = 'close_position'
                 break
         
         # 执行平仓操作
-        self.close_position(self.position)
-        self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={self.position.quantity.as_double()}")
+        self.close_position(current_position)
+        self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
-        # 检查是否有持仓
-        if not self.position or self.position.quantity.as_double() <= 0:
+        # 检查是否有持仓 - 使用可靠的持仓查询方法
+        current_position = self.get_current_position()
+        if current_position is None:
             return
         
         current_price = bar.close.as_double()
-        entry_price = self.position.avg_px_open
+        entry_price = current_position.avg_px_open
         
         # 计算盈亏百分比
         pnl_pct = (current_price - entry_price) / entry_price
         
         # 止损检查
         if pnl_pct <= -self.stop_loss_pct:
-            self.close_position(self.position)
+            self.close_position(current_position)
             self._log.info(f"触发止损: 亏损{pnl_pct*100:.2f}%")
         
         # 止盈检查
         elif pnl_pct >= self.take_profit_pct:
-            self.close_position(self.position)
+            self.close_position(current_position)
             self._log.info(f"触发止盈: 盈利{pnl_pct*100:.2f}%")
+
+    def get_current_position(self):
+        """获取当前持仓状态 - 回测环境优化版本"""
+        # 方法1：检查实例变量（最优先）
+        if self.position and self.position.quantity.as_double() > 0:
+            return self.position
+        
+        # 方法2：从缓存查询当前工具的持仓（回测推荐）
+        try:
+            position = self.cache.position_for_instrument(self.config.instrument_id)
+            if position and position.quantity.as_double() > 0:
+                # 更新实例变量
+                self.position = position
+                self._log.debug(f"从缓存恢复持仓状态: {position.quantity.as_double()} 股")
+                return position
+        except Exception as e:
+            self._log.debug(f"从缓存查询指定工具持仓失败: {e}")
+        
+        # 方法3：从缓存查询所有持仓（备用方案）
+        try:
+            positions = self.cache.positions()
+            if positions:
+                for pos in positions:
+                    if pos.instrument_id == self.config.instrument_id and pos.quantity.as_double() > 0:
+                        self.position = pos
+                        self._log.debug(f"从缓存恢复持仓状态: {pos.quantity.as_double()} 股")
+                        return pos
+        except Exception as e:
+            self._log.debug(f"从缓存查询所有持仓失败: {e}")
+        
+        # 没有持仓
+        self.position = None
+        return None
 
     def on_dispose(self):
         """策略销毁时调用"""
