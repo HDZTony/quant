@@ -220,15 +220,12 @@ class ETF159506OfficialBacktest:
                                 logger.info(f"策略ID: {strategy.id}")
                                 logger.info(f"策略属性: {dir(strategy)}")
                                 
-                                # 从策略实例的 trade_signals 获取
-                                if hasattr(strategy, 'trade_signals') and strategy.trade_signals:
-                                    logger.info(f"从策略 {strategy.id} 获取到 {len(strategy.trade_signals)} 个交易信号")
-                                    self.trade_signals.extend(strategy.trade_signals)
-                                
-                                # 从策略实例的 _saved_trade_signals 获取（备用）
+                                # 只从策略实例的 _saved_trade_signals 获取（策略停止时保存的）
                                 if hasattr(strategy, '_saved_trade_signals') and strategy._saved_trade_signals:
                                     logger.info(f"从策略 {strategy.id} 的保存信号中获取到 {len(strategy._saved_trade_signals)} 个交易信号")
                                     self.trade_signals.extend(strategy._saved_trade_signals)
+                                else:
+                                    logger.warning(f"策略 {strategy.id} 没有保存的交易信号")
                         else:
                             logger.warning("引擎没有trader属性")
                             
@@ -239,6 +236,31 @@ class ETF159506OfficialBacktest:
             
             
             logger.info(f"最终收集到 {len(self.trade_signals)} 个交易信号")
+            
+            # 添加详细的信号统计信息
+            if self.trade_signals:
+                buy_count = sum(1 for s in self.trade_signals if s.get('side') == 'BUY')
+                sell_count = sum(1 for s in self.trade_signals if s.get('side') == 'SELL')
+                hold_count = sum(1 for s in self.trade_signals if s.get('side') == 'HOLD')
+                watch_count = sum(1 for s in self.trade_signals if s.get('side') == 'WATCH')
+                
+                logger.info("=" * 60)
+                logger.info("交易信号详细统计")
+                logger.info("=" * 60)
+                logger.info(f"买入信号: {buy_count} 个")
+                logger.info(f"卖出信号: {sell_count} 个")
+                logger.info(f"持有信号: {hold_count} 个")
+                logger.info(f"观望信号: {watch_count} 个")
+                logger.info(f"总计: {len(self.trade_signals)} 个")
+                
+                # 显示前几个信号的详细信息
+                logger.info("\n前5个交易信号详情:")
+                for i, signal in enumerate(self.trade_signals[:5]):
+                    logger.info(f"信号 {i+1}: {signal}")
+                
+                if len(self.trade_signals) > 5:
+                    logger.info(f"... 还有 {len(self.trade_signals) - 5} 个信号")
+                logger.info("=" * 60)
             
         except Exception as e:
             logger.error(f"收集交易信号失败: {e}")

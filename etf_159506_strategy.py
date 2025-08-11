@@ -115,10 +115,24 @@ class ETF159506Strategy(Strategy):
         
         # 策略始终空仓开始，无需设置初始持仓
         
+        # 无论MACD是否初始化，都计算图表MACD值
+        chart_macd = self.calculate_chart_macd(bar)
+        
         if not self.macd.initialized:
             self._log.info(f"MACD指标未初始化，当前数据点: {len(self.macd_history)}")
+            self._log.info(f"使用图表MACD: DIF={chart_macd['macd']:.6f}, DEA={chart_macd['signal']:.6f}, Histogram={chart_macd['histogram']:.6f}")
+            
+            # 即使未初始化，也记录图表MACD值到历史数据中
+            self.macd_history.append(chart_macd['macd'])
+            self.signal_history.append(chart_macd['signal'])
+            self.histogram_history.append(chart_macd['histogram'])
+            
+            # 不进行交易信号检测，但记录数据
             return
 
+        # MACD指标已初始化，使用官方指标值
+        self._log.info(f"MACD指标已初始化，使用官方指标值")
+        
         # 更新历史数据
         self.update_history_data(bar)
         
@@ -182,7 +196,63 @@ class ETF159506Strategy(Strategy):
         self.histogram_history.append(histogram_value)
         
         # 记录当前指标值
-        self._log.info(f"MACD(DIF): {macd_value:.6f}, Signal(DEA): {signal_value:.6f}, Histogram: {histogram_value:.6f}")
+        self._log.info(f"DIF: {macd_value:.6f}, DEA: {signal_value:.6f}, MACD柱: {histogram_value:.6f}")
+    
+    def calculate_chart_macd(self, bar: Bar):
+        """计算图表风格的MACD值，弥补前26分钟的空白"""
+        # 获取当前价格
+        current_price = bar.close.as_double()
+        
+        # 如果MACD指标已初始化，使用官方指标值
+        if self.macd.initialized:
+            return {
+                'macd': self.macd.value,  # DIF
+                'signal': self.calculate_signal_line(),  # DEA
+                'histogram': self.macd.value - self.calculate_signal_line()  # MACD柱
+            }
+        
+        # 如果MACD指标未初始化，使用图表方法计算
+        # 收集所有历史价格数据
+        if not hasattr(self, '_price_history'):
+            self._price_history = []
+        
+        self._price_history.append(current_price)
+        
+        # 使用pandas的ewm计算，即使数据不足也能计算
+        price_series = pd.Series(self._price_history)
+        
+        # 计算EMA12和EMA26
+        ema12 = price_series.ewm(span=12, adjust=False).mean()
+        ema26 = price_series.ewm(span=26, adjust=False).mean()
+        
+        # 计算DIF (MACD线)
+        dif = ema12.iloc[-1] - ema26.iloc[-1]
+        
+        # 计算DEA (信号线) - 对DIF的9周期EMA
+        if len(self._price_history) >= 2:
+            # 如果有DIF历史，计算DEA
+            if not hasattr(self, '_dif_history'):
+                self._dif_history = []
+            self._dif_history.append(dif)
+            
+            dif_series = pd.Series(self._dif_history)
+            span = min(9, len(dif_series))
+            dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
+        else:
+            # 数据不足时，DEA = DIF
+            dea = dif
+        
+        # 计算MACD柱
+        histogram = 2 * (dif - dea)
+        
+        # 记录图表MACD计算
+        self._log.info(f"图表MACD计算: 价格={current_price:.4f}, DIF={dif:.6f}, DEA={dea:.6f}, MACD柱={histogram:.6f}")
+        
+        return {
+            'macd': dif,      # DIF
+            'signal': dea,    # DEA
+            'histogram': histogram  # MACD柱
+        }
     
     def calculate_signal_line(self):
         """计算信号线（DEA）- 对DIF的9周期EMA"""

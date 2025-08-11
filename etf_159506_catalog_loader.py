@@ -702,7 +702,13 @@ class ETF159506RedisKlineGenerator:
                 hold_signals = []
                 watch_signals = []
                 
-                for signal in trade_signals:
+                # 添加调试日志
+                logger.info(f"开始处理 {len(trade_signals)} 个交易信号...")
+                logger.info(f"图表时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
+                
+                for i, signal in enumerate(trade_signals):
+                    logger.info(f"处理第 {i+1} 个信号: {signal}")
+                    
                     # 转换时间戳为pandas datetime
                     if isinstance(signal['timestamp'], str):
                         signal_time = pd.to_datetime(signal['timestamp'])
@@ -720,48 +726,65 @@ class ETF159506RedisKlineGenerator:
                         beijing_tz = pytz.timezone('Asia/Shanghai')
                         signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
                     
+                    logger.info(f"信号 {i+1} 原始时间: {signal_time}")
+                    
                     # 应用相同的时间映射，保持图表连续性
                     current_time = signal_time.time()
                     if current_time < datetime_time(11, 30):
                         # 上午时间保持不变
                         mapped_signal_time = signal_time
+                        logger.info(f"信号 {i+1} 上午时间，映射后时间: {mapped_signal_time}")
                     elif current_time > datetime_time(13, 0):
                         # 下午时间减去1.5小时（午休时间），保持图表连续
                         mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
+                        logger.info(f"信号 {i+1} 下午时间，映射后时间: {mapped_signal_time}")
                     else:
                         # 午休时间的信号跳过
+                        logger.warning(f"信号 {i+1} 在午休时间 {current_time}，跳过")
                         continue
                     
-                    # 检查映射后的时间是否在图表范围内
-                    if mapped_signal_time >= mapped_df.index.min() and mapped_signal_time <= mapped_df.index.max():
-                        if signal['side'] == 'BUY':
-                            buy_signals.append({
-                                'timestamp': mapped_signal_time,
-                                'price': signal['price'],
-                                'original_time': signal_time,  # 保存原始时间
-                                'signal_type': signal.get('signal_type', 'unknown')
-                            })
-                        elif signal['side'] == 'SELL':
-                            sell_signals.append({
-                                'timestamp': mapped_signal_time,
-                                'price': signal['price'],
-                                'original_time': signal_time,  # 保存原始时间
-                                'signal_type': signal.get('signal_type', 'unknown')
-                            })
-                        elif signal['side'] == 'HOLD':
-                            hold_signals.append({
-                                'timestamp': mapped_signal_time,
-                                'price': signal['price'],
-                                'original_time': signal_time,  # 保存原始时间
-                                'signal_type': signal.get('signal_type', 'unknown')
-                            })
-                        elif signal['side'] == 'WATCH':
-                            watch_signals.append({
-                                'timestamp': mapped_signal_time,
-                                'price': signal['price'],
-                                'original_time': signal_time,  # 保存原始时间
-                                'signal_type': signal.get('signal_type', 'unknown')
-                            })
+                    # 检查映射后的时间是否在图表范围内，如果超出范围则调整到最近的有效时间
+                    if mapped_signal_time < mapped_df.index.min():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 早于图表开始时间，调整到 {mapped_df.index.min()}")
+                        mapped_signal_time = mapped_df.index.min()
+                    elif mapped_signal_time > mapped_df.index.max():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 晚于图表结束时间，调整到 {mapped_df.index.max()}")
+                        mapped_signal_time = mapped_df.index.max()
+                    
+                    logger.info(f"信号 {i+1} 最终映射时间: {mapped_signal_time}")
+                    
+                    # 所有信号都添加到对应列表（经过时间调整后）
+                    if signal['side'] == 'BUY':
+                        buy_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'SELL':
+                        sell_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'HOLD':
+                        hold_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'WATCH':
+                        watch_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                
+                logger.info(f"信号处理完成: 买入={len(buy_signals)}, 卖出={len(sell_signals)}, 持有={len(hold_signals)}, 观望={len(watch_signals)}")
+                logger.info(f"总共 {len(buy_signals) + len(sell_signals) + len(hold_signals) + len(watch_signals)} 个信号被添加到图表")
                 
                 # 绘制买入点（红色三角形向上）
                 if buy_signals:
