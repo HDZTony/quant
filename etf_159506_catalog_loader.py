@@ -670,10 +670,10 @@ class ETF159506RedisKlineGenerator:
             
             # 添加信号类型说明
             signal_info = "信号说明:\n"
-            signal_info += "🔴 买入信号: 金叉出现，无持仓时买入\n"
-            signal_info += "🟢 卖出信号: 死叉出现，有持仓时卖出\n"
-            signal_info += "🔵 持有信号: 金叉出现，已有持仓时持有\n"
-            signal_info += "🟡 观望信号: 死叉出现，无持仓时观望\n"
+            signal_info += "▲ 买入信号: 金叉出现，无持仓时买入\n"
+            signal_info += "▼ 卖出信号: 死叉出现，有持仓时卖出\n"
+            signal_info += "● 持有信号: 金叉出现，已有持仓时持有\n"
+            signal_info += "■ 观望信号: 死叉出现，无持仓时观望\n"
             
             ax1.text(0.02, 0.85, signal_info, 
                    transform=ax1.transAxes, verticalalignment='top', 

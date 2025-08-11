@@ -1,19 +1,19 @@
 # jvQuant实时技术指标计算系统依赖
 
 # 基础依赖
-requests>=2.28.0
-websocket-client>=1.4.0
-
-# 数据处理
 pandas>=1.5.0
 numpy>=1.21.0
+websocket-client>=1.5.0
+requests>=2.28.0
 
-# 图表绘制
-matplotlib>=3.5.0
-mplfinance>=0.12.0
+# 内存监控
+psutil>=5.9.0
 
-# Nautilus Trader (如果已安装虚拟环境中的版本，可以注释掉)
-# nautilus_trader>=1.219.0
+# Redis支持（可选）
+redis>=4.5.0
 
-# 其他工具
-python-dateutil>=2.8.0 
+# NautilusTrader相关
+nautilus_trader>=1.0.0
+
+# 数据格式支持
+pyarrow>=10.0.0  # 用于Parquet文件读写 

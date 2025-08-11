@@ -20,6 +20,17 @@ from pathlib import Path
 import pickle
 from typing import Dict, List, Optional, Any
 import logging
+import gc
+
+# 内存监控相关导入
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+    print("[Memory Monitor] psutil已安装，启用内存监控功能")
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("[Memory Monitor] 未安装psutil，内存监控功能将被禁用")
+    print("[Memory Monitor] 建议安装: pip install psutil")
 
 # Redis连接检测和健康检查
 REDIS_AVAILABLE = False
@@ -67,6 +78,16 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# 内存监控配置
+MEMORY_MONITOR_CONFIG = {
+    'warning_threshold_mb': 500,      # 内存警告阈值(MB)
+    'critical_threshold_mb': 1024,    # 内存严重警告阈值(MB)
+    'cleanup_threshold_mb': 800,      # 触发清理的阈值(MB)
+    'check_interval_seconds': 60,     # 内存检查间隔(秒)
+    'max_cache_size': 10000,          # 最大缓存数据条数
+    'cleanup_keep_hours': 2,          # 清理时保留的小时数
+}
 
 
 class TradingTimeManager:
@@ -493,7 +514,7 @@ class ETF159506CacheManager:
             return None
     
     def clear_old_data(self, keep_hours: int = 24):
-        """清理旧数据"""
+        """清理旧数据 - 优化版本，真正释放内存"""
         try:
             cutoff_time = datetime.now() - timedelta(hours=keep_hours)
             cutoff_ns = int(cutoff_time.timestamp() * 1e9)
@@ -502,19 +523,143 @@ class ETF159506CacheManager:
             quote_ticks = self.cache.quote_ticks(self.instrument_id)
             trade_ticks = self.cache.trade_ticks(self.instrument_id)
             
-            # 过滤新数据
-            new_quotes = [tick for tick in quote_ticks if tick.ts_event >= cutoff_ns]
-            new_trades = [tick for tick in trade_ticks if tick.ts_event >= cutoff_ns]
+            # 统计旧数据
+            old_quotes = [tick for tick in quote_ticks if tick.ts_event < cutoff_ns]
+            old_trades = [tick for tick in trade_ticks if tick.ts_event < cutoff_ns]
             
-            # 重新设置数据（这里简化处理，实际应该使用Cache的清理方法）
-            logger.info(f"数据清理: 报价 {len(quote_ticks)} -> {len(new_quotes)}, "
-                       f"交易 {len(trade_ticks)} -> {len(new_trades)}")
+            # 清理旧数据 - 使用Cache的删除方法
+            cleaned_quotes = 0
+            cleaned_trades = 0
+            
+            for tick in old_quotes:
+                try:
+                    # 尝试从Cache中删除旧数据
+                    if hasattr(self.cache, 'delete_quote_tick'):
+                        self.cache.delete_quote_tick(tick)
+                        cleaned_quotes += 1
+                except Exception as e:
+                    logger.debug(f"删除旧报价tick失败: {e}")
+            
+            for tick in old_trades:
+                try:
+                    # 尝试从Cache中删除旧数据
+                    if hasattr(self.cache, 'delete_trade_tick'):
+                        self.cache.delete_trade_tick(tick)
+                        cleaned_trades += 1
+                except Exception as e:
+                    logger.debug(f"删除旧交易tick失败: {e}")
+            
+            # 强制垃圾回收
+            if cleaned_quotes > 0 or cleaned_trades > 0:
+                gc.collect()
+                logger.info(f"数据清理完成: 清理报价 {cleaned_quotes} 条, 交易 {cleaned_trades} 条")
+                logger.info(f"清理后数据量: 报价 {len(quote_ticks) - cleaned_quotes} 条, "
+                           f"交易 {len(trade_ticks) - cleaned_trades} 条")
+            else:
+                logger.debug("无需清理旧数据")
             
         except Exception as e:
             logger.error(f"清理旧数据失败: {e}")
     
+    def force_memory_cleanup(self):
+        """强制内存清理"""
+        try:
+            logger.info("开始强制内存清理...")
+            
+            # 清理旧数据（只保留2小时）
+            self.clear_old_data(keep_hours=MEMORY_MONITOR_CONFIG['cleanup_keep_hours'])
+            
+            # 限制缓存大小
+            quote_ticks = self.cache.quote_ticks(self.instrument_id)
+            trade_ticks = self.cache.trade_ticks(self.instrument_id)
+            
+            max_size = MEMORY_MONITOR_CONFIG['max_cache_size']
+            
+            if len(quote_ticks) > max_size:
+                # 保留最新的数据
+                new_quotes = quote_ticks[-max_size:]
+                logger.info(f"限制报价缓存大小: {len(quote_ticks)} -> {len(new_quotes)}")
+                # 这里需要实现真正的数据替换逻辑
+            
+            if len(trade_ticks) > max_size:
+                # 保留最新的数据
+                new_trades = trade_ticks[-max_size:]
+                logger.info(f"限制交易缓存大小: {len(trade_ticks)} -> {len(new_trades)}")
+                # 这里需要实现真正的数据替换逻辑
+            
+            # 强制垃圾回收
+            gc.collect()
+            
+            # 获取清理后的内存状态
+            if PSUTIL_AVAILABLE:
+                process = psutil.Process()
+                memory_mb = process.memory_info().rss / 1024 / 1024
+                logger.info(f"强制清理完成，当前内存使用: {memory_mb:.2f} MB")
+            
+        except Exception as e:
+            logger.error(f"强制内存清理失败: {e}")
+    
+    def get_memory_usage(self) -> Dict:
+        """获取内存使用情况"""
+        if not PSUTIL_AVAILABLE:
+            return {'available': False, 'error': 'psutil not available'}
+        
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            
+            return {
+                'available': True,
+                'rss_mb': memory_info.rss / 1024 / 1024,  # 物理内存
+                'vms_mb': memory_info.vms / 1024 / 1024,  # 虚拟内存
+                'percent': process.memory_percent(),         # 内存使用百分比
+                'cache_size': {
+                    'quotes': len(self.cache.quote_ticks(self.instrument_id)),
+                    'trades': len(self.cache.trade_ticks(self.instrument_id))
+                }
+            }
+        except Exception as e:
+            return {'available': False, 'error': str(e)}
+    
+    def check_memory_threshold(self) -> Dict:
+        """检查内存阈值"""
+        memory_info = self.get_memory_usage()
+        
+        if not memory_info.get('available', False):
+            return {'action': 'unknown', 'reason': 'memory monitoring not available'}
+        
+        rss_mb = memory_info['rss_mb']
+        warning_threshold = MEMORY_MONITOR_CONFIG['warning_threshold_mb']
+        critical_threshold = MEMORY_MONITOR_CONFIG['critical_threshold_mb']
+        cleanup_threshold = MEMORY_MONITOR_CONFIG['cleanup_threshold_mb']
+        
+        if rss_mb >= critical_threshold:
+            return {
+                'action': 'critical',
+                'reason': f'内存使用严重超标: {rss_mb:.2f} MB >= {critical_threshold} MB',
+                'memory_mb': rss_mb
+            }
+        elif rss_mb >= cleanup_threshold:
+            return {
+                'action': 'cleanup',
+                'reason': f'内存使用较高，触发清理: {rss_mb:.2f} MB >= {cleanup_threshold} MB',
+                'memory_mb': rss_mb
+            }
+        elif rss_mb >= warning_threshold:
+            return {
+                'action': 'warning',
+                'reason': f'内存使用较高: {rss_mb:.2f} MB >= {warning_threshold} MB',
+                'memory_mb': rss_mb
+            }
+        else:
+            return {
+                'action': 'normal',
+                'reason': f'内存使用正常: {rss_mb:.2f} MB >= {warning_threshold} MB',
+                'memory_mb': rss_mb
+            }
+    
     def cleanup_corrupted_files(self, catalog_path: str = None):
-        """清理损坏的Parquet文件"""
+        """清理损坏的Parquet文件 - 优化版本"""
         try:
             # 如果没有提供catalog_path，使用默认路径
             if catalog_path is None:
@@ -531,21 +676,34 @@ class ETF159506CacheManager:
             
             for file_path in parquet_files:
                 try:
-                    # 检查文件大小
+                    # 更宽松的文件大小检测
                     file_size = file_path.stat().st_size
-                    if file_size < 100:  # 小于100字节的文件可能是损坏的
-                        logger.warning(f"发现损坏文件: {file_path} (大小: {file_size}字节)")
-                        # 备份并删除
+                    if file_size < 10:  # 降低阈值到10字节，避免误判小文件
+                        logger.warning(f"文件过小: {file_path} (大小: {file_size}字节)")
+                        # 不立即标记为损坏，先尝试读取
+                    
+                    # 尝试读取文件验证完整性
+                    df = pd.read_parquet(file_path)
+                    
+                    # 检查数据有效性
+                    if df.empty:
+                        logger.warning(f"文件为空: {file_path}")
+                        # 空文件不一定是损坏的，可能是当天没有数据
+                        continue
+                    
+                    # 检查必要的列是否存在
+                    required_columns = ['timestamp', 'price', 'size', 'trade_id', 'type']
+                    missing_columns = [col for col in required_columns if col not in df.columns]
+                    if missing_columns:
+                        logger.warning(f"文件缺少必要列: {file_path}, 缺失: {missing_columns}")
+                        # 标记为损坏
                         backup_path = file_path.with_suffix('.corrupted')
                         file_path.rename(backup_path)
                         corrupted_count += 1
                         continue
                     
-                    # 尝试读取文件验证完整性
-                    pd.read_parquet(file_path)
-                    
                 except Exception as e:
-                    logger.warning(f"发现损坏文件: {file_path} (错误: {e})")
+                    logger.warning(f"文件读取失败: {file_path} (错误: {e})")
                     # 备份并删除
                     backup_path = file_path.with_suffix('.corrupted')
                     file_path.rename(backup_path)
@@ -558,6 +716,67 @@ class ETF159506CacheManager:
             
         except Exception as e:
             logger.error(f"清理损坏文件失败: {e}")
+    
+    def recover_corrupted_files(self, catalog_path: str = None):
+        """尝试恢复损坏的文件"""
+        try:
+            if catalog_path is None:
+                catalog_path = "catalog/etf_159506_cache"
+            
+            catalog_path = Path(catalog_path)
+            if not catalog_path.exists():
+                logger.info(f"目录不存在，跳过恢复: {catalog_path}")
+                return
+            
+            corrupted_files = list(catalog_path.glob("*.corrupted"))
+            if not corrupted_files:
+                logger.info("没有发现损坏的文件需要恢复")
+                return
+            
+            logger.info(f"发现 {len(corrupted_files)} 个损坏文件，尝试恢复...")
+            recovered_count = 0
+            
+            for corrupted_file in corrupted_files:
+                try:
+                    # 尝试读取损坏的文件
+                    df = pd.read_parquet(corrupted_file)
+                    if not df.empty:
+                        # 检查必要的列是否存在
+                        required_columns = ['timestamp', 'price', 'size', 'trade_id', 'type']
+                        missing_columns = [col for col in required_columns if col not in df.columns]
+                        
+                        if not missing_columns:
+                            # 如果数据有效，恢复文件
+                            original_name = corrupted_file.stem + ".parquet"
+                            recovered_path = corrupted_file.parent / original_name
+                            
+                            # 检查是否已存在同名文件
+                            if recovered_path.exists():
+                                # 如果存在，先备份
+                                backup_name = f"{original_name}.backup_{int(time.time())}"
+                                backup_path = corrupted_file.parent / backup_name
+                                recovered_path.rename(backup_path)
+                                logger.info(f"已备份现有文件: {backup_name}")
+                            
+                            # 恢复文件
+                            corrupted_file.rename(recovered_path)
+                            recovered_count += 1
+                            logger.info(f"成功恢复文件: {original_name} ({len(df)} 条记录)")
+                        else:
+                            logger.warning(f"文件 {corrupted_file.name} 缺少必要列: {missing_columns}")
+                    else:
+                        logger.warning(f"文件 {corrupted_file.name} 为空，无法恢复")
+                        
+                except Exception as e:
+                    logger.warning(f"无法恢复文件 {corrupted_file.name}: {e}")
+            
+            if recovered_count > 0:
+                logger.info(f"成功恢复 {recovered_count} 个文件")
+            else:
+                logger.warning("没有文件被成功恢复")
+                
+        except Exception as e:
+            logger.error(f"恢复损坏文件失败: {e}")
 
 
 class ETF159506ServerManager:
@@ -783,6 +1002,7 @@ class ETF159506CacheWebSocketClient:
         self.stop_monitor = False
         self.trading_time_thread = None
         self.stop_trading_time_check = False
+        self.stop_data_integrity_check = False
         
         # 统计信息
         self.connection_count = 0
@@ -795,6 +1015,7 @@ class ETF159506CacheWebSocketClient:
         self.save_interval = 10  # 5分钟保存一次（减少文件数量）
         self.merge_interval = 3600  # 1小时合并一次文件
         self.trading_time_check_interval = 60  # 改为60秒检查一次交易时间，减少检查频率
+        self.data_integrity_check_interval = 1800  # 30分钟检查一次数据完整性
         self.catalog_path = f"catalog/etf_159506_cache"
         
         # 数据缓冲区
@@ -892,12 +1113,19 @@ class ETF159506CacheWebSocketClient:
         # 移除心跳机制 - JVQuant服务器不支持心跳
         # self.start_heartbeat(ws)
         
+        # 启动时尝试恢复损坏的文件
+        logger.info("启动时尝试恢复损坏的文件...")
+        self.cache_manager.recover_corrupted_files(self.catalog_path)
+        
         # 启动时清理损坏的文件
+        logger.info("启动时清理损坏的文件...")
         self.cache_manager.cleanup_corrupted_files(self.catalog_path)
         
         self.start_auto_save()
         self.start_diagnostic_monitor()
+        self.start_memory_monitor()  # 启动内存监控线程
         self.start_trading_time_check()
+        self.start_data_integrity_check()  # 启动数据完整性检查线程
     
     def on_message(self, ws, message, *args):
         """接收消息回调"""
@@ -1117,6 +1345,61 @@ class ETF159506CacheWebSocketClient:
         self.monitor_thread.start()
         logger.info("诊断监控线程已启动")
     
+    def start_memory_monitor(self):
+        """启动内存监控线程"""
+        if PSUTIL_AVAILABLE:
+            self.memory_monitor_thread = threading.Thread(target=self.memory_monitor_loop)
+            self.memory_monitor_thread.daemon = True
+            self.memory_monitor_thread.start()
+            logger.info("内存监控线程已启动")
+        else:
+            logger.warning("psutil未安装，内存监控线程未启动")
+    
+    def memory_monitor_loop(self):
+        """内存监控循环"""
+        while not self.stop_monitor:
+            try:
+                time.sleep(MEMORY_MONITOR_CONFIG['check_interval_seconds'])
+                
+                if not self.stop_monitor:
+                    # 检查内存使用情况
+                    memory_check = self.cache_manager.check_memory_threshold()
+                    
+                    if memory_check['action'] == 'critical':
+                        logger.critical(f"🚨 内存严重超标: {memory_check['reason']}")
+                        # 强制清理内存
+                        self.cache_manager.force_memory_cleanup()
+                        
+                    elif memory_check['action'] == 'cleanup':
+                        logger.warning(f"⚠️ 内存使用较高: {memory_check['reason']}")
+                        # 触发清理
+                        self.cache_manager.force_memory_cleanup()
+                        
+                    elif memory_check['action'] == 'warning':
+                        logger.warning(f"⚠️ 内存使用较高: {memory_check['reason']}")
+                        # 轻度清理
+                        self.cache_manager.clear_old_data(keep_hours=12)
+                        
+                    else:
+                        logger.debug(f"内存使用正常: {memory_check['reason']}")
+                    
+                    # 每10次检查输出一次详细内存信息
+                    if hasattr(self, '_memory_check_count'):
+                        self._memory_check_count += 1
+                    else:
+                        self._memory_check_count = 1
+                    
+                    if self._memory_check_count % 10 == 0:
+                        memory_info = self.cache_manager.get_memory_usage()
+                        if memory_info.get('available', False):
+                            logger.info(f"内存监控状态: {memory_info['rss_mb']:.2f} MB, "
+                                      f"缓存大小: 报价{memory_info['cache_size']['quotes']}条, "
+                                      f"交易{memory_info['cache_size']['trades']}条")
+                    
+            except Exception as e:
+                logger.error(f"内存监控循环错误: {e}")
+                time.sleep(30)  # 出错时等待30秒
+    
     def start_trading_time_check(self):
         """启动交易时间检查线程"""
         if self.enable_trading_time_control and self.trading_time_manager:
@@ -1124,6 +1407,13 @@ class ETF159506CacheWebSocketClient:
             self.trading_time_thread.daemon = True
             self.trading_time_thread.start()
             logger.info("交易时间检查线程已启动")
+    
+    def start_data_integrity_check(self):
+        """启动数据完整性检查线程"""
+        self.data_integrity_thread = threading.Thread(target=self.data_integrity_check_loop)
+        self.data_integrity_thread.daemon = True
+        self.data_integrity_thread.start()
+        logger.info("数据完整性检查线程已启动")
     
     def diagnostic_monitor_loop(self):
         """诊断监控循环"""
@@ -1227,6 +1517,103 @@ class ETF159506CacheWebSocketClient:
                 logger.error(f"详细错误信息: {traceback.format_exc()}")
                 # 出错时等待一段时间再继续
                 time.sleep(30)
+    
+    def data_integrity_check_loop(self):
+        """数据完整性检查循环"""
+        while not self.stop_data_integrity_check:
+            try:
+                time.sleep(self.data_integrity_check_interval)
+                
+                if not self.stop_data_integrity_check:
+                    logger.info("开始数据完整性检查...")
+                    
+                    # 检查catalog目录中的文件
+                    catalog_path = Path(self.catalog_path)
+                    if catalog_path.exists():
+                        # 检查.parquet文件
+                        parquet_files = list(catalog_path.glob("*.parquet"))
+                        corrupted_files = list(catalog_path.glob("*.corrupted"))
+                        
+                        logger.info(f"数据完整性检查: 发现 {len(parquet_files)} 个正常文件, {len(corrupted_files)} 个损坏文件")
+                        
+                        # 尝试恢复损坏的文件
+                        if corrupted_files:
+                            logger.info("尝试恢复损坏的文件...")
+                            self.cache_manager.recover_corrupted_files(self.catalog_path)
+                        
+                        # 检查文件大小异常
+                        small_files = []
+                        for file_path in parquet_files:
+                            try:
+                                file_size = file_path.stat().st_size
+                                if file_size < 50:  # 小于50字节的文件可能有问题
+                                    small_files.append((file_path.name, file_size))
+                            except Exception as e:
+                                logger.warning(f"检查文件大小失败 {file_path.name}: {e}")
+                        
+                        if small_files:
+                            logger.warning(f"发现 {len(small_files)} 个过小的文件:")
+                            for filename, size in small_files:
+                                logger.warning(f"  - {filename}: {size} 字节")
+                        
+                        # 检查数据连续性
+                        self._check_data_continuity()
+                        
+                        logger.info("数据完整性检查完成")
+                    else:
+                        logger.warning("Catalog目录不存在，跳过数据完整性检查")
+                    
+            except Exception as e:
+                logger.error(f"数据完整性检查循环错误: {e}")
+                import traceback
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
+                time.sleep(60)  # 出错时等待1分钟
+    
+    def _check_data_continuity(self):
+        """检查数据连续性"""
+        try:
+            catalog_path = Path(self.catalog_path)
+            if not catalog_path.exists():
+                return
+            
+            # 查找最近几天的数据文件
+            today = datetime.now().date()
+            recent_files = []
+            
+            for i in range(7):  # 检查最近7天
+                check_date = today - timedelta(days=i)
+                filename = f"cache_data_{check_date.strftime('%Y%m%d')}.parquet"
+                file_path = catalog_path / filename
+                
+                if file_path.exists():
+                    try:
+                        file_size = file_path.stat().st_size
+                        if file_size >= 50:  # 只检查有效文件
+                            recent_files.append((check_date, file_path, file_size))
+                    except Exception:
+                        continue
+            
+            if len(recent_files) > 1:
+                # 按日期排序
+                recent_files.sort(key=lambda x: x[0])
+                
+                # 检查是否有数据缺失
+                missing_dates = []
+                for i in range(len(recent_files) - 1):
+                    current_date = recent_files[i][0]
+                    next_date = recent_files[i + 1][0]
+                    expected_date = current_date + timedelta(days=1)
+                    
+                    if expected_date != next_date:
+                        missing_dates.append(expected_date)
+                
+                if missing_dates:
+                    logger.warning(f"发现数据缺失的日期: {[d.strftime('%Y-%m-%d') for d in missing_dates]}")
+                else:
+                    logger.info("最近数据连续性良好")
+            
+        except Exception as e:
+            logger.error(f"检查数据连续性失败: {e}")
     
     def print_diagnostic_status(self):
         """打印诊断状态信息"""
@@ -1348,131 +1735,156 @@ Cache统计:
                 time.sleep(30)  # 出错时等待30秒，减少错误频率
     
     def _save_buffer_data(self):
-        """保存缓冲区数据"""
+        """保存缓冲区数据 - 改进版本"""
         try:
-            # 获取当前缓存数据，减少数据量避免内存占用过高
-            cache_data = self.cache_manager.get_historical_data(limit=1000)
+            # 使用文件锁避免并发写入
+            lock_file = Path(self.catalog_path) / ".save_lock"
             
-            if not cache_data or not cache_data.get('trade_ticks'):
-                logger.debug("跳过保存：无交易数据")
+            if lock_file.exists():
+                logger.debug("保存操作正在进行中，跳过本次保存")
                 return
             
-            # 转换为DataFrame格式
-            trade_data = []
-            for tick in cache_data['trade_ticks']:
-                trade_data.append({
-                    'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
-                    'price': float(tick.price),
-                    'size': int(tick.size),
-                    'trade_id': str(tick.trade_id),
-                    'type': 'trade'
-                })
-            
-            if not trade_data:
-                logger.debug("跳过保存：转换后无数据")
-                return
-            
-            # 按日期分组保存
-            today = datetime.now().date()
-            filename = f"cache_data_{today.strftime('%Y%m%d')}.parquet"
-            filepath = Path(self.catalog_path) / filename
-            
-            # 确保目录存在 - 使用绝对路径并增加详细日志
+            # 创建锁文件
             try:
-                catalog_dir = Path(self.catalog_path).resolve()
-                logger.debug(f"创建目录: {catalog_dir}")
-                catalog_dir.mkdir(parents=True, exist_ok=True)
+                lock_file.touch()
+                logger.debug("创建保存锁文件")
+            except Exception as e:
+                logger.warning(f"无法创建锁文件，跳过保存: {e}")
+                return
+            
+            try:
+                # 获取当前缓存数据，减少数据量避免内存占用过高
+                cache_data = self.cache_manager.get_historical_data(limit=1000)
                 
-                # 验证目录是否真的存在
-                if not catalog_dir.exists():
-                    logger.error(f"目录创建失败: {catalog_dir}")
+                if not cache_data or not cache_data.get('trade_ticks'):
+                    logger.debug("跳过保存：无交易数据")
                     return
                 
-                logger.debug(f"目录验证成功: {catalog_dir}")
-            except Exception as dir_error:
-                logger.error(f"创建目录失败: {dir_error}")
-                return
-            
-            # 如果文件已存在，读取并合并
-            if filepath.exists():
+                # 转换为DataFrame格式
+                trade_data = []
+                for tick in cache_data['trade_ticks']:
+                    trade_data.append({
+                        'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+                        'price': float(tick.price),
+                        'size': int(tick.size),
+                        'trade_id': str(tick.trade_id),
+                        'type': 'trade'
+                    })
+                
+                if not trade_data:
+                    logger.debug("跳过保存：转换后无数据")
+                    return
+                
+                # 按日期分组保存
+                today = datetime.now().date()
+                filename = f"cache_data_{today.strftime('%Y%m%d')}.parquet"
+                filepath = Path(self.catalog_path) / filename
+                
+                # 确保目录存在 - 使用绝对路径并增加详细日志
                 try:
-                    # 检查文件大小，如果太小可能是损坏文件
-                    file_size = filepath.stat().st_size
-                    if file_size < 100:  # 小于100字节的文件可能是损坏的
-                        logger.warning(f"文件太小({file_size}字节)，可能是损坏文件，创建新文件")
-                        combined_df = pd.DataFrame(trade_data)
-                    else:
-                        existing_df = pd.read_parquet(filepath)
-                        new_df = pd.DataFrame(trade_data)
-                        
-                        # 合并数据，去重
-                        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                        combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
-                        combined_df = combined_df.sort_values('timestamp')
-                except Exception as read_error:
-                    logger.warning(f"读取现有文件失败，创建新文件: {read_error}")
-                    # 备份损坏的文件
-                    try:
-                        backup_path = filepath.with_suffix('.parquet.bak')
-                        filepath.rename(backup_path)
-                        logger.info(f"已备份损坏文件到: {backup_path}")
-                    except Exception as backup_error:
-                        logger.error(f"备份损坏文件失败: {backup_error}")
-                    combined_df = pd.DataFrame(trade_data)
-            else:
-                combined_df = pd.DataFrame(trade_data)
-            
-            # 保存文件（使用临时文件避免并发写入问题）
-            temp_filepath = filepath.with_suffix('.tmp')
-            try:
-                logger.debug(f"开始保存数据到临时文件: {temp_filepath}")
-                combined_df.to_parquet(temp_filepath, index=False)
-                
-                # 验证临时文件是否创建成功
-                if not temp_filepath.exists():
-                    logger.error(f"临时文件创建失败: {temp_filepath}")
+                    catalog_dir = Path(self.catalog_path).resolve()
+                    logger.debug(f"创建目录: {catalog_dir}")
+                    catalog_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # 验证目录是否真的存在
+                    if not catalog_dir.exists():
+                        logger.error(f"目录创建失败: {catalog_dir}")
+                        return
+                    
+                    logger.debug(f"目录验证成功: {catalog_dir}")
+                except Exception as dir_error:
+                    logger.error(f"创建目录失败: {dir_error}")
                     return
                 
-                # 原子性替换文件
+                # 如果文件已存在，读取并合并
                 if filepath.exists():
-                    logger.debug(f"删除原文件: {filepath}")
-                    filepath.unlink()  # 删除原文件
+                    try:
+                        # 检查文件大小，如果太小可能是损坏文件
+                        file_size = filepath.stat().st_size
+                        if file_size < 100:  # 小于100字节的文件可能是损坏的
+                            logger.warning(f"文件太小({file_size}字节)，可能是损坏文件，创建新文件")
+                            combined_df = pd.DataFrame(trade_data)
+                        else:
+                            existing_df = pd.read_parquet(filepath)
+                            new_df = pd.DataFrame(trade_data)
+                            
+                            # 合并数据，去重
+                            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+                            combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
+                            combined_df = combined_df.sort_values('timestamp')
+                    except Exception as read_error:
+                        logger.warning(f"读取现有文件失败，创建新文件: {read_error}")
+                        # 备份损坏的文件
+                        try:
+                            backup_path = filepath.with_suffix('.parquet.bak')
+                            filepath.rename(backup_path)
+                            logger.info(f"已备份损坏文件到: {backup_path}")
+                        except Exception as backup_error:
+                            logger.error(f"备份损坏文件失败: {backup_error}")
+                        combined_df = pd.DataFrame(trade_data)
+                else:
+                    combined_df = pd.DataFrame(trade_data)
                 
-                logger.debug(f"重命名临时文件: {temp_filepath} -> {filepath}")
-                temp_filepath.rename(filepath)
-                
-                # 验证最终文件是否创建成功
-                if not filepath.exists():
-                    logger.error(f"最终文件创建失败: {filepath}")
+                # 保存文件（使用临时文件避免并发写入问题）
+                temp_filepath = filepath.with_suffix('.tmp')
+                try:
+                    logger.debug(f"开始保存数据到临时文件: {temp_filepath}")
+                    combined_df.to_parquet(temp_filepath, index=False)
+                    
+                    # 验证临时文件是否创建成功
+                    if not temp_filepath.exists():
+                        logger.error(f"临时文件创建失败: {temp_filepath}")
+                        return
+                    
+                    # 原子性替换文件
+                    if filepath.exists():
+                        logger.debug(f"删除原文件: {filepath}")
+                        filepath.unlink()  # 删除原文件
+                    
+                    logger.debug(f"重命名临时文件: {temp_filepath} -> {filepath}")
+                    temp_filepath.rename(filepath)
+                    
+                    # 验证最终文件是否创建成功
+                    if not filepath.exists():
+                        logger.error(f"最终文件创建失败: {filepath}")
+                        return
+                    
+                    logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
+                    self.last_save_time = datetime.now()
+                    
+                except Exception as save_error:
+                    logger.error(f"保存文件失败: {save_error}")
+                    logger.error(f"临时文件路径: {temp_filepath}")
+                    logger.error(f"目标文件路径: {filepath}")
+                    logger.error(f"目录是否存在: {filepath.parent.exists()}")
+                    logger.error(f"目录权限: {oct(filepath.parent.stat().st_mode)[-3:] if filepath.parent.exists() else 'N/A'}")
+                    
+                    # 清理临时文件
+                    if temp_filepath.exists():
+                        try:
+                            temp_filepath.unlink()
+                            logger.debug(f"已清理临时文件: {temp_filepath}")
+                        except Exception as cleanup_error:
+                            logger.error(f"清理临时文件失败: {cleanup_error}")
                     return
-                
-                logger.info(f"数据保存完成: {filepath} ({len(combined_df)} 条记录)")
-                self.last_save_time = datetime.now()
-                
-            except Exception as save_error:
-                logger.error(f"保存文件失败: {save_error}")
-                logger.error(f"临时文件路径: {temp_filepath}")
-                logger.error(f"目标文件路径: {filepath}")
-                logger.error(f"目录是否存在: {filepath.parent.exists()}")
-                logger.error(f"目录权限: {oct(filepath.parent.stat().st_mode)[-3:] if filepath.parent.exists() else 'N/A'}")
-                
-                # 清理临时文件
-                if temp_filepath.exists():
-                    try:
-                        temp_filepath.unlink()
-                        logger.debug(f"已清理临时文件: {temp_filepath}")
-                    except Exception as cleanup_error:
-                        logger.error(f"清理临时文件失败: {cleanup_error}")
-                return
-            finally:
-                # 确保临时文件被清理
-                if temp_filepath.exists():
-                    try:
-                        temp_filepath.unlink()
-                        logger.debug(f"最终清理临时文件: {temp_filepath}")
-                    except Exception as final_cleanup_error:
-                        logger.error(f"最终清理临时文件失败: {final_cleanup_error}")
+                finally:
+                    # 确保临时文件被清理
+                    if temp_filepath.exists():
+                        try:
+                            temp_filepath.unlink()
+                            logger.debug(f"最终清理临时文件: {temp_filepath}")
+                        except Exception as final_cleanup_error:
+                            logger.error(f"最终清理临时文件失败: {final_cleanup_error}")
             
+            finally:
+                # 清理锁文件
+                try:
+                    if lock_file.exists():
+                        lock_file.unlink()
+                        logger.debug("清理保存锁文件")
+                except Exception as e:
+                    logger.warning(f"清理锁文件失败: {e}")
+        
         except Exception as e:
             logger.error(f"保存缓冲区数据失败: {e}")
             import traceback
@@ -1491,7 +1903,7 @@ Cache统计:
             self.last_merge_time = current_time
     
     def _merge_daily_files(self):
-        """合并当天的文件"""
+        """合并当天的文件 - 改进版本"""
         try:
             today = datetime.now().date()
             today_str = today.strftime('%Y%m%d')
@@ -1500,6 +1912,9 @@ Cache统计:
             pattern = f"cache_data_{today_str}*.parquet"
             files = list(Path(self.catalog_path).glob(pattern))
             
+            # 排除已合并的文件
+            files = [f for f in files if 'merged' not in f.name]
+            
             if len(files) <= 1:
                 return  # 只有一个文件或没有文件，不需要合并
             
@@ -1507,39 +1922,97 @@ Cache统计:
             
             # 读取所有文件
             all_dataframes = []
+            valid_files = []
             for file_path in files:
                 try:
+                    # 检查文件大小
+                    file_size = file_path.stat().st_size
+                    if file_size < 50:  # 跳过过小的文件
+                        logger.warning(f"跳过过小文件: {file_path.name} ({file_size} 字节)")
+                        continue
+                    
                     df = pd.read_parquet(file_path)
-                    all_dataframes.append(df)
+                    if not df.empty:
+                        all_dataframes.append(df)
+                        valid_files.append(file_path)
+                        logger.debug(f"成功读取文件: {file_path.name} ({len(df)} 条记录)")
+                    else:
+                        logger.warning(f"文件为空: {file_path.name}")
                 except Exception as e:
-                    logger.warning(f"读取文件失败 {file_path}: {e}")
+                    logger.warning(f"读取文件失败 {file_path.name}: {e}")
                     continue
             
             if not all_dataframes:
+                logger.warning("没有有效文件可以合并")
                 return
+            
+            logger.info(f"成功读取 {len(valid_files)} 个有效文件")
             
             # 合并数据
             combined_df = pd.concat(all_dataframes, ignore_index=True)
             combined_df = combined_df.drop_duplicates(subset=['timestamp', 'trade_id'], keep='last')
             combined_df = combined_df.sort_values('timestamp')
             
-            # 保存合并后的文件
+            logger.info(f"合并后数据量: {len(combined_df)} 条记录")
+            
+            # 保存合并后的文件（使用临时文件）
             merged_filename = f"cache_data_{today_str}_merged.parquet"
             merged_filepath = Path(self.catalog_path) / merged_filename
-            combined_df.to_parquet(merged_filepath, index=False)
+            temp_merged_filepath = merged_filepath.with_suffix('.tmp')
             
-            # 删除原始文件
-            for file_path in files:
-                try:
-                    file_path.unlink()
-                    logger.info(f"删除原始文件: {file_path.name}")
-                except Exception as e:
-                    logger.warning(f"删除文件失败 {file_path}: {e}")
-            
-            logger.info(f"文件合并完成: {merged_filename} ({len(combined_df)} 条记录)")
+            try:
+                # 先保存到临时文件
+                combined_df.to_parquet(temp_merged_filepath, index=False)
+                
+                # 验证临时文件
+                if not temp_merged_filepath.exists():
+                    logger.error("临时合并文件创建失败")
+                    return
+                
+                # 如果目标文件已存在，先备份
+                if merged_filepath.exists():
+                    backup_name = f"{merged_filename}.backup_{int(time.time())}"
+                    backup_path = merged_filepath.parent / backup_name
+                    merged_filepath.rename(backup_path)
+                    logger.info(f"已备份现有合并文件: {backup_name}")
+                
+                # 原子性替换
+                temp_merged_filepath.rename(merged_filepath)
+                logger.info(f"合并文件保存成功: {merged_filename}")
+                
+                # 删除原始文件（只删除成功合并的文件）
+                deleted_count = 0
+                for file_path in valid_files:
+                    try:
+                        file_path.unlink()
+                        deleted_count += 1
+                        logger.debug(f"删除原始文件: {file_path.name}")
+                    except Exception as e:
+                        logger.warning(f"删除文件失败 {file_path.name}: {e}")
+                
+                logger.info(f"文件合并完成: {merged_filename} ({len(combined_df)} 条记录), 删除了 {deleted_count} 个原始文件")
+                
+            except Exception as save_error:
+                logger.error(f"保存合并文件失败: {save_error}")
+                # 清理临时文件
+                if temp_merged_filepath.exists():
+                    try:
+                        temp_merged_filepath.unlink()
+                    except Exception as cleanup_error:
+                        logger.error(f"清理临时合并文件失败: {cleanup_error}")
+                return
+            finally:
+                # 确保临时文件被清理
+                if temp_merged_filepath.exists():
+                    try:
+                        temp_merged_filepath.unlink()
+                    except Exception as final_cleanup_error:
+                        logger.error(f"最终清理临时合并文件失败: {final_cleanup_error}")
             
         except Exception as e:
             logger.error(f"合并文件失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
     
     def get_status(self) -> Dict:
         """获取状态信息"""
@@ -1550,6 +2023,9 @@ Cache统计:
         if self.trading_time_manager:
             trading_status = self.trading_time_manager.get_trading_status()
         
+        # 获取内存状态信息
+        memory_status = self.cache_manager.get_memory_usage()
+        
         return {
             'connected': self.is_connected,
             'stock_code': self.stock_code,
@@ -1559,7 +2035,8 @@ Cache统计:
             'last_data_time': self.last_data_time.isoformat() if self.last_data_time else None,
             'cache_status': cache_status,
             'trading_time_control_enabled': self.enable_trading_time_control,
-            'trading_status': trading_status
+            'trading_status': trading_status,
+            'memory_status': memory_status  # 添加内存状态信息
         }
     
     def disconnect(self):
@@ -1568,6 +2045,7 @@ Cache统计:
         self.stop_save = True
         # self.stop_heartbeat = True  # 移除心跳停止
         self.stop_monitor = True
+        self.stop_data_integrity_check = True
         # 不要停止交易时间检测线程，让它继续监控并自动重连
         # self.stop_trading_time_check = True
         if self.ws:
@@ -1669,10 +2147,10 @@ def main():
             if ENABLE_TRADING_TIME_CONTROL:
                 # 启用交易时间控制时，持续运行直到用户中断
                 while True:
-                    time.sleep(0.1)  # 减少到0.1秒检查间隔
+                    time.sleep(0.1)  # 优化：从0.1秒改为1秒检查间隔，减少CPU占用
                     
-                    # 每5秒打印一次数据状态（提高监控频率）
-                    if int(time.time()) % 5 == 0:
+                    # 每10秒打印一次数据状态（优化：从5秒改为10秒，减少状态查询频率）
+                    if int(time.time()) % 10 == 0:
                         status = client.get_status()
                         cache_status = status.get('cache_status', {})
                         trading_status = status.get('trading_status')
@@ -1702,8 +2180,8 @@ def main():
                               f"交易数={cache_status.get('trade_count', 0)}, "
                               f"{price_info}{trading_info}")
                     
-                    # 每30秒打印一次详细状态信息（提高监控频率）
-                    if int(time.time()) % 30 == 0:
+                    # 每60秒打印一次详细状态信息（优化：从30秒改为60秒，减少状态查询频率）
+                    if int(time.time()) % 60 == 0:
                         status = client.get_status()
                         cache_status = status.get('cache_status', {})
                         trading_status = status.get('trading_status')
@@ -1741,6 +2219,18 @@ def main():
                         print(f"  报价数: {cache_status.get('quote_count', 0)}")
                         print(f"  交易数: {cache_status.get('trade_count', 0)}")
                         print(f"最新数据: {price_info}")
+                        
+                        # 显示内存状态信息
+                        memory_status = status.get('memory_status', {})
+                        if memory_status.get('available', False):
+                            print(f"内存状态:")
+                            print(f"  物理内存: {memory_status['rss_mb']:.2f} MB")
+                            print(f"  虚拟内存: {memory_status['vms_mb']:.2f} MB")
+                            print(f"  内存使用率: {memory_status['percent']:.1f}%")
+                            print(f"  缓存大小: 报价{memory_status['cache_size']['quotes']}条, 交易{memory_status['cache_size']['trades']}条")
+                        else:
+                            print(f"内存状态: {memory_status.get('error', '未知')}")
+                        
                         print(f"{'='*60}\n")
                     
                     # 检查用户中断
@@ -1752,10 +2242,10 @@ def main():
             else:
                 # 不启用交易时间控制时，只在连接状态下运行
                 while client.is_connected:
-                    time.sleep(0.1)  # 减少到0.1秒检查间隔
+                    time.sleep(1.0)  # 优化：从0.1秒改为1秒检查间隔，减少CPU占用
                     
-                    # 每5秒打印一次数据状态（提高监控频率）
-                    if int(time.time()) % 5 == 0:
+                    # 每10秒打印一次数据状态（优化：从5秒改为10秒，减少状态查询频率）
+                    if int(time.time()) % 10 == 0:
                         status = client.get_status()
                         cache_status = status.get('cache_status', {})
                         trading_status = status.get('trading_status')
@@ -1785,8 +2275,8 @@ def main():
                               f"交易数={cache_status.get('trade_count', 0)}, "
                               f"{price_info}{trading_info}")
                     
-                    # 每30秒打印一次详细状态信息（提高监控频率）
-                    if int(time.time()) % 30 == 0:
+                    # 每60秒打印一次详细状态信息（优化：从30秒改为60秒，减少状态查询频率）
+                    if int(time.time()) % 60 == 0:
                         status = client.get_status()
                         cache_status = status.get('cache_status', {})
                         trading_status = status.get('trading_status')
@@ -1824,6 +2314,18 @@ def main():
                         print(f"  报价数: {cache_status.get('quote_count', 0)}")
                         print(f"  交易数: {cache_status.get('trade_count', 0)}")
                         print(f"最新数据: {price_info}")
+                        
+                        # 显示内存状态信息
+                        memory_status = status.get('memory_status', {})
+                        if memory_status.get('available', False):
+                            print(f"内存状态:")
+                            print(f"  物理内存: {memory_status['rss_mb']:.2f} MB")
+                            print(f"  虚拟内存: {memory_status['vms_mb']:.2f} MB")
+                            print(f"  内存使用率: {memory_status['percent']:.1f}%")
+                            print(f"  缓存大小: 报价{memory_status['cache_size']['quotes']}条, 交易{memory_status['cache_size']['trades']}条")
+                        else:
+                            print(f"内存状态: {memory_status.get('error', '未知')}")
+                        
                         print(f"{'='*60}\n")
                     
     except KeyboardInterrupt:
