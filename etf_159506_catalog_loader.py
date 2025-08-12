@@ -680,7 +680,7 @@ class ETF159506RedisKlineGenerator:
                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
                    fontsize=9)
             
-            ax1.legend()
+            ax1.legend(loc='upper right')
             
             # 设置x轴格式 - 显示北京时间
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
@@ -901,7 +901,7 @@ class ETF159506RedisKlineGenerator:
             ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
-            ax3.legend()
+            ax3.legend(loc='upper right')
             ax3.grid(True, alpha=0.3)
 
             # ====== 计算RSI(6), RSI(12), RSI(24)（用1分钟K线收盘价） ======
@@ -914,9 +914,44 @@ class ETF159506RedisKlineGenerator:
                 rs = avg_gain / avg_loss
                 rsi = 100 - (100 / (1 + rs))
                 return rsi
-            rsi6 = calc_rsi(minute_close, 6)
-            rsi12 = calc_rsi(minute_close, 12)
-            rsi24 = calc_rsi(minute_close, 24)
+            
+            # 先计算RSI(1)，用于填充其他RSI的初始值
+            def calc_rsi1(series):
+                """计算RSI(1)，第一个值为0"""
+                delta = series.diff()
+                gain = delta.where(delta > 0, 0.0)
+                loss = -delta.where(delta < 0, 0.0)
+                # RSI(1)使用当前值，不需要移动平均
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs))
+                # 第一个值设为0，其他值保持不变
+                rsi.iloc[0] = 0
+                return rsi
+            
+            # 计算基础RSI值
+            rsi1 = calc_rsi1(minute_close)
+            rsi6_raw = calc_rsi(minute_close, 6)
+            rsi12_raw = calc_rsi(minute_close, 12)
+            rsi24_raw = calc_rsi(minute_close, 24)
+            
+            # 使用级联填充逻辑，在数据不足时用更短周期的RSI填充
+            # RSI(6)在数据不足时用RSI(1)填充
+            rsi6 = rsi6_raw.copy()
+            for i in range(len(rsi6)):
+                if pd.isna(rsi6.iloc[i]):
+                    rsi6.iloc[i] = rsi1.iloc[i]
+            
+            # RSI(12)在数据不足时用RSI(6)填充
+            rsi12 = rsi12_raw.copy()
+            for i in range(len(rsi12)):
+                if pd.isna(rsi12.iloc[i]):
+                    rsi12.iloc[i] = rsi6.iloc[i]
+            
+            # RSI(24)在数据不足时用RSI(12)填充
+            rsi24 = rsi24_raw.copy()
+            for i in range(len(rsi24)):
+                if pd.isna(rsi24.iloc[i]):
+                    rsi24.iloc[i] = rsi12.iloc[i]
 
             # ====== ax4 RSI副图（6,12,24三线，用1分钟K线收盘价） ======
             ax4.plot(minute_index, rsi6, color='orange', label='RSI(6)')         # 橙色
@@ -935,17 +970,27 @@ class ETF159506RedisKlineGenerator:
             ax4.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
             ax4.set_ylim(0, 100)
-            ax4.legend()
+            ax4.legend(loc='upper right')
             ax4.grid(True, alpha=0.3)
 
             # ====== 计算KDJ(9,3,3)（用1分钟K线收盘价） ======
             def calc_kdj(close, n=9, k_period=3, d_period=3):
+                # 计算N1周期内的最低价和最高价
                 low_list = close.rolling(window=n, min_periods=1).min()
                 high_list = close.rolling(window=n, min_periods=1).max()
+                
+                # 计算RSV：RSV = (CLOSE - LLV(LOW, N1)) / (HHV(HIGH, N1) - LLV(LOW, N1)) * 100
                 rsv = (close - low_list) / (high_list - low_list) * 100
-                k = rsv.rolling(window=k_period, min_periods=1).mean()  # 使用简单移动平均(MA)
-                d = k.rolling(window=d_period, min_periods=1).mean()    # 使用简单移动平均(MA)
+                
+                # 计算K值：K = MA(RSV, N2) 其中 N2 = 3
+                k = rsv.rolling(window=k_period, min_periods=1).mean()
+                
+                # 计算D值：D = MA(K, N3) 其中 N3 = 3
+                d = k.rolling(window=d_period, min_periods=1).mean()
+                
+                # 计算J值：J = 3*K - 2*D
                 j = 3 * k - 2 * d
+                
                 return k, d, j
             kdj_k, kdj_d, kdj_j = calc_kdj(minute_close, n=9, k_period=3, d_period=3)
 
@@ -963,7 +1008,7 @@ class ETF159506RedisKlineGenerator:
             ax5.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax5.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45)
-            ax5.legend()
+            ax5.legend(loc='upper right')
             ax5.grid(True, alpha=0.3)
 
             # 统一x轴格式化，防止内容错乱
