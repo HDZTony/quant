@@ -85,7 +85,7 @@ MEMORY_MONITOR_CONFIG = {
     'critical_threshold_mb': 1024,    # 内存严重警告阈值(MB)
     'cleanup_threshold_mb': 800,      # 触发清理的阈值(MB)
     'check_interval_seconds': 60,     # 内存检查间隔(秒)
-    'max_cache_size': 10000,          # 最大缓存数据条数
+    'max_cache_size': 1000000,        # 最大缓存数据条数（支持全天tick数据收集）
     'cleanup_keep_hours': 2,          # 清理时保留的小时数
 }
 
@@ -242,7 +242,7 @@ class ETF159506CacheManager:
             print("[CacheManager] 请求使用Redis，但Redis不可用，已自动切换为内存缓存模式！")
             logging.warning("[CacheManager] 请求使用Redis，但Redis不可用，已自动切换为内存缓存模式！")
         
-        # 创建Cache配置
+        # 创建Cache配置 - 优化版本，支持全天tick数据收集
         if self.use_redis:
             print(f"[CacheManager] 创建Redis配置: host={redis_host}, port={redis_port}")
             cache_config = CacheConfig(
@@ -252,8 +252,8 @@ class ETF159506CacheManager:
                     port=redis_port,
                     timeout=2,  # 减少超时时间
                 ),
-                tick_capacity=500_000,  # 增加到50万条tick（提高容量）
-                bar_capacity=100_000,   # 增加到10万根K线
+                tick_capacity=2_000_000,  # 增加到200万条tick（支持全天数据收集）
+                bar_capacity=200_000,     # 增加到20万根K线
                 encoding="msgpack",
                 timestamps_as_iso8601=True,
                 use_trader_prefix=True,  # 启用trader前缀，这是默认行为
@@ -264,8 +264,8 @@ class ETF159506CacheManager:
             print("[CacheManager] Redis配置创建成功")
         else:
             cache_config = CacheConfig(
-                tick_capacity=100_000,
-                bar_capacity=50_000,
+                tick_capacity=1_000_000,  # 增加到100万条tick（支持全天数据收集）
+                bar_capacity=100_000,     # 增加到10万根K线
                 encoding="msgpack",
                 timestamps_as_iso8601=True,
             )
@@ -451,7 +451,7 @@ class ETF159506CacheManager:
             logger.error(f"获取最新数据失败: {e}")
             return {}
     
-    def get_historical_data(self, limit: int = 1000) -> Dict:
+    def get_historical_data(self, limit: int = 100000) -> Dict:
         """获取历史数据"""
         try:
             quote_ticks = self.cache.quote_ticks(self.instrument_id)[-limit:]
@@ -562,30 +562,20 @@ class ETF159506CacheManager:
             logger.error(f"清理旧数据失败: {e}")
     
     def force_memory_cleanup(self):
-        """强制内存清理"""
+        """强制内存清理 - 优化版本，支持全天数据收集"""
         try:
             logger.info("开始强制内存清理...")
             
             # 清理旧数据（只保留2小时）
             self.clear_old_data(keep_hours=MEMORY_MONITOR_CONFIG['cleanup_keep_hours'])
             
-            # 限制缓存大小
+            # 注意：移除缓存大小限制，支持收集全天tick数据
+            # 当max_cache_size设置为1000000时，可以支持全天数据收集
             quote_ticks = self.cache.quote_ticks(self.instrument_id)
             trade_ticks = self.cache.trade_ticks(self.instrument_id)
             
-            max_size = MEMORY_MONITOR_CONFIG['max_cache_size']
-            
-            if len(quote_ticks) > max_size:
-                # 保留最新的数据
-                new_quotes = quote_ticks[-max_size:]
-                logger.info(f"限制报价缓存大小: {len(quote_ticks)} -> {len(new_quotes)}")
-                # 这里需要实现真正的数据替换逻辑
-            
-            if len(trade_ticks) > max_size:
-                # 保留最新的数据
-                new_trades = trade_ticks[-max_size:]
-                logger.info(f"限制交易缓存大小: {len(trade_ticks)} -> {len(new_trades)}")
-                # 这里需要实现真正的数据替换逻辑
+            logger.info(f"当前缓存状态: 报价 {len(quote_ticks)} 条, 交易 {len(trade_ticks)} 条")
+            logger.info(f"缓存容量: 最大支持 {MEMORY_MONITOR_CONFIG['max_cache_size']} 条数据")
             
             # 强制垃圾回收
             gc.collect()
@@ -1488,12 +1478,37 @@ class ETF159506CacheWebSocketClient:
                             logger.error(f"  - 连续失败次数: {consecutive_failures}")
                             logger.error(f"  - 下次重连时间: {datetime.fromtimestamp(last_reconnect_time + reconnect_cooldown).strftime('%H:%M:%S')}")
                     
-                    # 如果当前不是交易时间但已连接，则断开
-                    elif not current_status['is_trading_time'] and self.is_connected:
-                        logger.info(f"🔌 检测到非交易时间，断开连接: {current_status['current_time']}")
-                        logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
+                    # 修改：只在完全非交易时间才断开连接，而不是在午休时间断开
+                    # 这样可以保持数据连续性，避免下午数据丢失
+                    elif not current_status['is_trading_day'] and self.is_connected:
+                        # 只在非交易日才断开连接
+                        logger.info(f"🔌 检测到非交易日，断开连接: {current_status['current_time']}")
+                        logger.info(f"下一个交易日: {current_status['next_trading_time']}")
                         self.disconnect()
                         consecutive_failures = 0  # 正常断开时重置失败计数
+                    elif not current_status['is_trading_time'] and self.is_connected:
+                        # 午休时间不断开连接，只记录状态
+                        current_hour = datetime.now().hour
+                        if current_hour == 11 or current_hour == 12:
+                            logger.info(f"⏸️  午休时间，保持连接状态: {current_status['current_time']}")
+                            logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
+                        else:
+                            # 其他非交易时间（如晚上）才断开
+                            logger.info(f"🔌 检测到非交易时间，断开连接: {current_status['current_time']}")
+                            logger.info(f"下一个交易时间: {current_status['next_trading_time']}")
+                            self.disconnect()
+                            consecutive_failures = 0
+                    
+                    # 午休时间检测服务器断开，记录状态但不立即重连
+                    current_hour = datetime.now().hour
+                    current_minute = datetime.now().minute
+                    
+                    if (current_hour == 11 or current_hour == 12) and not self.is_connected:
+                        # 午休时间如果连接断开，记录状态但不立即重连
+                        logger.info(f"⏸️  午休时间检测到连接断开: {current_status['current_time']}")
+                        logger.info(f"   将在13:00交易时间自动重连")
+                        logger.info(f"   当前时间: {datetime.now().strftime('%H:%M:%S')}")
+                        logger.info(f"   距离13:00交易时间: {13 - current_hour}小时{60 - current_minute if current_minute > 0 else 0}分钟")
                     
                     # 每5分钟输出一次交易时间状态
                     if int(current_time) % 300 == 0:  # 5分钟 = 300秒
@@ -1711,12 +1726,20 @@ Cache统计:
                 
                 if not self.stop_save:
                     # 增加数据量检查，避免频繁保存空数据
-                    cache_data = self.cache_manager.get_historical_data(limit=100)
+                    cache_data = self.cache_manager.get_historical_data(limit=100000)
                     quote_count = len(cache_data.get('quote_ticks', []))
                     trade_count = len(cache_data.get('trade_ticks', []))
                     
+                    # 修改：在午休时间也继续保存数据，确保数据连续性
+                    current_hour = datetime.now().hour
+                    is_lunch_break = current_hour == 11 or current_hour == 12
+                    
                     if quote_count > 0 or trade_count > 0:
-                        logger.debug(f"开始自动保存: 报价{quote_count}条, 交易{trade_count}条")
+                        if is_lunch_break:
+                            logger.debug(f"午休时间继续保存: 报价{quote_count}条, 交易{trade_count}条")
+                        else:
+                            logger.debug(f"开始自动保存: 报价{quote_count}条, 交易{trade_count}条")
+                        
                         # 保存数据到Parquet文件
                         self._save_buffer_data()
                         
@@ -1726,7 +1749,10 @@ Cache统计:
                         # 清理旧数据（保留24小时）
                         self.cache_manager.clear_old_data(24)
                     else:
-                        logger.debug("跳过保存：无新数据")
+                        if is_lunch_break:
+                            logger.debug("午休时间跳过保存：无新数据")
+                        else:
+                            logger.debug("跳过保存：无新数据")
                     
             except Exception as e:
                 logger.error(f"自动保存失败: {e}")
@@ -1754,7 +1780,7 @@ Cache统计:
             
             try:
                 # 获取当前缓存数据，减少数据量避免内存占用过高
-                cache_data = self.cache_manager.get_historical_data(limit=1000)
+                cache_data = self.cache_manager.get_historical_data(limit=100000)
                 
                 if not cache_data or not cache_data.get('trade_ticks'):
                     logger.debug("跳过保存：无交易数据")
@@ -2042,6 +2068,15 @@ Cache统计:
     def disconnect(self):
         """断开连接"""
         logger.info("正在断开连接...")
+        
+        # 修改：在断开连接前强制保存所有数据，确保数据不丢失
+        try:
+            logger.info("断开连接前强制保存数据...")
+            self._save_buffer_data()
+            logger.info("数据保存完成")
+        except Exception as e:
+            logger.error(f"断开连接前保存数据失败: {e}")
+        
         self.stop_save = True
         # self.stop_heartbeat = True  # 移除心跳停止
         self.stop_monitor = True
@@ -2051,8 +2086,11 @@ Cache统计:
         if self.ws:
             self.ws.close()
         
-        # 保存最终数据
-        self._save_buffer_data()
+        # 保存最终数据（再次确保数据保存）
+        try:
+            self._save_buffer_data()
+        except Exception as e:
+            logger.error(f"最终数据保存失败: {e}")
         
         self.print_diagnostic_status()
         logger.info("连接已断开")
@@ -2075,17 +2113,43 @@ Cache统计:
                 self.monitor_thread.join(timeout=2)
             # 不要等待交易时间检查线程结束
             # if self.trading_time_thread:
-            #     self.trading_time_thread.join(timeout=2)
+            #     self.thread.join(timeout=2)
             
             # 重置停止标志
             self.stop_save = False
             self.stop_monitor = False
             # self.stop_heartbeat = False  # 移除心跳标志
             
-            self.connect()
+            # 修改：重连成功后重新启动必要的线程
+            connect_result = self.connect()
+            if connect_result:
+                logger.info("重连成功，重新启动数据采集线程")
+                # 重新启动保存线程
+                if not self.save_thread or not self.save_thread.is_alive():
+                    self.start_auto_save()
+                    logger.info("数据保存线程已重新启动")
+                
+                # 重新启动监控线程
+                if not self.monitor_thread or not self.monitor_thread.is_alive():
+                    self.start_diagnostic_monitor()
+                    logger.info("诊断监控线程已重新启动")
+                
+                # 重新启动内存监控线程
+                if hasattr(self, 'memory_monitor_thread') and (not self.memory_monitor_thread or not self.memory_monitor_thread.is_alive()):
+                    self.start_memory_monitor()
+                    logger.info("内存监控线程已重新启动")
+                
+                # 重新启动数据完整性检查线程
+                if not self.data_integrity_thread or not self.data_integrity_thread.is_alive():
+                    self.start_data_integrity_check()
+                    logger.info("数据完整性检查线程已重新启动")
+            else:
+                logger.error("重连失败")
             
         except Exception as e:
             logger.error(f"重连失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
 
 
 def main():
@@ -2179,6 +2243,11 @@ def main():
                               f"报价数={cache_status.get('quote_count', 0)}, "
                               f"交易数={cache_status.get('trade_count', 0)}, "
                               f"{price_info}{trading_info}")
+                        
+                        # 添加连接状态说明，避免用户混淆
+                        if not status['connected']:
+                            print(f"    ⚠️  注意：WebSocket连接已断开，显示的是缓存中的历史数据，不是实时接收")
+                            print(f"    📊  如需实时数据，系统将自动尝试重连")
                     
                     # 每60秒打印一次详细状态信息（优化：从30秒改为60秒，减少状态查询频率）
                     if int(time.time()) % 60 == 0:
@@ -2274,6 +2343,11 @@ def main():
                               f"报价数={cache_status.get('quote_count', 0)}, "
                               f"交易数={cache_status.get('trade_count', 0)}, "
                               f"{price_info}{trading_info}")
+                        
+                        # 添加连接状态说明，避免用户混淆
+                        if not status['connected']:
+                            print(f"    ⚠️  注意：WebSocket连接已断开，显示的是缓存中的历史数据，不是实时接收")
+                            print(f"    📊  如需实时数据，系统将自动尝试重连")
                     
                     # 每60秒打印一次详细状态信息（优化：从30秒改为60秒，减少状态查询频率）
                     if int(time.time()) % 60 == 0:

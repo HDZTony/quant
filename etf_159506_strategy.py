@@ -61,7 +61,7 @@ class ETF159506Strategy(Strategy):
         
         # 策略参数
         self.stop_loss_pct = config.stop_loss_pct
-        self.take_profit_pct = config.take_profit_pct if hasattr(config, 'take_profit_pct') else 0.05
+        self.take_profit_pct = config.take_profit_pct if hasattr(config, 'take_profit_pct') else 0.99
         self.lookback_period = config.lookback_period
         
         # 交易状态

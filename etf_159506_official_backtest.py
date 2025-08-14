@@ -328,7 +328,7 @@ class ETF159506OfficialBacktest:
                             "slow_ema_period": 26,
                             "volume_threshold": 500000,
                             "stop_loss_pct": 0.02,  # 修复：2%止损
-                            "take_profit_pct": 0.05,  # 修复：5%止盈
+                            "take_profit_pct": 0.25,  # 修复：25%止盈
                             "max_daily_trades": 100,
                             "lookback_period": 2,  # 修复：需要至少2个数据点
                             "price_threshold": 0.001,
