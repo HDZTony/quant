@@ -21,7 +21,7 @@ import pickle
 
 from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
 from nautilus_trader.indicators.momentum.rsi import RelativeStrengthIndex
-from nautilus_trader.indicators.trend.macd import MovingAverageConvergenceDivergence
+from nautilus_trader.indicators.macd import MovingAverageConvergenceDivergence  # 修复：正确的导入路径
 from kdj_indicator import KDJIndicator
 
 
@@ -92,10 +92,14 @@ class RealTimeDataProcessor:
         self.stock_code = stock_code
         
         # 技术指标
-        self.macd = MovingAverageConvergenceDivergence(12, 26, 9)
+        self.macd = MovingAverageConvergenceDivergence(12, 26)  # 修复：移除第三个参数9
         self.rsi = RelativeStrengthIndex(14)
         self.kdj = KDJIndicator(9, 3, 3)
         self.volume_ratio = VolumeRatioCalculator(5)
+        
+        # 添加MACD相关存储
+        self.macd_history = deque(maxlen=100)  # 存储DIF值
+        self.signal_period = 9  # DEA计算周期
         
         # 数据存储
         self.ohlc_data = []
@@ -109,6 +113,33 @@ class RealTimeDataProcessor:
         
         # 数据锁
         self.data_lock = threading.Lock()
+    
+    def update_macd(self, close_price: float):
+        """更新MACD指标"""
+        # 更新官方MACD
+        self.macd.update_raw(close_price)
+        
+        if self.macd.initialized:
+            # 存储DIF值
+            self.macd_history.append(self.macd.value)
+    
+    def get_macd_signal(self) -> float:
+        """获取DEA值（信号线）"""
+        if len(self.macd_history) < self.signal_period:
+            return 0.0
+        
+        # 简单的EMA计算
+        alpha = 2.0 / (self.signal_period + 1)
+        dea = self.macd_history[0]
+        for dif in self.macd_history[1:]:
+            dea = alpha * dif + (1 - alpha) * dea
+        return dea
+    
+    def get_macd_histogram(self) -> float:
+        """获取MACD柱值"""
+        if not self.macd.initialized:
+            return 0.0
+        return self.macd.value - self.get_macd_signal()
     
     def process_level1_data(self, data: str):
         """处理Level1基础行情数据"""
@@ -148,6 +179,9 @@ class RealTimeDataProcessor:
                 # 更新量比
                 self.volume_ratio.update(volume)
                 
+                # 更新MACD
+                self.update_macd(latest_price)  # 添加这行
+                
                 print(f"Level1 - {stock_code}: 价格={latest_price}, 成交量={volume}, 量比={self.volume_ratio.volume_ratio:.2f}")
                 
         except Exception as e:
@@ -184,15 +218,21 @@ class RealTimeDataProcessor:
                     trade_price = float(fields[2])
                     trade_volume = float(fields[3])
                     
+                    # 更新MACD
+                    self.update_macd(trade_price)  # 添加这行
+                    
                     # 存储逐笔数据
+                    tick_data = {
+                        'time': trade_time,
+                        'price': trade_price,
+                        'volume': trade_volume,
+                        'trade_id': trade_id
+                    }
+                    
                     with self.data_lock:
-                        self.tick_data.append({
-                            'time': trade_time,
-                            'price': trade_price,
-                            'volume': trade_volume
-                        })
+                        self.tick_data.append(tick_data)
                         
-                        # 保持最近1000条记录
+                        # 限制数据量
                         if len(self.tick_data) > 1000:
                             self.tick_data.pop(0)
                     
@@ -255,7 +295,7 @@ class RealTimeDataProcessor:
         """更新技术指标"""
         try:
             # 更新MACD
-            self.macd.update_raw(bar_data['close'])
+            self.update_macd(bar_data['close'])
             
             # 更新RSI
             self.rsi.update_raw(bar_data['close'])
@@ -275,8 +315,8 @@ class RealTimeDataProcessor:
             return {
                 'macd': {
                     'macd': self.macd.value if self.macd.initialized else 0,
-                    'signal': self.macd.signal if self.macd.initialized else 0,
-                    'histogram': self.macd.histogram if self.macd.initialized else 0
+                    'signal': self.get_macd_signal() if self.macd.initialized else 0,
+                    'histogram': self.get_macd_histogram() if self.macd.initialized else 0
                 },
                 'rsi': self.rsi.value if self.rsi.initialized else 50,
                 'kdj': {
@@ -300,8 +340,8 @@ class RealTimeDataProcessor:
                 'indicators': {
                     'macd': {
                         'macd': self.macd.value if self.macd.initialized else 0,
-                        'signal': self.macd.signal if self.macd.initialized else 0,
-                        'histogram': self.macd.histogram if self.macd.initialized else 0
+                        'signal': self.get_macd_signal() if self.macd.initialized else 0,
+                        'histogram': self.get_macd_histogram() if self.macd.initialized else 0
                     },
                     'rsi': self.rsi.value if self.rsi.initialized else 50,
                     'kdj': {

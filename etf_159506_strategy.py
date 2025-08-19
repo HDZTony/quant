@@ -113,7 +113,6 @@ class ETF159506Strategy(Strategy):
         # 添加调试信息
         self._log.info(f"处理K线: 时间={pd.to_datetime(bar.ts_event, unit='ns')}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
         
-        # 策略始终空仓开始，无需设置初始持仓
         
         # 无论MACD是否初始化，都计算图表MACD值
         chart_macd = self.calculate_chart_macd(bar)

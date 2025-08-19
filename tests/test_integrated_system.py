@@ -15,9 +15,10 @@ from trading_system import JVQuantTradingClient
 
 # 导入Nautilus Trader指标
 try:
-    from nautilus_trader.indicators.trend.macd import MovingAverageConvergenceDivergence
+    from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
     from nautilus_trader.indicators.momentum.rsi import RelativeStrengthIndex
-    from nautilus_trader.indicators.stochastics import Stochastics as KDJIndicator
+    from nautilus_trader.indicators.macd import MovingAverageConvergenceDivergence  # 修复：正确的导入路径
+    from kdj_indicator import KDJIndicator
     NAUTILUS_AVAILABLE = True
 except ImportError:
     print("警告: Nautilus Trader不可用，将使用自定义指标")
@@ -105,20 +106,26 @@ class VolumeRatio:
 class TestDataProcessor:
     """测试数据处理器"""
     
-    def __init__(self, stock_code: str):
+    def __init__(self, token: str, stock_code: str):
+        self.token = token
         self.stock_code = stock_code
         
         # 技术指标
         if NAUTILUS_AVAILABLE:
-            self.macd = MovingAverageConvergenceDivergence(12, 26, 9)
+            self.macd = MovingAverageConvergenceDivergence(12, 26)  # 修复：移除第三个参数9
             self.rsi = RelativeStrengthIndex(14)
             self.kdj = KDJIndicator(9, 3, 3)
         else:
             # 使用自定义指标作为备选
             self.macd = None
-        self.rsi = SimpleRSI(14)
+            self.rsi = SimpleRSI(14)
             self.kdj = None
+        
         self.volume_ratio = VolumeRatio(5)
+        
+        # 添加MACD相关存储
+        self.macd_history = deque(maxlen=100)  # 存储DIF值
+        self.signal_period = 9  # DEA计算周期
         
         # 数据存储
         self.price_history = deque(maxlen=100)
@@ -128,6 +135,24 @@ class TestDataProcessor:
         self.latest_price = 0.0
         self.latest_volume = 0.0
         self.latest_time = None
+    
+    def get_macd_signal(self) -> float:
+        """获取DEA值（信号线）"""
+        if not NAUTILUS_AVAILABLE or not self.macd or len(self.macd_history) < self.signal_period:
+            return 0.0
+        
+        # 简单的EMA计算
+        alpha = 2.0 / (self.signal_period + 1)
+        dea = self.macd_history[0]
+        for dif in self.macd_history[1:]:
+            dea = alpha * dif + (1 - alpha) * dea
+        return dea
+    
+    def get_macd_histogram(self) -> float:
+        """获取MACD柱值"""
+        if not NAUTILUS_AVAILABLE or not self.macd or not self.macd.initialized:
+            return 0.0
+        return self.macd.value - self.get_macd_signal()
     
     def update_data(self, price: float, volume: float, timestamp: str = None):
         """更新数据"""
@@ -142,11 +167,15 @@ class TestDataProcessor:
         # 更新技术指标
         if NAUTILUS_AVAILABLE:
             self.macd.update_raw(price)
+            # 更新MACD历史数据
+            if self.macd.initialized:
+                self.macd_history.append(self.macd.value)
             self.rsi.update_raw(price)
             self.kdj.update(price, price, price)  # 简化处理
         else:
             if self.rsi:
-        self.rsi.update(price)
+                self.rsi.update(price)
+        
         self.volume_ratio.update(volume)
     
     def generate_signal(self) -> str:
@@ -157,9 +186,9 @@ class TestDataProcessor:
         # MACD信号
         macd_signal = "HOLD"
         if NAUTILUS_AVAILABLE and self.macd and self.macd.initialized:
-            if self.macd.value > self.macd.signal and self.macd.histogram > 0:
+            if self.macd.value > self.get_macd_signal() and self.get_macd_histogram() > 0:
                 macd_signal = "BUY"
-            elif self.macd.value < self.macd.signal and self.macd.histogram < 0:
+            elif self.macd.value < self.get_macd_signal() and self.get_macd_histogram() < 0:
                 macd_signal = "SELL"
         
         # RSI信号
@@ -198,7 +227,7 @@ class TestDataProcessor:
         
         # MACD
         if NAUTILUS_AVAILABLE and self.macd and self.macd.initialized:
-            print(f"MACD: {self.macd.value:.4f}, Signal: {self.macd.signal:.4f}, Histogram: {self.macd.histogram:.4f}")
+            print(f"MACD: {self.macd.value:.4f}, Signal: {self.get_macd_signal():.4f}, Histogram: {self.get_macd_histogram():.4f}")
         
         # RSI
         if self.rsi and self.rsi.initialized:

@@ -18,7 +18,8 @@ import json
 try:
     from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
     from nautilus_trader.indicators.momentum.rsi import RelativeStrengthIndex
-    from nautilus_trader.indicators.trend.macd import MovingAverageConvergenceDivergence
+    from nautilus_trader.indicators.macd import MovingAverageConvergenceDivergence  # 修复：正确的导入路径
+    from kdj_indicator import KDJIndicator
     NAUTILUS_AVAILABLE = True
 except ImportError:
     print("警告: Nautilus Trader指标不可用，使用简化版本")
@@ -179,12 +180,16 @@ class JVQuantSimpleClient:
         self.is_connected = False
         
         # 技术指标 - 使用Nautilus Trader的指标
-        self.macd = MovingAverageConvergenceDivergence(12, 26, 9)
+        self.macd = MovingAverageConvergenceDivergence(12, 26)  # 修复：移除第三个参数9
         self.rsi = RelativeStrengthIndex(14)
         # 使用自定义KDJ
         self.kdj = SimpleKDJ(9, 3, 3)
         
         self.volume_ratio = VolumeRatio(5)
+        
+        # 添加MACD相关存储
+        self.macd_history = deque(maxlen=100)  # 存储DIF值
+        self.signal_period = 9  # DEA计算周期
         
         # 数据存储
         self.latest_data = {
@@ -321,6 +326,10 @@ class JVQuantSimpleClient:
         # 更新MACD - 使用Nautilus Trader的MACD
         self.macd.update_raw(price)
         
+        # 更新MACD历史数据
+        if self.macd.initialized:
+            self.macd_history.append(self.macd.value)
+        
         # 更新RSI - 使用Nautilus Trader的RSI
         self.rsi.update_raw(price)
         
@@ -342,7 +351,7 @@ class JVQuantSimpleClient:
         
         # MACD - 使用Nautilus Trader的MACD
         if self.macd.initialized:
-            print(f"MACD: {self.macd.value:.4f}, Signal: {self.macd.signal:.4f}, Histogram: {self.macd.histogram:.4f}")
+            print(f"MACD: {self.macd.value:.4f}, Signal: {self.get_macd_signal():.4f}, Histogram: {self.get_macd_histogram():.4f}")
         
         # RSI - 使用Nautilus Trader的RSI
         if self.rsi.initialized:
@@ -370,6 +379,24 @@ class JVQuantSimpleClient:
         """断开连接"""
         if self.ws:
             self.ws.close()
+
+    def get_macd_signal(self) -> float:
+        """获取DEA值（信号线）"""
+        if len(self.macd_history) < self.signal_period:
+            return 0.0
+        
+        # 简单的EMA计算
+        alpha = 2.0 / (self.signal_period + 1)
+        dea = self.macd_history[0]
+        for dif in self.macd_history[1:]:
+            dea = alpha * dif + (1 - alpha) * dea
+        return dea
+    
+    def get_macd_histogram(self) -> float:
+        """获取MACD柱值"""
+        if not self.macd.initialized:
+            return 0.0
+        return self.macd.value - self.get_macd_signal()
 
 
 def main():
