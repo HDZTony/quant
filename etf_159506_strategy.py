@@ -83,6 +83,7 @@ class ETF159506Strategy(Strategy):
         
         # 记录极值点检测参数
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
+        self._log.info(f"MACD背离过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤MACD绝对值小于此值的背离信号)")
         
         # 策略参数
         self.stop_loss_pct = config.stop_loss_pct
@@ -435,11 +436,18 @@ class ETF159506Strategy(Strategy):
         price_higher = latest_price_peak[1] > previous_price_peak[1]  # 价格创新高
         macd_lower = latest_macd_peak[1] < previous_macd_peak[1]     # MACD走低
         
+        # 过滤MACD值太小的背离信号
+        # 只有当MACD绝对值大于阈值时才认为是有效背离
+        macd_threshold = abs(self.divergence_threshold)
+        if abs(latest_macd_peak[1]) < macd_threshold:
+            return False
+        
         # 确认背离：价格创新高，MACD明显走低
         if price_higher and macd_lower:
             # 记录背离检测结果
             self._log.info(f"顶背离检测: 价格峰值{latest_price_peak[0]}({latest_price_peak[1]:.4f}) vs {previous_price_peak[0]}({previous_price_peak[1]:.4f})")
             self._log.info(f"MACD峰值{latest_macd_peak[0]}({latest_macd_peak[1]:.6f}) vs {previous_macd_peak[0]}({previous_macd_peak[1]:.6f})")
+            self._log.info(f"MACD阈值过滤: 最新MACD={abs(latest_macd_peak[1]):.6f}, 阈值={macd_threshold:.6f}")
             self._log.info("检测到顶背离：价格创新高但MACD走低")
             
             return True
@@ -468,11 +476,18 @@ class ETF159506Strategy(Strategy):
         price_lower = latest_price_trough[1] < previous_price_trough[1]  # 价格创新低
         macd_higher = latest_macd_trough[1] > previous_macd_trough[1]   # MACD走高
         
+        # 过滤MACD值太小的背离信号
+        # 只过滤最新MACD值，避免过度过滤
+        macd_threshold = abs(self.divergence_threshold)
+        if abs(latest_macd_trough[1]) < macd_threshold:
+            return False
+        
         # 确认背离：价格创新低，MACD明显走高
         if price_lower and macd_higher:
             # 记录背离检测结果
             self._log.info(f"底背离检测: 价格谷值{latest_price_trough[0]}({latest_price_trough[1]:.4f}) vs {previous_price_trough[0]}({previous_price_trough[1]:.4f})")
             self._log.info(f"MACD谷值{latest_macd_trough[0]}({latest_macd_trough[1]:.6f}) vs {previous_macd_trough[0]}({previous_macd_trough[1]:.6f})")
+            self._log.info(f"MACD阈值过滤: 最新MACD={abs(latest_macd_trough[1]):.6f}, 阈值={macd_threshold:.6f} (仅过滤最新值)")
             self._log.info("检测到底背离：价格创新低但MACD走高")
             
             return True
