@@ -70,4 +70,5 @@ class ETF159506Config(StrategyConfig, frozen=True):
     divergence_threshold: PositiveFloat = 0.0002  # 背离检测阈值
     advance_trading_bars: PositiveInt = 2  # 提前交易K线数
     confirmation_bars: PositiveInt = 3  # 确认K线数
-    max_divergence_duration: PositiveInt = 10  # 最大背离持续时间（分钟） 
+    max_divergence_duration: PositiveInt = 10  # 最大背离持续时间（分钟）
+    max_extremes: PositiveInt = 200  # 最大极值点数量 
