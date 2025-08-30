@@ -63,6 +63,8 @@ class ETF159506Strategy(Strategy):
         
         # 背离检测相关历史数据存储
         self.price_history = deque(maxlen=1000)  # 存储收盘价历史
+        self.price_timestamps = deque(maxlen=1000)  # 存储价格对应的时间戳
+        self.macd_timestamps = deque(maxlen=1000)  # 存储MACD对应的时间戳
         self.divergence_lookback = 30  # 背离检测的回看周期
         self.divergence_confirmation_bars = 3  # 背离确认所需的K线数
         self.last_divergence_signal = None  # 记录上一次背离信号类型
@@ -75,15 +77,25 @@ class ETF159506Strategy(Strategy):
         self.max_divergence_duration = config.max_divergence_duration
         
         # 背离检测改进：记录历史极值点
-        self.price_peaks = deque(maxlen=config.max_extremes)  # 存储价格峰值点 (index, price)
-        self.price_troughs = deque(maxlen=config.max_extremes)  # 存储价格谷值点 (index, price)
-        self.macd_peaks = deque(maxlen=config.max_extremes)  # 存储MACD峰值点 (index, macd_value)
-        self.macd_troughs = deque(maxlen=config.max_extremes)  # 存储MACD谷值点 (index, macd_value)
+        self.price_peaks = deque(maxlen=config.max_extremes)  # 存储价格峰值点 (timestamp, price, dif_value)
+        self.price_troughs = deque(maxlen=config.max_extremes)  # 存储价格谷值点 (timestamp, price, dif_value)
+        self.dif_peaks = deque(maxlen=config.max_extremes)  # 存储DIF峰值点 (timestamp, dif_value, price_value)
+        self.dif_troughs = deque(maxlen=config.max_extremes)  # 存储DIF谷值点 (timestamp, dif_value, price_value)
         self.divergence_lookback_peaks = 3  # 回看过去几个极值点来检测背离
+        
+        # 极值点检测改进：时间窗口和曲率检测
+        self.extreme_detection_window = config.extreme_detection_window  # 极值点检测时间窗口（分钟）
+        self.curvature_threshold = config.curvature_threshold  # 曲率阈值
+        
+        # 技术指标信号累积系统
+        self.technical_signal = 0  # 技术指标信号累积值，+100买入，-100卖出
+        self.buy_threshold = 100   # 买入信号阈值
+        self.sell_threshold = -100 # 卖出信号阈值
         
         # 记录极值点检测参数
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
-        self._log.info(f"MACD背离过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤MACD绝对值小于此值的背离信号)")
+        self._log.info(f"DIF信号过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤DIF绝对值小于此值的金叉死叉和背离信号)")
+        self._log.info(f"技术指标信号系统: 买入信号+30, 卖出信号-30, 阈值±100, 执行后归零")
         
         # 策略参数
         self.stop_loss_pct = config.stop_loss_pct
@@ -143,34 +155,31 @@ class ETF159506Strategy(Strategy):
         # 无论MACD是否初始化，都计算图表MACD值
         chart_macd = self.calculate_chart_macd(bar)
         
+        # 根据MACD初始化状态选择数据源
         if not self.macd.initialized:
             self._log.info(f"MACD指标未初始化，当前数据点: {len(self.macd_history)}")
             self._log.info(f"使用图表MACD: DIF={chart_macd['macd']:.6f}, DEA={chart_macd['signal']:.6f}, Histogram={chart_macd['histogram']:.6f}")
             
-            # 即使未初始化，也记录图表MACD值到历史数据中
+            # 使用图表MACD值
             self.macd_history.append(chart_macd['macd'])
             self.signal_history.append(chart_macd['signal'])
             self.histogram_history.append(chart_macd['histogram'])
             
-            # 更新价格历史数据（用于背离检测）
+            # 更新价格历史数据
             self.price_history.append(bar.close.as_double())
+            self.price_timestamps.append(bar.ts_event)
+            self.macd_timestamps.append(bar.ts_event)
+        else:
+            self._log.info(f"MACD指标已初始化，使用官方指标值")
             
-            # 不进行交易信号检测，但记录数据
-            return
-
-        # MACD指标已初始化，使用官方指标值
-        self._log.info(f"MACD指标已初始化，使用官方指标值")
+            # 使用官方MACD值更新历史数据
+            self.update_history_data(bar)
         
-        # 更新历史数据
-        self.update_history_data(bar)
+        # 统一的极值点检测（背离检测会在deque增加时自动执行）
+        self.detect_and_record_extremes_improved(bar)
         
-        # 检查金叉死叉信号
+        # 统一的交易信号检测和风险管理
         self.check_macd_signals(bar)
-        
-        # 检查背离信号
-        self.check_divergence(bar)
-        
-        # 检查止损止盈
         self.check_risk_management(bar)
         
         # 定期监控持仓状态（每10个K线记录一次）
@@ -228,10 +237,9 @@ class ETF159506Strategy(Strategy):
         
         # 更新价格历史数据（用于背离检测）
         self.price_history.append(bar.close.as_double())
-        
-        # 检测并记录极值点
-        self.detect_and_record_extremes()
-        
+        self.price_timestamps.append(bar.ts_event)
+        self.macd_timestamps.append(bar.ts_event)
+                
         # 记录当前指标值
         self._log.info(f"DIF: {macd_value:.6f}, DEA: {signal_value:.6f}, MACD柱: {histogram_value:.6f}")
     
@@ -325,12 +333,26 @@ class ETF159506Strategy(Strategy):
         # 检测死叉：MACD线从上方向下穿越信号线
         death_cross = (previous_macd > previous_signal and current_macd < current_signal)
         
+        # 检查MACD值是否足够大（过滤小波动）
+        macd_threshold = abs(self.divergence_threshold)
+        current_macd_abs = abs(current_macd)
+        
         # 记录信号
         if golden_cross:
             self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
+            
+            # 检查MACD值是否足够大
+            if current_macd_abs < macd_threshold:
+                self._log.info(f"金叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
+                return
+            
             self.last_signal = "golden_cross"
             
-            # 检查当前持仓状态 - 使用可靠的持仓查询方法
+            # 累积买入信号
+            self.technical_signal += 30
+            self._log.info(f"金叉买入信号累积: 当前信号值={self.technical_signal}")
+            
+            # 检查当前持仓状态
             current_position = self.get_current_position()
             has_position = current_position is not None
             
@@ -343,7 +365,8 @@ class ETF159506Strategy(Strategy):
                     'side': 'HOLD',
                     'quantity': current_quantity,
                     'order_id': 'signal_detected',
-                    'signal_type': 'golden_cross_hold'
+                    'signal_type': 'golden_cross_hold',
+                    'signal_value': self.technical_signal
                 }
                 self.trade_signals.append(hold_signal)
                 self._log.info(f"记录持有信号（金叉但已有持仓）: {hold_signal}")
@@ -355,18 +378,33 @@ class ETF159506Strategy(Strategy):
                     'side': 'BUY',
                     'quantity': 0,
                     'order_id': 'signal_detected',
-                    'signal_type': 'golden_cross'
+                    'signal_type': 'golden_cross',
+                    'signal_value': self.technical_signal
                 }
                 self.trade_signals.append(buy_signal)
                 self._log.info(f"记录买入信号时间: {buy_signal}")
             
-            self.execute_buy_signal(bar)
+            # 检查是否达到买入阈值
+            if self.technical_signal >= self.buy_threshold:
+                self._log.info(f"金叉买入信号达到阈值{self.buy_threshold}，执行买入操作")
+                self.execute_buy_signal(bar)
+                self.technical_signal = 0  # 信号归零
         
         elif death_cross:
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
+            
+            # 检查MACD值是否足够大
+            if current_macd_abs < macd_threshold:
+                self._log.info(f"死叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
+                return
+            
             self.last_signal = "death_cross"
             
-            # 检查当前持仓状态 - 使用可靠的持仓查询方法
+            # 累积卖出信号
+            self.technical_signal -= 30
+            self._log.info(f"死叉卖出信号累积: 当前信号值={self.technical_signal}")
+            
+            # 检查当前持仓状态
             current_position = self.get_current_position()
             has_position = current_position is not None
             
@@ -379,7 +417,8 @@ class ETF159506Strategy(Strategy):
                     'side': 'SELL',
                     'quantity': current_quantity,
                     'order_id': 'signal_detected',
-                    'signal_type': 'death_cross'
+                    'signal_type': 'death_cross',
+                    'signal_value': self.technical_signal
                 }
                 self.trade_signals.append(sell_signal)
                 self._log.info(f"记录卖出信号时间: {sell_signal}")
@@ -391,17 +430,22 @@ class ETF159506Strategy(Strategy):
                     'side': 'WATCH',
                     'quantity': 0,
                     'order_id': 'signal_detected',
-                    'signal_type': 'death_cross_watch'
+                    'signal_type': 'death_cross_watch',
+                    'signal_value': self.technical_signal
                 }
                 self.trade_signals.append(watch_signal)
                 self._log.info(f"记录观望信号（死叉但无持仓）: {watch_signal}")
             
-            self.execute_sell_signal(bar)
+            # 检查是否达到卖出阈值
+            if self.technical_signal <= self.sell_threshold:
+                self._log.info(f"死叉卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
+                self.execute_sell_signal(bar)
+                self.technical_signal = 0  # 信号归零
     
     def check_divergence(self, bar: Bar):
-        """检查MACD背离信号"""
+        """检查DIF背离信号"""
         # 需要足够的极值点来检测背离
-        if len(self.price_peaks) < 2 or len(self.price_troughs) < 2 or len(self.macd_peaks) < 2 or len(self.macd_troughs) < 2:
+        if len(self.price_peaks) < 2 or len(self.price_troughs) < 2 or len(self.dif_peaks) < 2 or len(self.dif_troughs) < 2:
             return
         
         # 检测顶背离和底背离
@@ -415,120 +459,62 @@ class ETF159506Strategy(Strategy):
             self.handle_bottom_divergence(bar)
     
     def detect_top_divergence(self):
-        """检测顶背离：价格创新高，MACD未创新高"""
-        # 需要至少2个价格峰值和2个MACD峰值来检测背离
-        if len(self.price_peaks) < 2 or len(self.macd_peaks) < 2:
+        """检测顶背离：在DIF新高点判断价格变化"""
+        # 需要至少2个DIF峰值来检测背离
+        if len(self.dif_peaks) < 2:
             return False
         
-        # 获取最近的几个峰值点
-        recent_price_peaks = list(self.price_peaks)[-self.divergence_lookback_peaks:]
-        recent_macd_peaks = list(self.macd_peaks)[-self.divergence_lookback_peaks:]
+        # 获取最新的两个DIF峰值
+        latest_dif_peak = self.dif_peaks[-1]
+        previous_dif_peak = self.dif_peaks[-2]
         
-        # 检查最新的两个价格峰值
-        latest_price_peak = recent_price_peaks[-1]
-        previous_price_peak = recent_price_peaks[-2]
-        
-        # 检查最新的两个MACD峰值
-        latest_macd_peak = recent_macd_peaks[-1]
-        previous_macd_peak = recent_macd_peaks[-2]
-        
-        # 顶背离条件：价格创新高，但MACD未创新高
-        price_higher = latest_price_peak[1] > previous_price_peak[1]  # 价格创新高
-        macd_lower = latest_macd_peak[1] < previous_macd_peak[1]     # MACD走低
-        
-        # 过滤MACD值太小的背离信号
-        # 只有当MACD绝对值大于阈值时才认为是有效背离
-        macd_threshold = abs(self.divergence_threshold)
-        if abs(latest_macd_peak[1]) < macd_threshold:
-            return False
-        
-        # 确认背离：价格创新高，MACD明显走低
-        if price_higher and macd_lower:
-            # 记录背离检测结果
-            self._log.info(f"顶背离检测: 价格峰值{latest_price_peak[0]}({latest_price_peak[1]:.4f}) vs {previous_price_peak[0]}({previous_price_peak[1]:.4f})")
-            self._log.info(f"MACD峰值{latest_macd_peak[0]}({latest_macd_peak[1]:.6f}) vs {previous_macd_peak[0]}({previous_macd_peak[1]:.6f})")
-            self._log.info(f"MACD阈值过滤: 最新MACD={abs(latest_macd_peak[1]):.6f}, 阈值={macd_threshold:.6f}")
-            self._log.info("检测到顶背离：价格创新高但MACD走低")
+        # 检查DIF是否创新高
+        if latest_dif_peak[1] > previous_dif_peak[1]:
+            # DIF创新高，检查同一时间点的价格变化
+            # 使用峰值点存储的实际价格数据
+            latest_price = latest_dif_peak[2]  # (timestamp, dif_value, price_value)
+            previous_price = previous_dif_peak[2]
             
-            return True
+            # 顶背离：DIF创新高，但价格未创新高（走低或持平）
+            if latest_price <= previous_price:
+                # 过滤DIF值太小的背离信号
+                dif_threshold = abs(self.divergence_threshold)
+                if abs(latest_dif_peak[1]) >= dif_threshold:
+                    self._log.info(f"顶背离检测: DIF创新高{latest_dif_peak[1]:.6f} vs {previous_dif_peak[1]:.6f}")
+                    self._log.info(f"价格变化: {latest_price:.4f} vs {previous_price:.4f}")
+                    self._log.info("检测到顶背离：DIF创新高但价格未创新高")
+                    return True
         
         return False
     
     def detect_bottom_divergence(self):
-        """检测底背离：价格创新低，MACD未创新低"""
-        # 需要至少2个价格谷值和2个MACD谷值来检测背离
-        if len(self.price_troughs) < 2 or len(self.macd_troughs) < 2:
+        """检测底背离：在DIF新低点判断价格变化"""
+        # 需要至少2个DIF谷值来检测背离
+        if len(self.dif_troughs) < 2:
             return False
         
-        # 获取最近的几个谷值点
-        recent_price_troughs = list(self.price_troughs)[-self.divergence_lookback_peaks:]
-        recent_macd_troughs = list(self.macd_troughs)[-self.divergence_lookback_peaks:]
+        # 获取最新的两个DIF谷值
+        latest_dif_trough = self.dif_troughs[-1]
+        previous_dif_trough = self.dif_troughs[-2]
         
-        # 检查最新的两个价格谷值
-        latest_price_trough = recent_price_troughs[-1]
-        previous_price_trough = recent_price_troughs[-2]
-        
-        # 检查最新的两个MACD谷值
-        latest_macd_trough = recent_macd_troughs[-1]
-        previous_macd_trough = recent_macd_troughs[-2]
-        
-        # 底背离条件：价格创新低，但MACD未创新低
-        price_lower = latest_price_trough[1] < previous_price_trough[1]  # 价格创新低
-        macd_higher = latest_macd_trough[1] > previous_macd_trough[1]   # MACD走高
-        
-        # 过滤MACD值太小的背离信号
-        # 只过滤最新MACD值，避免过度过滤
-        macd_threshold = abs(self.divergence_threshold)
-        if abs(latest_macd_trough[1]) < macd_threshold:
-            return False
-        
-        # 确认背离：价格创新低，MACD明显走高
-        if price_lower and macd_higher:
-            # 记录背离检测结果
-            self._log.info(f"底背离检测: 价格谷值{latest_price_trough[0]}({latest_price_trough[1]:.4f}) vs {previous_price_trough[0]}({previous_price_trough[1]:.4f})")
-            self._log.info(f"MACD谷值{latest_macd_trough[0]}({latest_macd_trough[1]:.6f}) vs {previous_macd_trough[0]}({previous_macd_trough[1]:.6f})")
-            self._log.info(f"MACD阈值过滤: 最新MACD={abs(latest_macd_trough[1]):.6f}, 阈值={macd_threshold:.6f} (仅过滤最新值)")
-            self._log.info("检测到底背离：价格创新低但MACD走高")
+        # 检查DIF是否创新低
+        if latest_dif_trough[1] < previous_dif_trough[1]:
+            # DIF创新低，检查同一时间点的价格变化
+            # 使用峰值点存储的实际价格数据
+            latest_price = latest_dif_trough[2]  # (timestamp, dif_value, price_value)
+            previous_price = previous_dif_trough[2]
             
-            return True
+            # 底背离：DIF创新低，但价格未创新低（走高或持平）
+            if latest_price >= previous_price:
+                # 过滤DIF值太小的背离信号
+                dif_threshold = abs(self.divergence_threshold)
+                if abs(latest_dif_trough[1]) >= dif_threshold:
+                    self._log.info(f"底背离检测: DIF创新低{latest_dif_trough[1]:.6f} vs {previous_dif_trough[1]:.6f}")
+                    self._log.info(f"价格变化: {latest_price:.4f} vs {previous_price:.4f}")
+                    self._log.info("检测到底背离：DIF创新低但价格未创新低")
+                    return True
         
         return False
-    
-    def confirm_divergence(self, divergence_type, bar: Bar):
-        """确认背离信号的有效性"""
-        # 背离确认：连续几个K线确认趋势
-        if not hasattr(self, '_divergence_confirmation_count'):
-            self._divergence_confirmation_count = 0
-        
-        current_price = bar.close.as_double()
-        current_macd = self.macd_history[-1] if self.macd_history else 0
-        
-        if divergence_type == "top_divergence":
-            # 顶背离确认：价格继续上涨但MACD继续走低
-            if len(self.price_history) >= 2 and len(self.macd_history) >= 2:
-                price_trend = current_price > self.price_history[-2]  # 价格继续上涨
-                macd_trend = current_macd < self.macd_history[-2]    # MACD继续走低
-                
-                if price_trend and macd_trend:
-                    self._divergence_confirmation_count += 1
-                    self._log.info(f"顶背离确认: 第{self._divergence_confirmation_count}次确认")
-                else:
-                    self._divergence_confirmation_count = 0
-                    
-        elif divergence_type == "bottom_divergence":
-            # 底背离确认：价格继续下跌但MACD继续走高
-            if len(self.price_history) >= 2 and len(self.macd_history) >= 2:
-                price_trend = current_price < self.price_history[-2]  # 价格继续下跌
-                macd_trend = current_macd > self.macd_history[-2]    # MACD继续走高
-                
-                if price_trend and macd_trend:
-                    self._divergence_confirmation_count += 1
-                    self._log.info(f"底背离确认: 第{self._divergence_confirmation_count}次确认")
-                else:
-                    self._divergence_confirmation_count = 0
-        
-        # 返回是否达到确认次数要求
-        return self._divergence_confirmation_count >= self.divergence_confirmation_bars
     
     def find_peaks(self, data):
         """找到数据序列中的峰值点（局部最大值）"""
@@ -546,53 +532,378 @@ class ETF159506Strategy(Strategy):
                 troughs.append(i)
         return troughs
     
-    def detect_and_record_extremes(self):
-        """检测并记录价格和MACD的极值点"""
-        # 需要至少3个数据点来检测极值
-        if len(self.price_history) < 3 or len(self.macd_history) < 3:
+    def calculate_curvature(self, data, index):
+        """计算数据序列中指定索引点的曲率"""
+        if index < 2 or index >= len(data) - 2:
+            return 0.0
+        
+        # 使用五点中心差分计算曲率
+        # 曲率 = (f(x+h) - 2f(x) + f(x-h)) / h^2
+        h = 1  # 步长
+        f_plus_h = data[index + h]
+        f_minus_h = data[index - h]
+        f_x = data[index]
+        
+        curvature = (f_plus_h - 2 * f_x + f_minus_h) / (h * h)
+        return curvature
+    
+    def calculate_slope(self, data, index):
+        """计算数据序列中指定索引点的斜率"""
+        if index < 1 or index >= len(data) - 1:
+            return 0.0
+        
+        # 使用中心差分计算斜率
+        # 斜率 = (f(x+h) - f(x-h)) / (2h)
+        h = 1  # 步长
+        f_plus_h = data[index + h]
+        f_minus_h = data[index - h]
+        
+        slope = (f_plus_h - f_minus_h) / (2 * h)
+        return slope
+    
+    def is_extreme_in_time_window(self, data_type, current_index, window_minutes=20):
+        """在时间窗口内检测是否为极值点（只使用曲率）"""
+        if len(self.price_timestamps) < 3:
+            return False, None
+        
+        current_timestamp = self.price_timestamps[current_index]
+        current_value = self.price_history[current_index] if data_type == 'price' else self.macd_history[current_index]
+        
+        # 计算时间窗口内的数据点
+        window_start_time = current_timestamp - pd.Timedelta(minutes=window_minutes)
+        window_end_time = current_timestamp + pd.Timedelta(minutes=window_minutes)
+        
+        # 找到时间窗口内的数据点索引
+        window_indices = []
+        for i, ts in enumerate(self.price_timestamps):
+            if window_start_time <= ts <= window_end_time:
+                window_indices.append(i)
+        
+        if len(window_indices) < 3:
+            return False, None
+        
+        # 在时间窗口内计算曲率
+        data_series = self.price_history if data_type == 'price' else self.macd_history
+        curvature = self.calculate_curvature(data_series, current_index)
+        
+        # 检查是否为极值点（只使用曲率）
+        if data_type == 'price':
+            # 价格峰值：曲率为负（向下弯曲）
+            if curvature < -self.curvature_threshold:
+                # 检查是否相对于历史极值点是真正的峰值
+                if self._is_relative_extreme('price_peak', current_value, current_timestamp):
+                    return True, 'peak'
+            # 价格谷值：曲率为正（向上弯曲）
+            elif curvature > self.curvature_threshold:
+                # 检查是否相对于历史极值点是真正的谷值
+                if self._is_relative_extreme('price_trough', current_value, current_timestamp):
+                    return True, 'trough'
+        else:  # MACD
+            # MACD峰值：曲率为负（向下弯曲）
+            if curvature < -self.curvature_threshold:
+                # 检查是否相对于历史极值点是真正的峰值
+                if self._is_relative_extreme('dif_peak', current_value, current_timestamp):
+                    return True, 'peak'
+            # MACD谷值：曲率为正（向上弯曲）
+            elif curvature > self.curvature_threshold:
+                # 检查是否相对于历史极值点是真正的谷值
+                if self._is_relative_extreme('dif_trough', current_value, current_timestamp):
+                    return True, 'trough'
+        
+        return False, None
+    
+    def _is_relative_extreme(self, extreme_type, current_value, current_timestamp):
+        """检查当前值是否相对于历史极值点是真正的极值（基于数学原理和相对比较）"""
+        if extreme_type in ['price_peak', 'dif_peak']:
+            # 峰值：检查是否在数学和相对意义上都是真正的峰值
+            if extreme_type == 'price_peak':
+                peaks = self.price_peaks
+                troughs = self.price_troughs
+            else:  # dif_peak
+                peaks = self.dif_peaks
+                troughs = self.dif_troughs
+            
+            # 如果没有历史数据，直接返回True
+            if len(peaks) == 0 and len(troughs) == 0:
+                return True
+            
+            # 检查是否比最近的谷值更高（这是峰值的基本要求）
+            if len(troughs) > 0:
+                latest_trough = troughs[-1]
+                latest_trough_value = latest_trough[1]
+                if current_value <= latest_trough_value:
+                    return False
+            
+            # 检查是否比最近的峰值更高或足够接近（避免重复的微小峰值）
+            if len(peaks) > 0:
+                latest_peak = peaks[-1]
+                latest_peak_value = latest_peak[1]
+                
+                # 如果新峰值比最近峰值低太多，可能不是真正的峰值
+                if current_value < latest_peak_value * 0.98:  # 允许2%的误差
+                    return False
+                
+
+            
+            return True
+            
+        elif extreme_type in ['price_trough', 'dif_trough']:
+            # 谷值：检查是否在数学和相对意义上都是真正的谷值
+            if extreme_type == 'price_trough':
+                troughs = self.price_troughs
+                peaks = self.price_peaks
+            else:  # dif_trough
+                troughs = self.dif_troughs
+                peaks = self.dif_peaks
+            
+            # 如果没有历史数据，直接返回True
+            if len(peaks) == 0 and len(troughs) == 0:
+                return True
+            
+            # 检查是否比最近的峰值更低（这是谷值的基本要求）
+            if len(peaks) > 0:
+                latest_peak = peaks[-1]
+                latest_peak_value = latest_peak[1]
+                if current_value >= latest_peak_value:
+                    return False
+            
+            # 检查是否比最近的谷值更低或足够接近（避免重复的微小谷值）
+            if len(troughs) > 0:
+                latest_trough = troughs[-1]
+                latest_trough_value = latest_trough[1]
+                
+                # 如果新谷值比最近谷值高太多，可能不是真正的谷值
+                if current_value > latest_trough_value * 1.02:  # 允许2%的误差
+                    return False
+                
+
+            
+            return True
+        
+        return False
+    
+    def detect_and_record_extremes_improved(self, bar: Bar):
+        """改进的极值点检测：基于时间窗口和曲率，自动删除同类型极值点"""
+        if len(self.price_history) < 3:
             return
         
+        current_timestamp = bar.ts_event
         current_price = self.price_history[-1]
         current_macd = self.macd_history[-1]
-        prev_price = self.price_history[-2]
-        prev_macd = self.macd_history[-2]
-        prev_prev_price = self.price_history[-3]
-        prev_prev_macd = self.macd_history[-3]
         
-        # 检测价格峰值（局部最大值）
-        if prev_price > prev_prev_price and prev_price > current_price:
-            self.price_peaks.append((len(self.price_history) - 2, prev_price))
-            self._log.debug(f"检测到价格峰值: 位置{len(self.price_history) - 2}, 价格{prev_price:.4f}")
+        # 检测价格极值点
+        price_extreme, price_type = self.is_extreme_in_time_window('price', len(self.price_history) - 1, self.extreme_detection_window)
+        if price_extreme:
+            if price_type == 'peak':
+                if self._is_valid_extreme_point('price_peak', current_price, current_macd):
+                    # 如果上一个极值点也是峰值，删除上一个峰值
+                    if len(self.price_peaks) > 0:
+                        removed_peak = self.price_peaks.pop()
+                        self._log.debug(f"删除旧价格峰值: 时间{removed_peak[0]}, 价格{removed_peak[1]:.4f}")
+                    
+                    self.price_peaks.append((current_timestamp, current_price, current_macd))
+                    self._log.debug(f"添加新价格峰值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
+                    self._cleanup_extreme_points('price_peaks')
+                    
+            elif price_type == 'trough':
+                if self._is_valid_extreme_point('price_trough', current_price, current_macd):
+                    # 如果上一个极值点也是谷值，删除上一个谷值
+                    if len(self.price_troughs) > 0:
+                        removed_trough = self.price_troughs.pop()
+                        self._log.debug(f"删除旧价格谷值: 时间{removed_trough[0]}, 价格{removed_trough[1]:.4f}")
+                    
+                    self.price_troughs.append((current_timestamp, current_price, current_macd))
+                    self._log.debug(f"添加新价格谷值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
+                    self._cleanup_extreme_points('price_troughs')
         
-        # 检测价格谷值（局部最小值）
-        if prev_price < prev_prev_price and prev_price < current_price:
-            self.price_troughs.append((len(self.price_history) - 2, prev_price))
-            self._log.debug(f"检测到价格谷值: 位置{len(self.price_history) - 2}, 价格{prev_price:.4f}")
+        # 检测MACD极值点
+        macd_extreme, macd_type = self.is_extreme_in_time_window('macd', len(self.macd_history) - 1, self.extreme_detection_window)
+        if macd_extreme:
+            if macd_type == 'peak':
+                if self._is_valid_extreme_point('dif_peak', current_macd, current_price):
+                    # 如果上一个极值点也是峰值，删除上一个峰值
+                    if len(self.dif_peaks) > 0:
+                        removed_peak = self.dif_peaks.pop()
+                        self._log.debug(f"删除旧DIF峰值: 时间{removed_peak[0]}, DIF{removed_peak[1]:.6f}")
+                    
+                    self.dif_peaks.append((current_timestamp, current_macd, current_price))
+                    self._log.debug(f"添加新DIF峰值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
+                    self._cleanup_extreme_points('dif_peaks')
+                    self.check_divergence(bar)
+                    
+            elif macd_type == 'trough':
+                if self._is_valid_extreme_point('dif_trough', current_macd, current_price):
+                    # 如果上一个极值点也是谷值，删除上一个谷值
+                    if len(self.dif_troughs) > 0:
+                        removed_trough = self.dif_troughs.pop()
+                        self._log.debug(f"删除旧DIF谷值: 时间{removed_trough[0]}, DIF{removed_trough[1]:.6f}")
+                    
+                    self.dif_troughs.append((current_timestamp, current_macd, current_price))
+                    self._log.debug(f"添加新DIF谷值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
+                    self._cleanup_extreme_points('dif_troughs')
+                    self.check_divergence(bar)
+    
+    
+    def _is_valid_extreme_point(self, extreme_type: str, value: float, related_value: float) -> bool:
+        """验证极值点是否有效"""
+        if extreme_type in ['price_peak', 'dif_peak']:
+            # 峰值验证：检查两侧是否有谷值点
+            return self._validate_peak_with_troughs(extreme_type, value, related_value)
+        elif extreme_type in ['price_trough', 'dif_trough']:
+            # 谷值验证：检查两侧是否有峰值点
+            return self._validate_trough_with_peaks(extreme_type, value, related_value)
+        return False
+    
+    def _validate_peak_with_troughs(self, peak_type: str, peak_value: float, related_value: float) -> bool:
+        """验证峰值点：确保两侧有谷值点"""
+        if peak_type == 'price_peak':
+            peaks = self.price_peaks
+            troughs = self.price_troughs
+            value = peak_value
+        else:  # dif_peak
+            peaks = self.dif_peaks
+            troughs = self.dif_troughs
+            value = peak_value
         
-        # 检测MACD峰值（局部最大值）
-        if prev_macd > prev_prev_macd and prev_macd > current_macd:
-            self.macd_peaks.append((len(self.macd_history) - 2, prev_macd))
-            self._log.debug(f"检测到MACD峰值: 位置{len(self.macd_history) - 2}, MACD{prev_macd:.6f}")
+        # 如果这是第一个峰值点，需要等待更多数据
+        if len(peaks) == 0:
+            return True
         
-        # 检测MACD谷值（局部最小值）
-        if prev_macd < prev_prev_macd and prev_macd < current_macd:
-            self.macd_troughs.append((len(self.macd_history) - 2, prev_macd))
-            self._log.debug(f"检测到MACD谷值: 位置{len(self.macd_history) - 2}, MACD{prev_macd:.6f}")
+        # 检查最近的峰值点是否仍然有效
+        latest_peak = peaks[-1]
+        latest_peak_value = latest_peak[1]
+        
+        # 如果新峰值比最近峰值更高，则最近峰值无效
+        if value > latest_peak_value:
+            # 移除无效的峰值点
+            peaks.pop()
+            self._log.debug(f"移除无效峰值点: {latest_peak_value:.6f} < {value:.6f}")
+            return True
+        
+        # 检查是否有足够的谷值点来形成有效的峰值
+        if len(troughs) < 2:
+            return False
+        
+        # 检查峰值是否在两个谷值之间
+        latest_trough = troughs[-1]
+        latest_trough_value = latest_trough[1]
+        
+        # 峰值应该在谷值之上
+        if value <= latest_trough_value:
+            return False
+        
+        return True
+    
+    def _validate_trough_with_peaks(self, trough_type: str, trough_value: float, related_value: float) -> bool:
+        """验证谷值点：确保两侧有峰值点"""
+        if trough_type == 'price_trough':
+            troughs = self.price_troughs
+            peaks = self.price_peaks
+            value = trough_value
+        else:  # dif_trough
+            troughs = self.dif_troughs
+            peaks = self.dif_peaks
+            value = trough_value
+        
+        # 如果这是第一个谷值点，需要等待更多数据
+        if len(troughs) == 0:
+            return True
+        
+        # 检查最近的谷值点是否仍然有效
+        latest_trough = troughs[-1]
+        latest_trough_value = latest_trough[1]
+        
+        # 如果新谷值比最近谷值更低，则最近谷值无效
+        if value < latest_trough_value:
+            # 移除无效的谷值点
+            troughs.pop()
+            self._log.debug(f"移除无效谷值点: {latest_trough_value:.6f} > {value:.6f}")
+            return True
+        
+        # 检查是否有足够的峰值点来形成有效的谷值
+        if len(peaks) < 2:
+            return False
+        
+        # 检查谷值是否在两个峰值之间
+        latest_peak = peaks[-1]
+        latest_peak_value = latest_peak[1]
+        
+        # 谷值应该在峰值之下
+        if value >= latest_peak_value:
+            return False
+        
+        return True
+    
+    def _cleanup_extreme_points(self, extreme_type: str):
+        """清理无效的极值点"""
+        if extreme_type == 'price_peaks':
+            extreme_points = self.price_peaks
+        elif extreme_type == 'price_troughs':
+            extreme_points = self.price_troughs
+        elif extreme_type == 'dif_peaks':
+            extreme_points = self.dif_peaks
+        elif extreme_type == 'dif_troughs':
+            extreme_points = self.dif_troughs
+        else:
+            return
         
         # 保持极值点数量在合理范围内
-        if len(self.price_peaks) > self.config.max_extremes:
-            self.price_peaks.popleft()
-        if len(self.price_troughs) > self.config.max_extremes:
-            self.price_troughs.popleft()
-        if len(self.macd_peaks) > self.config.max_extremes:
-            self.macd_peaks.popleft()
-        if len(self.macd_troughs) > self.config.max_extremes:
-            self.macd_troughs.popleft()
+        max_points = self.config.max_extremes // 2  # 每种类型最多一半
+        
+        if len(extreme_points) > max_points:
+            # 移除最旧的极值点
+            removed_count = len(extreme_points) - max_points
+            for _ in range(removed_count):
+                extreme_points.popleft()
+            self._log.debug(f"清理{extreme_type}: 移除{removed_count}个旧极值点")
+    
+    def _get_alternating_extremes(self, peak_type: str, trough_type: str, min_count: int = 3):
+        """获取交替的极值点序列"""
+        if peak_type == 'price_peaks':
+            peaks = self.price_peaks
+        elif peak_type == 'dif_peaks':
+            peaks = self.dif_peaks
+        else:
+            peaks = []
+        
+        if trough_type == 'price_troughs':
+            troughs = self.price_troughs
+        elif trough_type == 'dif_troughs':
+            troughs = self.dif_troughs
+        else:
+            troughs = []
+        
+        # 合并并按时间排序
+        all_extremes = []
+        for peak in peaks:
+            all_extremes.append((peak[0], 'peak', peak[1], peak[2]))
+        for trough in troughs:
+            all_extremes.append((trough[0], 'trough', trough[1], trough[2]))
+        
+        # 按时间排序
+        all_extremes.sort(key=lambda x: x[0])
+        
+        # 验证交替性
+        alternating_extremes = []
+        for i, extreme in enumerate(all_extremes):
+            if i == 0:
+                alternating_extremes.append(extreme)
+            else:
+                prev_extreme = alternating_extremes[-1]
+                # 确保相邻极值点类型不同
+                if extreme[1] != prev_extreme[1]:
+                    alternating_extremes.append(extreme)
+        
+        return alternating_extremes if len(alternating_extremes) >= min_count else []
     
     def handle_top_divergence(self, bar: Bar):
         """处理顶背离信号"""
-        self._log.info("检测到顶背离信号：价格创新高但MACD走低，看跌信号")
+        self._log.info("检测到顶背离信号：DIF创新高但价格未创新高，看跌信号")
         self.last_divergence_signal = "top_divergence"
+        
+        # 累积卖出信号
+        self.technical_signal -= 30
+        self._log.info(f"顶背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录顶背离信号
         divergence_signal = {
@@ -602,20 +913,25 @@ class ETF159506Strategy(Strategy):
             'quantity': 0,
             'order_id': 'divergence_signal',
             'signal_type': 'top_divergence',
-            'divergence_type': 'bearish'
+            'divergence_type': 'bearish',
+            'signal_value': self.technical_signal
         }
         self.trade_signals.append(divergence_signal)
         
-        # 如果当前有持仓，考虑减仓或设置更严格的止损
-        current_position = self.get_current_position()
-        if current_position is not None:
-            self._log.info("顶背离信号：建议减仓或设置更严格止损")
-            # 这里可以添加减仓逻辑或调整止损参数
+        # 检查是否达到卖出阈值
+        if self.technical_signal <= self.sell_threshold:
+            self._log.info(f"顶背离卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
+            self.execute_divergence_sell_signal(bar)
+            self.technical_signal = 0  # 信号归零
     
     def handle_bottom_divergence(self, bar: Bar):
         """处理底背离信号"""
-        self._log.info("检测到底背离信号：价格创新低但MACD走高，看涨信号")
+        self._log.info("检测到底背离信号：DIF创新低但价格未创新低，看涨信号")
         self.last_divergence_signal = "bottom_divergence"
+        
+        # 累积买入信号
+        self.technical_signal += 30
+        self._log.info(f"底背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录底背离信号
         divergence_signal = {
@@ -625,15 +941,16 @@ class ETF159506Strategy(Strategy):
             'quantity': 0,
             'order_id': 'divergence_signal',
             'signal_type': 'bottom_divergence',
-            'divergence_type': 'bullish'
+            'divergence_type': 'bullish',
+            'signal_value': self.technical_signal
         }
         self.trade_signals.append(divergence_signal)
         
-        # 如果当前没有持仓，可以考虑提前建仓
-        current_position = self.get_current_position()
-        if current_position is None:
-            self._log.info("底背离信号：建议关注买入机会")
-            # 这里可以添加提前建仓的逻辑
+        # 检查是否达到买入阈值
+        if self.technical_signal >= self.buy_threshold:
+            self._log.info(f"底背离买入信号达到阈值{self.buy_threshold}，执行买入操作")
+            self.execute_divergence_buy_signal(bar)
+            self.technical_signal = 0  # 信号归零
     
     def execute_buy_signal(self, bar: Bar):
         """执行买入信号"""
@@ -699,6 +1016,68 @@ class ETF159506Strategy(Strategy):
         # 执行平仓操作
         self.close_position(current_position)
         self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
+    
+    def execute_divergence_buy_signal(self, bar: Bar):
+        """执行背离买入信号"""
+        # 检查是否已有持仓
+        current_position = self.get_current_position()
+        if current_position is not None:
+            self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过背离买入信号")
+            return
+        
+        # 计算交易数量
+        if self.trade_size is None:
+            account = self.cache.account_for_venue(self.config.venue)
+            available_balance = account.balance_total().as_double()
+            current_price = bar.close.as_double()
+            
+            if available_balance <= 0:
+                self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过背离买入信号")
+                return
+                
+            quantity = int(available_balance / current_price)
+            if quantity <= 0:
+                self._log.info(f"计算出的交易数量无效: {quantity}，跳过背离买入信号")
+                return
+                
+            trade_quantity = Quantity.from_int(quantity)
+        else:
+            trade_quantity = self.trade_size
+
+        order = self.order_factory.market(
+            instrument_id=self.config.instrument_id,
+            order_side=OrderSide.BUY,
+            quantity=trade_quantity,
+        )
+        self.submit_order(order)
+        
+        # 更新最近的背离买入信号记录
+        for signal in reversed(self.trade_signals):
+            if signal.get('signal_type') == 'bottom_divergence' and signal.get('side') == 'BUY':
+                signal['quantity'] = trade_quantity.as_double()
+                signal['order_id'] = str(order.client_order_id)
+                break
+        
+        self._log.info(f"背离买入信号: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+    
+    def execute_divergence_sell_signal(self, bar: Bar):
+        """执行背离卖出信号"""
+        # 检查是否有持仓
+        current_position = self.get_current_position()
+        if current_position is None:
+            self._log.info("没有持仓，跳过背离卖出信号")
+            return
+        
+        # 更新最近的背离卖出信号记录
+        for signal in reversed(self.trade_signals):
+            if signal.get('signal_type') == 'top_divergence' and signal.get('side') == 'SELL':
+                signal['quantity'] = current_position.quantity.as_double()
+                signal['order_id'] = 'close_position'
+                break
+        
+        # 执行平仓操作
+        self.close_position(current_position)
+        self._log.info(f"背离卖出信号: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""

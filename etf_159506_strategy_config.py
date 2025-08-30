@@ -71,4 +71,8 @@ class ETF159506Config(StrategyConfig, frozen=True):
     advance_trading_bars: PositiveInt = 2  # 提前交易K线数
     confirmation_bars: PositiveInt = 3  # 确认K线数
     max_divergence_duration: PositiveInt = 10  # 最大背离持续时间（分钟）
-    max_extremes: PositiveInt = 200  # 最大极值点数量 
+    max_extremes: PositiveInt = 200  # 最大极值点数量
+    
+    # 极值点检测改进参数
+    extreme_detection_window: PositiveInt = 20  # 极值点检测时间窗口（分钟）
+    curvature_threshold: PositiveFloat = 0.001  # 曲率阈值 
