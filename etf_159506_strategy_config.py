@@ -73,6 +73,4 @@ class ETF159506Config(StrategyConfig, frozen=True):
     max_divergence_duration: PositiveInt = 10  # 最大背离持续时间（分钟）
     max_extremes: PositiveInt = 200  # 最大极值点数量
     
-    # 极值点检测改进参数
-    extreme_detection_window: PositiveInt = 20  # 极值点检测时间窗口（分钟）
-    curvature_threshold: PositiveFloat = 0.001  # 曲率阈值 
+    # 极值点检测参数（已简化，使用简单的前后点比较方法） 

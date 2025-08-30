@@ -83,10 +83,6 @@ class ETF159506Strategy(Strategy):
         self.dif_troughs = deque(maxlen=config.max_extremes)  # 存储DIF谷值点 (timestamp, dif_value, price_value)
         self.divergence_lookback_peaks = 3  # 回看过去几个极值点来检测背离
         
-        # 极值点检测改进：时间窗口和曲率检测
-        self.extreme_detection_window = config.extreme_detection_window  # 极值点检测时间窗口（分钟）
-        self.curvature_threshold = config.curvature_threshold  # 曲率阈值
-        
         # 技术指标信号累积系统
         self.technical_signal = 0  # 技术指标信号累积值，+100买入，-100卖出
         self.buy_threshold = 100   # 买入信号阈值
@@ -96,6 +92,7 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
         self._log.info(f"DIF信号过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤DIF绝对值小于此值的金叉死叉和背离信号)")
         self._log.info(f"技术指标信号系统: 买入信号+30, 卖出信号-30, 阈值±100, 执行后归零")
+        self._log.info(f"极值点检测: 使用简单的前后点比较方法，无需时间窗口和曲率检测")
         
         # 策略参数
         self.stop_loss_pct = config.stop_loss_pct
@@ -532,85 +529,15 @@ class ETF159506Strategy(Strategy):
                 troughs.append(i)
         return troughs
     
-    def calculate_curvature(self, data, index):
-        """计算数据序列中指定索引点的曲率"""
-        if index < 2 or index >= len(data) - 2:
-            return 0.0
-        
-        # 使用五点中心差分计算曲率
-        # 曲率 = (f(x+h) - 2f(x) + f(x-h)) / h^2
-        h = 1  # 步长
-        f_plus_h = data[index + h]
-        f_minus_h = data[index - h]
-        f_x = data[index]
-        
-        curvature = (f_plus_h - 2 * f_x + f_minus_h) / (h * h)
-        return curvature
-    
-    def calculate_slope(self, data, index):
-        """计算数据序列中指定索引点的斜率"""
-        if index < 1 or index >= len(data) - 1:
-            return 0.0
-        
-        # 使用中心差分计算斜率
-        # 斜率 = (f(x+h) - f(x-h)) / (2h)
-        h = 1  # 步长
-        f_plus_h = data[index + h]
-        f_minus_h = data[index - h]
-        
-        slope = (f_plus_h - f_minus_h) / (2 * h)
-        return slope
+    # 移除复杂的曲率和斜率计算方法，使用简单的前后点比较
     
     def is_extreme_in_time_window(self, data_type, current_index, window_minutes=20):
-        """在时间窗口内检测是否为极值点（只使用曲率）"""
-        if len(self.price_timestamps) < 3:
-            return False, None
-        
-        current_timestamp = self.price_timestamps[current_index]
-        current_value = self.price_history[current_index] if data_type == 'price' else self.macd_history[current_index]
-        
-        # 计算时间窗口内的数据点
-        window_start_time = current_timestamp - pd.Timedelta(minutes=window_minutes)
-        window_end_time = current_timestamp + pd.Timedelta(minutes=window_minutes)
-        
-        # 找到时间窗口内的数据点索引
-        window_indices = []
-        for i, ts in enumerate(self.price_timestamps):
-            if window_start_time <= ts <= window_end_time:
-                window_indices.append(i)
-        
-        if len(window_indices) < 3:
-            return False, None
-        
-        # 在时间窗口内计算曲率
-        data_series = self.price_history if data_type == 'price' else self.macd_history
-        curvature = self.calculate_curvature(data_series, current_index)
-        
-        # 检查是否为极值点（只使用曲率）
-        if data_type == 'price':
-            # 价格峰值：曲率为负（向下弯曲）
-            if curvature < -self.curvature_threshold:
-                # 检查是否相对于历史极值点是真正的峰值
-                if self._is_relative_extreme('price_peak', current_value, current_timestamp):
-                    return True, 'peak'
-            # 价格谷值：曲率为正（向上弯曲）
-            elif curvature > self.curvature_threshold:
-                # 检查是否相对于历史极值点是真正的谷值
-                if self._is_relative_extreme('price_trough', current_value, current_timestamp):
-                    return True, 'trough'
-        else:  # MACD
-            # MACD峰值：曲率为负（向下弯曲）
-            if curvature < -self.curvature_threshold:
-                # 检查是否相对于历史极值点是真正的峰值
-                if self._is_relative_extreme('dif_peak', current_value, current_timestamp):
-                    return True, 'peak'
-            # MACD谷值：曲率为正（向上弯曲）
-            elif curvature > self.curvature_threshold:
-                # 检查是否相对于历史极值点是真正的谷值
-                if self._is_relative_extreme('dif_trough', current_value, current_timestamp):
-                    return True, 'trough'
-        
-        return False, None
+        """在时间窗口内检测是否为极值点（已简化，使用简单的前后点比较）"""
+        # 简化为直接调用简单极值检测方法
+        return self._detect_extreme(
+            self.price_history if data_type == 'price' else self.macd_history, 
+            current_index
+        )
     
     def _is_relative_extreme(self, extreme_type, current_value, current_timestamp, min_extreme_distance=0.1):
         """检查当前值是否相对于上一个极值点是真正的极值
@@ -787,95 +714,7 @@ class ETF159506Strategy(Strategy):
             else:  # dif_trough
                 self.dif_troughs.append((timestamp, value, related_value))
     
-    def _is_valid_extreme_point(self, extreme_type: str, value: float, related_value: float) -> bool:
-        """验证极值点是否有效"""
-        if extreme_type in ['price_peak', 'dif_peak']:
-            # 峰值验证：检查两侧是否有谷值点
-            return self._validate_peak_with_troughs(extreme_type, value, related_value)
-        elif extreme_type in ['price_trough', 'dif_trough']:
-            # 谷值验证：检查两侧是否有峰值点
-            return self._validate_trough_with_peaks(extreme_type, value, related_value)
-        return False
-    
-    def _validate_peak_with_troughs(self, peak_type: str, peak_value: float, related_value: float) -> bool:
-        """验证峰值点：确保两侧有谷值点"""
-        if peak_type == 'price_peak':
-            peaks = self.price_peaks
-            troughs = self.price_troughs
-            value = peak_value
-        else:  # dif_peak
-            peaks = self.dif_peaks
-            troughs = self.dif_troughs
-            value = peak_value
-        
-        # 如果这是第一个峰值点，需要等待更多数据
-        if len(peaks) == 0:
-            return True
-        
-        # 检查最近的峰值点是否仍然有效
-        latest_peak = peaks[-1]
-        latest_peak_value = latest_peak[1]
-        
-        # 如果新峰值比最近峰值更高，则最近峰值无效
-        if value > latest_peak_value:
-            # 移除无效的峰值点
-            peaks.pop()
-            self._log.debug(f"移除无效峰值点: {latest_peak_value:.6f} < {value:.6f}")
-            return True
-        
-        # 检查是否有足够的谷值点来形成有效的峰值
-        if len(troughs) < 2:
-            return False
-        
-        # 检查峰值是否在两个谷值之间
-        latest_trough = troughs[-1]
-        latest_trough_value = latest_trough[1]
-        
-        # 峰值应该在谷值之上
-        if value <= latest_trough_value:
-            return False
-        
-        return True
-    
-    def _validate_trough_with_peaks(self, trough_type: str, trough_value: float, related_value: float) -> bool:
-        """验证谷值点：确保两侧有峰值点"""
-        if trough_type == 'price_trough':
-            troughs = self.price_troughs
-            peaks = self.price_peaks
-            value = trough_value
-        else:  # dif_trough
-            troughs = self.dif_troughs
-            peaks = self.dif_peaks
-            value = trough_value
-        
-        # 如果这是第一个谷值点，需要等待更多数据
-        if len(troughs) == 0:
-            return True
-        
-        # 检查最近的谷值点是否仍然有效
-        latest_trough = troughs[-1]
-        latest_trough_value = latest_trough[1]
-        
-        # 如果新谷值比最近谷值更低，则最近谷值无效
-        if value < latest_trough_value:
-            # 移除无效的谷值点
-            troughs.pop()
-            self._log.debug(f"移除无效谷值点: {latest_trough_value:.6f} > {value:.6f}")
-            return True
-        
-        # 检查是否有足够的峰值点来形成有效的谷值
-        if len(peaks) < 2:
-            return False
-        
-        # 检查谷值是否在两个峰值之间
-        latest_peak = peaks[-1]
-        latest_peak_value = latest_peak[1]
-        
-        # 谷值应该在峰值之下
-        if value >= latest_peak_value:
-            return False
-        
-        return True
+    # 移除复杂的极值点验证方法，使用简单的相对极值检测
     
     def _cleanup_extreme_points(self, extreme_type: str):
         """清理无效的极值点"""
@@ -900,44 +739,7 @@ class ETF159506Strategy(Strategy):
                 extreme_points.popleft()
             self._log.debug(f"清理{extreme_type}: 移除{removed_count}个旧极值点")
     
-    def _get_alternating_extremes(self, peak_type: str, trough_type: str, min_count: int = 3):
-        """获取交替的极值点序列"""
-        if peak_type == 'price_peaks':
-            peaks = self.price_peaks
-        elif peak_type == 'dif_peaks':
-            peaks = self.dif_peaks
-        else:
-            peaks = []
-        
-        if trough_type == 'price_troughs':
-            troughs = self.price_troughs
-        elif trough_type == 'dif_troughs':
-            troughs = self.dif_troughs
-        else:
-            troughs = []
-        
-        # 合并并按时间排序
-        all_extremes = []
-        for peak in peaks:
-            all_extremes.append((peak[0], 'peak', peak[1], peak[2]))
-        for trough in troughs:
-            all_extremes.append((trough[0], 'trough', trough[1], trough[2]))
-        
-        # 按时间排序
-        all_extremes.sort(key=lambda x: x[0])
-        
-        # 验证交替性
-        alternating_extremes = []
-        for i, extreme in enumerate(all_extremes):
-            if i == 0:
-                alternating_extremes.append(extreme)
-            else:
-                prev_extreme = alternating_extremes[-1]
-                # 确保相邻极值点类型不同
-                if extreme[1] != prev_extreme[1]:
-                    alternating_extremes.append(extreme)
-        
-        return alternating_extremes if len(alternating_extremes) >= min_count else []
+    # 移除复杂的交替极值点检测方法，使用简单的相对极值检测
     
     def handle_top_divergence(self, bar: Bar):
         """处理顶背离信号"""
