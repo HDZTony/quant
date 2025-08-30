@@ -13,91 +13,6 @@ from datetime import datetime, timedelta
 import time
 from collections import deque
 
-def calculate_first_derivative(data, index):
-    """计算数据序列中指定索引点的一阶导数"""
-    if index < 1 or index >= len(data) - 1:
-        return 0.0
-    
-    # 使用中心差分计算一阶导数
-    # 一阶导数 = (f(x+h) - f(x-h)) / (2h)
-    h = 1  # 步长
-    f_plus_h = data[index + h]
-    f_minus_h = data[index - h]
-    
-    derivative = (f_plus_h - f_minus_h) / (2 * h)
-    return derivative
-
-def calculate_second_derivative(data, index):
-    """计算数据序列中指定索引点的二阶导数（用于确认极值类型）"""
-    if index < 2 or index >= len(data) - 2:
-        return 0.0
-    
-    # 使用中心差分计算二阶导数
-    # 二阶导数 = (f(x+h) - 2f(x) + f(x-h)) / h^2
-    h = 1  # 步长
-    f_plus_h = data[index + h]
-    f_minus_h = data[index - h]
-    f_x = data[index]
-    
-    second_derivative = (f_plus_h - 2 * f_x + f_minus_h) / (h * h)
-    return second_derivative
-
-def is_extreme_by_derivative(data, index, derivative_threshold=0.001):
-    """通过一阶导数检测是否为极值点"""
-    if index < 2 or index >= len(data) - 2:
-        return False, None
-    
-    # 计算当前点的一阶导数
-    current_derivative = calculate_first_derivative(data, index)
-    
-    # 计算前后点的一阶导数
-    prev_derivative = calculate_first_derivative(data, index - 1)
-    next_derivative = calculate_first_derivative(data, index + 1)
-    
-    # 检测极值点：
-    # 峰值：导数从正变负（从左到右，函数先增后减）
-    # 谷值：导数从负变正（从左到右，函数先减后增）
-    
-    # 检查是否为峰值（导数从正变负）
-    if (abs(prev_derivative) > derivative_threshold and 
-        abs(next_derivative) > derivative_threshold and
-        prev_derivative > derivative_threshold and 
-        next_derivative < -derivative_threshold):
-        return True, 'peak'
-    
-    # 检查是否为谷值（导数从负变正）
-    elif (abs(prev_derivative) > derivative_threshold and 
-          abs(next_derivative) > derivative_threshold and
-          prev_derivative < -derivative_threshold and 
-          next_derivative > derivative_threshold):
-        return True, 'trough'
-    
-    return False, None
-
-def is_extreme_in_time_window(timestamps, data, current_index, window_minutes=20, 
-                             derivative_threshold=0.001):
-    """在时间窗口内检测是否为极值点（使用一阶导数）"""
-    if len(timestamps) < 3:
-        return False, None
-    
-    current_timestamp = timestamps[current_index]
-    
-    # 计算时间窗口内的数据点
-    window_start_time = current_timestamp - timedelta(minutes=window_minutes)
-    window_end_time = current_timestamp + timedelta(minutes=window_minutes)
-    
-    # 找到时间窗口内的数据点索引
-    window_indices = []
-    for i, ts in enumerate(timestamps):
-        if window_start_time <= ts <= window_end_time:
-            window_indices.append(i)
-    
-    if len(window_indices) < 3:
-        return False, None
-    
-    # 在时间窗口内使用导数检测极值点
-    return is_extreme_by_derivative(data, current_index, derivative_threshold)
-
 def is_relative_extreme(extreme_type, current_value, current_timestamp, 
                        all_extremes, min_extreme_distance=0.1):
     """检查当前值是否相对于上一个极值点是真正的极值
@@ -155,9 +70,7 @@ def is_relative_extreme(extreme_type, current_value, current_timestamp,
 class RealTimeExtremeDetector:
     """实时极值检测器，每分钟分析当前极值"""
     
-    def __init__(self, window_minutes=20, derivative_threshold=0.0001, max_history=1000):
-        self.window_minutes = window_minutes
-        self.derivative_threshold = derivative_threshold
+    def __init__(self, max_history=1000):
         self.max_history = max_history
         
         # 使用deque来存储历史数据，自动限制大小
@@ -383,7 +296,7 @@ def simulate_realtime_analysis():
     print("每分钟分析一次当前MACD极值...")
     
     # 创建实时检测器
-    detector = RealTimeExtremeDetector(window_minutes=20, derivative_threshold=0.001)
+    detector = RealTimeExtremeDetector()
     
     # 生成模拟数据（每分钟一个数据点）
     start_time = datetime.now().replace(second=0, microsecond=0)

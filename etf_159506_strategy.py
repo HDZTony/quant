@@ -612,78 +612,104 @@ class ETF159506Strategy(Strategy):
         
         return False, None
     
-    def _is_relative_extreme(self, extreme_type, current_value, current_timestamp):
-        """检查当前值是否相对于历史极值点是真正的极值（基于数学原理和相对比较）"""
-        if extreme_type in ['price_peak', 'dif_peak']:
-            # 峰值：检查是否在数学和相对意义上都是真正的峰值
-            if extreme_type == 'price_peak':
-                peaks = self.price_peaks
-                troughs = self.price_troughs
-            else:  # dif_peak
-                peaks = self.dif_peaks
-                troughs = self.dif_troughs
-            
-            # 如果没有历史数据，直接返回True
-            if len(peaks) == 0 and len(troughs) == 0:
-                return True
-            
-            # 检查是否比最近的谷值更高（这是峰值的基本要求）
-            if len(troughs) > 0:
-                latest_trough = troughs[-1]
-                latest_trough_value = latest_trough[1]
-                if current_value <= latest_trough_value:
-                    return False
-            
-            # 检查是否比最近的峰值更高或足够接近（避免重复的微小峰值）
-            if len(peaks) > 0:
-                latest_peak = peaks[-1]
-                latest_peak_value = latest_peak[1]
-                
-                # 如果新峰值比最近峰值低太多，可能不是真正的峰值
-                if current_value < latest_peak_value * 0.98:  # 允许2%的误差
-                    return False
-                
-
-            
-            return True
-            
-        elif extreme_type in ['price_trough', 'dif_trough']:
-            # 谷值：检查是否在数学和相对意义上都是真正的谷值
-            if extreme_type == 'price_trough':
-                troughs = self.price_troughs
-                peaks = self.price_peaks
-            else:  # dif_trough
-                troughs = self.dif_troughs
-                peaks = self.dif_peaks
-            
-            # 如果没有历史数据，直接返回True
-            if len(peaks) == 0 and len(troughs) == 0:
-                return True
-            
-            # 检查是否比最近的峰值更低（这是谷值的基本要求）
-            if len(peaks) > 0:
-                latest_peak = peaks[-1]
-                latest_peak_value = latest_peak[1]
-                if current_value >= latest_peak_value:
-                    return False
-            
-            # 检查是否比最近的谷值更低或足够接近（避免重复的微小谷值）
-            if len(troughs) > 0:
-                latest_trough = troughs[-1]
-                latest_trough_value = latest_trough[1]
-                
-                # 如果新谷值比最近谷值高太多，可能不是真正的谷值
-                if current_value > latest_trough_value * 1.02:  # 允许2%的误差
-                    return False
-                
-
-            
-            return True
+    def _is_relative_extreme(self, extreme_type, current_value, current_timestamp, min_extreme_distance=0.1):
+        """检查当前值是否相对于上一个极值点是真正的极值
         
-        return False
+        规则：
+        1. 如果新极值与上一个不同类型极值差异太小，则略过当前极值
+        2. 如果新极值与上一个同类型极值，则保留绝对值更大的那个
+        """
+        # 根据极值类型确定对应的极值列表
+        if extreme_type in ['price_peak', 'dif_peak']:
+            extreme_type_short = 'peak'
+            if extreme_type == 'price_peak':
+                all_extremes = [(ts, price, 'peak') for ts, price, _ in self.price_peaks] + \
+                              [(ts, price, 'trough') for ts, price, _ in self.price_troughs]
+            else:  # dif_peak
+                all_extremes = [(ts, dif_val, 'peak') for ts, dif_val, _ in self.dif_peaks] + \
+                              [(ts, dif_val, 'trough') for ts, dif_val, _ in self.dif_troughs]
+        elif extreme_type in ['price_trough', 'dif_trough']:
+            extreme_type_short = 'trough'
+            if extreme_type == 'price_trough':
+                all_extremes = [(ts, price, 'peak') for ts, price, _ in self.price_peaks] + \
+                              [(ts, price, 'trough') for ts, price, _ in self.price_troughs]
+            else:  # dif_trough
+                all_extremes = [(ts, dif_val, 'peak') for ts, dif_val, _ in self.dif_peaks] + \
+                              [(ts, dif_val, 'trough') for ts, dif_val, _ in self.dif_troughs]
+        else:
+            return False, None
+        
+        # 按时间排序
+        all_extremes.sort(key=lambda x: x[0])
+        
+        # 如果没有历史数据，直接返回True
+        if len(all_extremes) == 0:
+            return True, 'keep'
+        
+        # 获取上一个极值点
+        last_extreme = all_extremes[-1]
+        last_extreme_type = last_extreme[2]  # 极值类型
+        last_extreme_value = last_extreme[1]  # 极值数值
+        
+        # 如果新极值与上一个极值类型不同
+        if extreme_type_short != last_extreme_type:
+            # 计算与上一个极值的绝对差异
+            diff_absolute = abs(current_value - last_extreme_value)
+            
+            # 如果差异太小，略过当前极值
+            if diff_absolute < min_extreme_distance:
+                return False, None
+            
+            # 差异足够大，保留新极值
+            return True, 'keep'
+        
+        # 如果新极值与上一个极值类型相同
+        else:
+            # 计算与上一个极值的绝对差异
+            diff_absolute = abs(current_value - last_extreme_value)
+            
+            # 如果差异太小，略过当前极值
+            if diff_absolute < min_extreme_distance:
+                return False, None
+            
+            # 根据极值类型决定保留策略
+            if extreme_type_short == 'peak':
+                # 峰值：保留更大的值
+                if current_value > last_extreme_value:
+                    return True, 'keep'  # 保留新的
+                else:
+                    return True, 'replace'  # 替换旧的
+            else:  # extreme_type_short == 'trough'
+                # 谷值：保留更小的值
+                if current_value < last_extreme_value:
+                    return True, 'keep'  # 保留新的
+                else:
+                    return True, 'replace'  # 替换旧的
+        
+        return False, None
+    
+    def _detect_extreme(self, data, current_index):
+        """检测极值点（基于前后点比较的简单方法）"""
+        if current_index < 1 or current_index >= len(data) - 1:
+            return False, None
+        
+        # 使用简单的极值检测逻辑：比较当前点与前后点的值
+        current_value = data[current_index]
+        prev_value = data[current_index - 1]
+        next_value = data[current_index + 1]
+        
+        # 检测峰值：当前值比前后值都大
+        if current_value > prev_value and current_value > next_value:
+            return True, 'peak'
+        
+        # 检测谷值：当前值比前后值都小
+        elif current_value < prev_value and current_value < next_value:
+            return True, 'trough'
+        
+        return False, None
     
     def detect_and_record_extremes_improved(self, bar: Bar):
-        """改进的极值点检测：基于时间窗口和曲率，自动删除同类型极值点"""
+        """改进的极值点检测：基于简单的前后点比较和相对极值检测"""
         if len(self.price_history) < 3:
             return
         
@@ -692,57 +718,74 @@ class ETF159506Strategy(Strategy):
         current_macd = self.macd_history[-1]
         
         # 检测价格极值点
-        price_extreme, price_type = self.is_extreme_in_time_window('price', len(self.price_history) - 1, self.extreme_detection_window)
+        price_extreme, price_type = self._detect_extreme(self.price_history, len(self.price_history) - 1)
         if price_extreme:
-            if price_type == 'peak':
-                if self._is_valid_extreme_point('price_peak', current_price, current_macd):
-                    # 如果上一个极值点也是峰值，删除上一个峰值
-                    if len(self.price_peaks) > 0:
+            # 使用新的相对极值检测逻辑
+            is_extreme, action = self._is_relative_extreme(f'price_{price_type}', current_price, current_timestamp)
+            
+            if is_extreme:
+                if action == 'replace':
+                    # 替换上一个极值点
+                    if price_type == 'peak' and len(self.price_peaks) > 0:
                         removed_peak = self.price_peaks.pop()
-                        self._log.debug(f"删除旧价格峰值: 时间{removed_peak[0]}, 价格{removed_peak[1]:.4f}")
-                    
-                    self.price_peaks.append((current_timestamp, current_price, current_macd))
-                    self._log.debug(f"添加新价格峰值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
-                    self._cleanup_extreme_points('price_peaks')
-                    
-            elif price_type == 'trough':
-                if self._is_valid_extreme_point('price_trough', current_price, current_macd):
-                    # 如果上一个极值点也是谷值，删除上一个谷值
-                    if len(self.price_troughs) > 0:
+                        self._log.debug(f"替换价格峰值: 时间{removed_peak[0]}, 价格{removed_peak[1]:.4f} -> 时间{current_timestamp}, 价格{current_price:.4f}")
+                    elif price_type == 'trough' and len(self.price_troughs) > 0:
                         removed_trough = self.price_troughs.pop()
-                        self._log.debug(f"删除旧价格谷值: 时间{removed_trough[0]}, 价格{removed_trough[1]:.4f}")
-                    
+                        self._log.debug(f"替换价格谷值: 时间{removed_trough[0]}, 价格{removed_trough[1]:.4f} -> 时间{current_timestamp}, 价格{current_price:.4f}")
+                
+                # 添加新极值点
+                if price_type == 'peak':
+                    self.price_peaks.append((current_timestamp, current_price, current_macd))
+                    self._log.debug(f"检测到新价格峰值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
+                else:  # price_type == 'trough'
                     self.price_troughs.append((current_timestamp, current_price, current_macd))
-                    self._log.debug(f"添加新价格谷值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
-                    self._cleanup_extreme_points('price_troughs')
+                    self._log.debug(f"检测到新价格谷值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
+                
+                self._cleanup_extreme_points('price_peaks' if price_type == 'peak' else 'price_troughs')
+            else:
+                self._log.debug(f"略过价格{price_type}: 时间{current_timestamp}, 价格{current_price:.4f} (差异太小)")
         
         # 检测MACD极值点
-        macd_extreme, macd_type = self.is_extreme_in_time_window('macd', len(self.macd_history) - 1, self.extreme_detection_window)
+        macd_extreme, macd_type = self._detect_extreme(self.macd_history, len(self.macd_history) - 1)
         if macd_extreme:
-            if macd_type == 'peak':
-                if self._is_valid_extreme_point('dif_peak', current_macd, current_price):
-                    # 如果上一个极值点也是峰值，删除上一个峰值
-                    if len(self.dif_peaks) > 0:
+            # 使用新的相对极值检测逻辑
+            is_extreme, action = self._is_relative_extreme(f'dif_{macd_type}', current_macd, current_timestamp)
+            
+            if is_extreme:
+                if action == 'replace':
+                    # 替换上一个极值点
+                    if macd_type == 'peak' and len(self.dif_peaks) > 0:
                         removed_peak = self.dif_peaks.pop()
-                        self._log.debug(f"删除旧DIF峰值: 时间{removed_peak[0]}, DIF{removed_peak[1]:.6f}")
-                    
-                    self.dif_peaks.append((current_timestamp, current_macd, current_price))
-                    self._log.debug(f"添加新DIF峰值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
-                    self._cleanup_extreme_points('dif_peaks')
-                    self.check_divergence(bar)
-                    
-            elif macd_type == 'trough':
-                if self._is_valid_extreme_point('dif_trough', current_macd, current_price):
-                    # 如果上一个极值点也是谷值，删除上一个谷值
-                    if len(self.dif_troughs) > 0:
+                        self._log.debug(f"替换DIF峰值: 时间{removed_peak[0]}, DIF{removed_peak[1]:.6f} -> 时间{current_timestamp}, DIF{current_macd:.6f}")
+                    elif macd_type == 'trough' and len(self.dif_troughs) > 0:
                         removed_trough = self.dif_troughs.pop()
-                        self._log.debug(f"删除旧DIF谷值: 时间{removed_trough[0]}, DIF{removed_trough[1]:.6f}")
-                    
+                        self._log.debug(f"替换DIF谷值: 时间{removed_trough[0]}, DIF{removed_trough[1]:.6f} -> 时间{current_timestamp}, DIF{current_macd:.6f}")
+                
+                # 添加新极值点
+                if macd_type == 'peak':
+                    self.dif_peaks.append((current_timestamp, current_macd, current_price))
+                    self._log.debug(f"检测到新DIF峰值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
+                else:  # macd_type == 'trough'
                     self.dif_troughs.append((current_timestamp, current_macd, current_price))
-                    self._log.debug(f"添加新DIF谷值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
-                    self._cleanup_extreme_points('dif_troughs')
-                    self.check_divergence(bar)
+                    self._log.debug(f"检测到新DIF谷值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
+                
+                self._cleanup_extreme_points('dif_peaks' if macd_type == 'peak' else 'dif_troughs')
+                self.check_divergence(bar)
+            else:
+                self._log.debug(f"略过DIF{macd_type}: 时间{current_timestamp}, DIF{current_macd:.6f} (差异太小)")
     
+    def _add_extreme_point(self, extreme_type, timestamp, value, related_value):
+        """添加极值点到相应的列表"""
+        if extreme_type.startswith('price_'):
+            if extreme_type == 'price_peak':
+                self.price_peaks.append((timestamp, value, related_value))
+            else:  # price_trough
+                self.price_troughs.append((timestamp, value, related_value))
+        elif extreme_type.startswith('dif_'):
+            if extreme_type == 'dif_peak':
+                self.dif_peaks.append((timestamp, value, related_value))
+            else:  # dif_trough
+                self.dif_troughs.append((timestamp, value, related_value))
     
     def _is_valid_extreme_point(self, extreme_type: str, value: float, related_value: float) -> bool:
         """验证极值点是否有效"""
