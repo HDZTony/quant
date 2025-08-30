@@ -350,12 +350,22 @@ class RealTimeExtremeDetector:
         plt.subplot(2, 1, 2)
         plt.plot(timestamps, macd_data, 'purple', label='MACD (DIF)', linewidth=1, alpha=0.7)
         
-        # 标记极值点
+        # 标记极值点并标注DIF值
         for ts, macd in self.macd_peaks:
             plt.scatter(ts, macd, color='red', s=80, marker='^', label='MACD峰值' if ts == self.macd_peaks[0][0] else "", zorder=5)
+            # 在峰值点上方标注DIF值
+            plt.annotate(f'{macd:.2f}', (ts, macd), 
+                        xytext=(0, 10), textcoords='offset points',
+                        ha='center', va='bottom', fontsize=8,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='red', alpha=0.7))
         
         for ts, macd in self.macd_troughs:
             plt.scatter(ts, macd, color='green', s=80, marker='v', label='MACD谷值' if ts == self.macd_troughs[0][0] else "", zorder=5)
+            # 在谷值点下方标注DIF值
+            plt.annotate(f'{macd:.2f}', (ts, macd), 
+                        xytext=(0, -15), textcoords='offset points',
+                        ha='center', va='top', fontsize=8,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='green', alpha=0.7))
         
         plt.title('实时MACD极值点检测', fontsize=14)
         plt.xlabel('时间')
