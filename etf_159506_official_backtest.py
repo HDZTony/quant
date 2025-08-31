@@ -74,6 +74,10 @@ class ETF159506OfficialBacktest:
         
         # 交易信号存储
         self.trade_signals = []
+        self.technical_signals = []  # 添加技术指标信号列表
+        
+        # 极值点数据存储
+        self.extremes_data = {}
         
         # 初始化 catalog
         self._init_catalog()
@@ -226,6 +230,20 @@ class ETF159506OfficialBacktest:
                                     self.trade_signals.extend(strategy._saved_trade_signals)
                                 else:
                                     logger.warning(f"策略 {strategy.id} 没有保存的交易信号")
+                                
+                                # 从策略实例的 _saved_technical_signals 获取技术指标信号
+                                if hasattr(strategy, '_saved_technical_signals') and strategy._saved_technical_signals:
+                                    logger.info(f"从策略 {strategy.id} 的保存信号中获取到 {len(strategy._saved_technical_signals)} 个技术指标信号")
+                                    self.technical_signals.extend(strategy._saved_technical_signals)
+                                else:
+                                    logger.warning(f"策略 {strategy.id} 没有保存的技术指标信号")
+                                
+                                # 获取极值点数据
+                                if hasattr(strategy, '_saved_extremes') and strategy._saved_extremes:
+                                    logger.info(f"从策略 {strategy.id} 的保存极值点中获取到极值点数据")
+                                    self.extremes_data = strategy._saved_extremes
+                                else:
+                                    logger.warning(f"策略 {strategy.id} 没有保存的极值点数据")
                         else:
                             logger.warning("引擎没有trader属性")
                             
@@ -235,31 +253,52 @@ class ETF159506OfficialBacktest:
                     logger.warning(f"详细错误: {traceback.format_exc()}")
             
             
-            logger.info(f"最终收集到 {len(self.trade_signals)} 个交易信号")
+            logger.info(f"最终收集到 {len(self.trade_signals)} 个交易信号, {len(self.technical_signals)} 个技术指标信号")
             
             # 添加详细的信号统计信息
             if self.trade_signals:
                 buy_count = sum(1 for s in self.trade_signals if s.get('side') == 'BUY')
                 sell_count = sum(1 for s in self.trade_signals if s.get('side') == 'SELL')
-                hold_count = sum(1 for s in self.trade_signals if s.get('side') == 'HOLD')
-                watch_count = sum(1 for s in self.trade_signals if s.get('side') == 'WATCH')
                 
                 logger.info("=" * 60)
                 logger.info("交易信号详细统计")
                 logger.info("=" * 60)
-                logger.info(f"买入信号: {buy_count} 个")
-                logger.info(f"卖出信号: {sell_count} 个")
-                logger.info(f"持有信号: {hold_count} 个")
-                logger.info(f"观望信号: {watch_count} 个")
+                logger.info(f"买入交易: {buy_count} 个")
+                logger.info(f"卖出交易: {sell_count} 个")
                 logger.info(f"总计: {len(self.trade_signals)} 个")
                 
-                # 显示前几个信号的详细信息
+                # 显示前几个交易信号的详细信息
                 logger.info("\n前5个交易信号详情:")
                 for i, signal in enumerate(self.trade_signals[:5]):
-                    logger.info(f"信号 {i+1}: {signal}")
+                    logger.info(f"交易信号 {i+1}: {signal}")
                 
                 if len(self.trade_signals) > 5:
-                    logger.info(f"... 还有 {len(self.trade_signals) - 5} 个信号")
+                    logger.info(f"... 还有 {len(self.trade_signals) - 5} 个交易信号")
+                logger.info("=" * 60)
+            
+            # 添加技术指标信号统计信息
+            if self.technical_signals:
+                golden_cross_count = sum(1 for s in self.technical_signals if s.get('signal_type') == 'golden_cross')
+                death_cross_count = sum(1 for s in self.technical_signals if s.get('signal_type') == 'death_cross')
+                top_divergence_count = sum(1 for s in self.technical_signals if s.get('signal_type') == 'top_divergence')
+                bottom_divergence_count = sum(1 for s in self.technical_signals if s.get('signal_type') == 'bottom_divergence')
+                
+                logger.info("=" * 60)
+                logger.info("技术指标信号详细统计")
+                logger.info("=" * 60)
+                logger.info(f"金叉信号: {golden_cross_count} 个")
+                logger.info(f"死叉信号: {death_cross_count} 个")
+                logger.info(f"顶背离信号: {top_divergence_count} 个")
+                logger.info(f"底背离信号: {bottom_divergence_count} 个")
+                logger.info(f"总计: {len(self.technical_signals)} 个")
+                
+                # 显示前几个技术信号的详细信息
+                logger.info("\n前5个技术指标信号详情:")
+                for i, signal in enumerate(self.technical_signals[:5]):
+                    logger.info(f"技术信号 {i+1}: {signal}")
+                
+                if len(self.technical_signals) > 5:
+                    logger.info(f"... 还有 {len(self.technical_signals) - 5} 个技术指标信号")
                 logger.info("=" * 60)
             
         except Exception as e:
@@ -280,10 +319,36 @@ class ETF159506OfficialBacktest:
                 save_path=image_filename,  # 保存图片文件
                 auto_refresh=False,  # 不自动刷新
                 target_date=start_date,
-                trade_signals=self.trade_signals
+                trade_signals=self.trade_signals,
+                technical_signals=self.technical_signals,
+                extremes_data=self.extremes_data
             )
             
             logger.info("回测结果K线图已显示")
+            
+            # 显示专门的买卖点图表
+            trade_points_filename = f"etf_159506_trade_points_{start_date.strftime('%Y%m%d')}.png"
+            catalog_loader.create_trade_points_chart(
+                save_path=trade_points_filename,  # 保存图片文件
+                target_date=start_date,
+                trade_signals=self.trade_signals
+            )
+            
+            logger.info("买卖点分析图表已显示")
+            
+            # 显示专门的极值点图表
+            extremes_filename = f"etf_159506_extremes_{start_date.strftime('%Y%m%d')}.png"
+            catalog_loader.create_extremes_chart(
+                save_path=extremes_filename,  # 保存图片文件
+                target_date=start_date,
+                extremes_data=self.extremes_data
+            )
+            
+            logger.info("极值点分析图表已显示")
+            
+            # 等待用户查看图表
+            import matplotlib.pyplot as plt
+            plt.show(block=True)
             
         except Exception as e:
             logger.error(f"显示回测图表失败: {e}")

@@ -83,8 +83,9 @@ class ETF159506Strategy(Strategy):
         self.dif_troughs = deque(maxlen=config.max_extremes)  # 存储DIF谷值点 (timestamp, dif_value, price_value)
         self.divergence_lookback_peaks = 3  # 回看过去几个极值点来检测背离
         
-        # 按时间排序的所有极值点列表（用于比较上一个极值点）
-        self.all_extremes = []
+        # 分别存储价格和MACD的极值点历史（用于相对极值检测）
+        self.price_extremes_history = []  # 存储价格极值点历史
+        self.macd_extremes_history = []    # 存储MACD极值点历史
         
         # 技术指标信号累积系统
         self.technical_signal = 0  # 技术指标信号累积值，+100买入，-100卖出
@@ -109,6 +110,8 @@ class ETF159506Strategy(Strategy):
         # 交易信号记录
         self.trade_signals = []
         
+        # 技术指标信号记录（金叉、死叉、背离等）
+        self.technical_signals = []
 
     def on_start(self):
         """策略启动时调用"""
@@ -140,6 +143,25 @@ class ETF159506Strategy(Strategy):
                 self._saved_trade_signals = []
             self._saved_trade_signals.extend(self.trade_signals)
             self._log.info(f"策略停止时保存了 {len(self.trade_signals)} 个交易信号")
+        
+        # 保存技术指标信号到策略实例变量中，供回测系统获取
+        if hasattr(self, 'technical_signals') and self.technical_signals:
+            if not hasattr(self, '_saved_technical_signals'):
+                self._saved_technical_signals = []
+            self._saved_technical_signals.extend(self.technical_signals)
+            self._log.info(f"策略停止时保存了 {len(self.technical_signals)} 个技术指标信号")
+        
+        # 保存极值点数据到策略实例变量中，供回测系统获取
+        if not hasattr(self, '_saved_extremes'):
+            self._saved_extremes = {
+                'price_peaks': list(self.price_peaks),
+                'price_troughs': list(self.price_troughs),
+                'dif_peaks': list(self.dif_peaks),
+                'dif_troughs': list(self.dif_troughs),
+                'price_extremes_history': self.price_extremes_history.copy(),
+                'macd_extremes_history': self.macd_extremes_history.copy()
+            }
+            self._log.info(f"策略停止时保存了 {len(self.price_peaks)} 个价格峰值, {len(self.price_troughs)} 个价格谷值, {len(self.dif_peaks)} 个DIF峰值, {len(self.dif_troughs)} 个DIF谷值")
         
         self._log.info("ETF159506 MACD金叉死叉策略已停止")
 
@@ -327,6 +349,9 @@ class ETF159506Strategy(Strategy):
         current_signal = self.signal_history[-1]
         previous_signal = self.signal_history[-2]
         
+        # 计算当前histogram值
+        current_histogram = current_macd - current_signal
+        
         # 检测金叉：MACD线从下方向上穿越信号线
         golden_cross = (previous_macd < previous_signal and current_macd > current_signal)
         
@@ -352,37 +377,18 @@ class ETF159506Strategy(Strategy):
             self.technical_signal += 30
             self._log.info(f"金叉买入信号累积: 当前信号值={self.technical_signal}")
             
-            # 检查当前持仓状态
-            current_position = self.get_current_position()
-            has_position = current_position is not None
-            
-            if has_position:
-                # 已有持仓，记录"持有"信号
-                current_quantity = current_position.quantity.as_double()
-                hold_signal = {
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'price': bar.close.as_double(),
-                    'side': 'HOLD',
-                    'quantity': current_quantity,
-                    'order_id': 'signal_detected',
-                    'signal_type': 'golden_cross_hold',
-                    'signal_value': self.technical_signal
-                }
-                self.trade_signals.append(hold_signal)
-                self._log.info(f"记录持有信号（金叉但已有持仓）: {hold_signal}")
-            else:
-                # 没有持仓，记录买入信号
-                buy_signal = {
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'price': bar.close.as_double(),
-                    'side': 'BUY',
-                    'quantity': 0,
-                    'order_id': 'signal_detected',
-                    'signal_type': 'golden_cross',
-                    'signal_value': self.technical_signal
-                }
-                self.trade_signals.append(buy_signal)
-                self._log.info(f"记录买入信号时间: {buy_signal}")
+            # 记录技术指标信号（金叉）
+            technical_signal = {
+                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                'price': bar.close.as_double(),
+                'signal_type': 'golden_cross',
+                'signal_value': self.technical_signal,
+                'macd_value': current_macd,
+                'signal_value_macd': current_signal,
+                'histogram': current_histogram
+            }
+            self.technical_signals.append(technical_signal)
+            self._log.info(f"记录金叉技术信号: {technical_signal}")
             
             # 检查是否达到买入阈值
             if self.technical_signal >= self.buy_threshold:
@@ -404,37 +410,18 @@ class ETF159506Strategy(Strategy):
             self.technical_signal -= 30
             self._log.info(f"死叉卖出信号累积: 当前信号值={self.technical_signal}")
             
-            # 检查当前持仓状态
-            current_position = self.get_current_position()
-            has_position = current_position is not None
-            
-            if has_position:
-                # 有持仓，记录卖出信号
-                current_quantity = current_position.quantity.as_double()
-                sell_signal = {
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'price': bar.close.as_double(),
-                    'side': 'SELL',
-                    'quantity': current_quantity,
-                    'order_id': 'signal_detected',
-                    'signal_type': 'death_cross',
-                    'signal_value': self.technical_signal
-                }
-                self.trade_signals.append(sell_signal)
-                self._log.info(f"记录卖出信号时间: {sell_signal}")
-            else:
-                # 没有持仓，记录"观望"信号
-                watch_signal = {
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'price': bar.close.as_double(),
-                    'side': 'WATCH',
-                    'quantity': 0,
-                    'order_id': 'signal_detected',
-                    'signal_type': 'death_cross_watch',
-                    'signal_value': self.technical_signal
-                }
-                self.trade_signals.append(watch_signal)
-                self._log.info(f"记录观望信号（死叉但无持仓）: {watch_signal}")
+            # 记录技术指标信号（死叉）
+            technical_signal = {
+                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                'price': bar.close.as_double(),
+                'signal_type': 'death_cross',
+                'signal_value': self.technical_signal,
+                'macd_value': current_macd,
+                'signal_value_macd': current_signal,
+                'histogram': current_histogram
+            }
+            self.technical_signals.append(technical_signal)
+            self._log.info(f"记录死叉技术信号: {technical_signal}")
             
             # 检查是否达到卖出阈值
             if self.technical_signal <= self.sell_threshold:
@@ -522,19 +509,34 @@ class ETF159506Strategy(Strategy):
     
     # 移除不再使用的时间窗口极值检测方法
     
-    def _is_relative_extreme(self, extreme_type, current_value, current_timestamp, min_extreme_distance=0.1):
+
+    
+    def _is_relative_extreme(self, extreme_type, current_value, current_timestamp, data_type='price', min_extreme_distance=0.1):
         """检查当前值是否相对于上一个极值点是真正的极值
         
         规则：
         1. 如果新极值与上一个不同类型极值差异太小，则略过当前极值
         2. 如果新极值与上一个同类型极值，则保留绝对值更大的那个
+        
+        Args:
+            extreme_type: 极值类型 ('peak' 或 'trough')
+            current_value: 当前值
+            current_timestamp: 当前时间戳
+            data_type: 数据类型 ('price' 或 'macd')
+            min_extreme_distance: 最小极值距离
         """
+        # 根据数据类型选择对应的历史记录
+        if data_type == 'price':
+            history = self.price_extremes_history
+        else:  # data_type == 'macd'
+            history = self.macd_extremes_history
+        
         # 如果没有历史数据，直接返回True
-        if len(self.all_extremes) == 0:
+        if len(history) == 0:
             return True, 'keep'
         
         # 获取上一个极值点
-        last_extreme = self.all_extremes[-1]
+        last_extreme = history[-1]
         last_extreme_type = last_extreme[2]  # 极值类型
         last_extreme_value = last_extreme[1]  # 极值数值
         
@@ -608,7 +610,7 @@ class ETF159506Strategy(Strategy):
         price_extreme, price_type = self._detect_extreme(self.price_history, len(self.price_history) - 1)
         if price_extreme:
             # 使用新的相对极值检测逻辑
-            is_extreme, action = self._is_relative_extreme(price_type, current_price, current_timestamp)
+            is_extreme, action = self._is_relative_extreme(price_type, current_price, current_timestamp, 'price')
             
             if is_extreme:
                 # 处理替换逻辑
@@ -616,15 +618,15 @@ class ETF159506Strategy(Strategy):
                     # 替换上一个极值点
                     if price_type == 'peak' and len(self.price_peaks) > 0:
                         removed_peak = self.price_peaks.pop()
-                        # 同时从all_extremes中移除
-                        if len(self.all_extremes) > 0:
-                            self.all_extremes.pop()
+                        # 同时从价格极值点历史中移除
+                        if len(self.price_extremes_history) > 0:
+                            self.price_extremes_history.pop()
                         self._log.debug(f"替换价格峰值: 时间{removed_peak[0]}, 价格{removed_peak[1]:.4f} -> 时间{current_timestamp}, 价格{current_price:.4f}")
                     elif price_type == 'trough' and len(self.price_troughs) > 0:
                         removed_trough = self.price_troughs.pop()
-                        # 同时从all_extremes中移除
-                        if len(self.all_extremes) > 0:
-                            self.all_extremes.pop()
+                        # 同时从价格极值点历史中移除
+                        if len(self.price_extremes_history) > 0:
+                            self.price_extremes_history.pop()
                         self._log.debug(f"替换价格谷值: 时间{removed_trough[0]}, 价格{removed_trough[1]:.4f} -> 时间{current_timestamp}, 价格{current_price:.4f}")
                 
                 elif action == 'keep':
@@ -634,13 +636,13 @@ class ETF159506Strategy(Strategy):
                 # 无论是replace还是keep，都需要添加新极值点
                 if price_type == 'peak':
                     self.price_peaks.append((current_timestamp, current_price, current_macd))
-                    # 同时更新all_extremes列表
-                    self.all_extremes.append((current_timestamp, current_price, 'peak'))
+                    # 同时更新价格极值点历史
+                    self.price_extremes_history.append((current_timestamp, current_price, 'peak'))
                     self._log.debug(f"检测到新价格峰值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
                 else:  # price_type == 'trough'
                     self.price_troughs.append((current_timestamp, current_price, current_macd))
-                    # 同时更新all_extremes列表
-                    self.all_extremes.append((current_timestamp, current_price, 'trough'))
+                    # 同时更新价格极值点历史
+                    self.price_extremes_history.append((current_timestamp, current_price, 'trough'))
                     self._log.debug(f"检测到新价格谷值: 时间{current_timestamp}, 价格{current_price:.4f}, DIF{current_macd:.6f}")
                 
                 # 简化后不再需要清理极值点
@@ -651,22 +653,22 @@ class ETF159506Strategy(Strategy):
         macd_extreme, macd_type = self._detect_extreme(self.macd_history, len(self.macd_history) - 1)
         if macd_extreme:
             # 使用新的相对极值检测逻辑
-            is_extreme, action = self._is_relative_extreme(macd_type, current_macd, current_timestamp)
+            is_extreme, action = self._is_relative_extreme(macd_type, current_macd, current_timestamp, 'macd')
             
             if is_extreme:
                 if action == 'replace':
                     # 替换上一个极值点
                     if macd_type == 'peak' and len(self.dif_peaks) > 0:
                         removed_peak = self.dif_peaks.pop()
-                        # 同时从all_extremes中移除
-                        if len(self.all_extremes) > 0:
-                            self.all_extremes.pop()
+                        # 同时从MACD极值点历史中移除
+                        if len(self.macd_extremes_history) > 0:
+                            self.macd_extremes_history.pop()
                         self._log.debug(f"替换DIF峰值: 时间{removed_peak[0]}, DIF{removed_peak[1]:.6f} -> 时间{current_timestamp}, DIF{current_macd:.6f}")
                     elif macd_type == 'trough' and len(self.dif_troughs) > 0:
                         removed_trough = self.dif_troughs.pop()
-                        # 同时从all_extremes中移除
-                        if len(self.all_extremes) > 0:
-                            self.all_extremes.pop()
+                        # 同时从MACD极值点历史中移除
+                        if len(self.macd_extremes_history) > 0:
+                            self.macd_extremes_history.pop()
                         self._log.debug(f"替换DIF谷值: 时间{removed_trough[0]}, DIF{removed_trough[1]:.6f} -> 时间{current_timestamp}, DIF{current_macd:.6f}")
                 
                 elif action == 'keep':
@@ -676,13 +678,13 @@ class ETF159506Strategy(Strategy):
                 # 添加新极值点
                 if macd_type == 'peak':
                     self.dif_peaks.append((current_timestamp, current_macd, current_price))
-                    # 同时更新all_extremes列表
-                    self.all_extremes.append((current_timestamp, current_macd, 'peak'))
+                    # 同时更新MACD极值点历史
+                    self.macd_extremes_history.append((current_timestamp, current_macd, 'peak'))
                     self._log.debug(f"检测到新DIF峰值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
                 else:  # macd_type == 'trough'
                     self.dif_troughs.append((current_timestamp, current_macd, current_price))
-                    # 同时更新all_extremes列表
-                    self.all_extremes.append((current_timestamp, current_macd, 'trough'))
+                    # 同时更新MACD极值点历史
+                    self.macd_extremes_history.append((current_timestamp, current_macd, 'trough'))
                     self._log.debug(f"检测到新DIF谷值: 时间{current_timestamp}, DIF{current_macd:.6f}, 价格{current_price:.4f}")
                 
                 # 无论是replace还是keep，都需要添加新极值点
@@ -700,18 +702,16 @@ class ETF159506Strategy(Strategy):
         self.technical_signal -= 30
         self._log.info(f"顶背离信号累积: 当前信号值={self.technical_signal}")
         
-        # 记录顶背离信号
+        # 记录顶背离技术信号
         divergence_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
             'price': bar.close.as_double(),
-            'side': 'SELL',
-            'quantity': 0,
-            'order_id': 'divergence_signal',
             'signal_type': 'top_divergence',
             'divergence_type': 'bearish',
             'signal_value': self.technical_signal
         }
-        self.trade_signals.append(divergence_signal)
+        self.technical_signals.append(divergence_signal)
+        self._log.info(f"记录顶背离技术信号: {divergence_signal}")
         
         # 检查是否达到卖出阈值
         if self.technical_signal <= self.sell_threshold:
@@ -728,18 +728,16 @@ class ETF159506Strategy(Strategy):
         self.technical_signal += 30
         self._log.info(f"底背离信号累积: 当前信号值={self.technical_signal}")
         
-        # 记录底背离信号
+        # 记录底背离技术信号
         divergence_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
             'price': bar.close.as_double(),
-            'side': 'BUY',
-            'quantity': 0,
-            'order_id': 'divergence_signal',
             'signal_type': 'bottom_divergence',
             'divergence_type': 'bullish',
             'signal_value': self.technical_signal
         }
-        self.trade_signals.append(divergence_signal)
+        self.technical_signals.append(divergence_signal)
+        self._log.info(f"记录底背离技术信号: {divergence_signal}")
         
         # 检查是否达到买入阈值
         if self.technical_signal >= self.buy_threshold:
@@ -784,14 +782,19 @@ class ETF159506Strategy(Strategy):
         )
         self.submit_order(order)
         
-        # 更新最近的买入信号记录
-        for signal in reversed(self.trade_signals):
-            if signal.get('signal_type') == 'golden_cross' and signal.get('side') == 'BUY':
-                signal['quantity'] = trade_quantity.as_double()
-                signal['order_id'] = str(order.client_order_id)
-                break
+        # 记录实际交易信号
+        trade_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'BUY',
+            'quantity': trade_quantity.as_double(),
+            'order_id': str(order.client_order_id),
+            'signal_type': 'executed_buy',
+            'signal_value': self.technical_signal
+        }
+        self.trade_signals.append(trade_signal)
         
-        self._log.info(f"金叉买入信号: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
     
     def execute_sell_signal(self, bar: Bar):
         """执行卖出信号"""
@@ -801,16 +804,21 @@ class ETF159506Strategy(Strategy):
             self._log.info("没有持仓，跳过卖出信号")
             return
         
-        # 更新最近的卖出信号记录
-        for signal in reversed(self.trade_signals):
-            if signal.get('signal_type') == 'death_cross' and signal.get('side') == 'SELL':
-                signal['quantity'] = current_position.quantity.as_double()
-                signal['order_id'] = 'close_position'
-                break
+        # 记录实际交易信号
+        trade_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'SELL',
+            'quantity': current_position.quantity.as_double(),
+            'order_id': 'close_position',
+            'signal_type': 'executed_sell',
+            'signal_value': self.technical_signal
+        }
+        self.trade_signals.append(trade_signal)
         
         # 执行平仓操作
         self.close_position(current_position)
-        self._log.info(f"死叉卖出信号: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
+        self._log.info(f"执行卖出交易: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
     
     def execute_divergence_buy_signal(self, bar: Bar):
         """执行背离买入信号"""
@@ -846,14 +854,19 @@ class ETF159506Strategy(Strategy):
         )
         self.submit_order(order)
         
-        # 更新最近的背离买入信号记录
-        for signal in reversed(self.trade_signals):
-            if signal.get('signal_type') == 'bottom_divergence' and signal.get('side') == 'BUY':
-                signal['quantity'] = trade_quantity.as_double()
-                signal['order_id'] = str(order.client_order_id)
-                break
+        # 记录实际交易信号
+        trade_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'BUY',
+            'quantity': trade_quantity.as_double(),
+            'order_id': str(order.client_order_id),
+            'signal_type': 'executed_divergence_buy',
+            'signal_value': self.technical_signal
+        }
+        self.trade_signals.append(trade_signal)
         
-        self._log.info(f"背离买入信号: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行背离买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
     
     def execute_divergence_sell_signal(self, bar: Bar):
         """执行背离卖出信号"""
@@ -863,16 +876,21 @@ class ETF159506Strategy(Strategy):
             self._log.info("没有持仓，跳过背离卖出信号")
             return
         
-        # 更新最近的背离卖出信号记录
-        for signal in reversed(self.trade_signals):
-            if signal.get('signal_type') == 'top_divergence' and signal.get('side') == 'SELL':
-                signal['quantity'] = current_position.quantity.as_double()
-                signal['order_id'] = 'close_position'
-                break
+        # 记录实际交易信号
+        trade_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'SELL',
+            'quantity': current_position.quantity.as_double(),
+            'order_id': 'close_position',
+            'signal_type': 'executed_divergence_sell',
+            'signal_value': self.technical_signal
+        }
+        self.trade_signals.append(trade_signal)
         
         # 执行平仓操作
         self.close_position(current_position)
-        self._log.info(f"背离卖出信号: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
+        self._log.info(f"执行背离卖出交易: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""

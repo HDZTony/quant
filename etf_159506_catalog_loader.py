@@ -494,14 +494,425 @@ class ETF159506RedisKlineGenerator:
         """从catalog文件获取今日数据（保持向后兼容）"""
         return self._get_data_from_catalog(datetime.now().date())
     
-    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None, trade_signals: List[Dict] = None):
+    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
         """创建实时K线图"""
         if auto_refresh:
-            self._start_realtime_chart(save_path, target_date, trade_signals)
+            self._start_realtime_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
         else:
-            self._plot_kline_chart(save_path, target_date, trade_signals)
+            self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
     
-    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
+    def create_trade_points_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
+        """创建专门的买卖点图表"""
+        try:
+            # 获取数据
+            kline_data = self.get_today_kline_data(target_date)
+            
+            if not kline_data:
+                logger.warning("没有数据可绘制")
+                return
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(kline_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # 检查是否需要时区转换
+            if df['timestamp'].dt.tz is None:
+                # 假设是UTC时间，转换为北京时间
+                import pytz
+                utc_tz = pytz.UTC
+                beijing_tz = pytz.timezone('Asia/Shanghai')
+                
+                # 添加UTC时区信息
+                df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                # 转换为北京时间
+                df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                logger.info("已将UTC时间转换为北京时间")
+            
+            df = df.sort_values('timestamp')
+            
+            # 检查数据时间范围
+            start_time = df['timestamp'].min()
+            end_time = df['timestamp'].max()
+            data_date = start_time.date()
+            logger.info(f"数据时间范围: {start_time} 到 {end_time}")
+            logger.info(f"数据条数: {len(df)}")
+            
+            # 确定图表标题
+            if target_date:
+                chart_title = f'159506 ETF {target_date} 买卖点分析 (北京时间)'
+            else:
+                chart_title = f'159506 ETF {data_date} 买卖点分析 (北京时间)'
+            
+            # 过滤交易时间内的数据，正确处理午休时间
+            from datetime import time as datetime_time
+            morning_start = datetime_time(9, 30)
+            morning_end = datetime_time(11, 30)
+            afternoon_start = datetime_time(13, 0)
+            afternoon_end = datetime_time(15, 0)
+            
+            # 分别获取上午和下午的数据
+            morning_data = df[
+                (df['timestamp'].dt.time >= morning_start) & 
+                (df['timestamp'].dt.time <= morning_end)
+            ]
+            
+            afternoon_data = df[
+                (df['timestamp'].dt.time >= afternoon_start) & 
+                (df['timestamp'].dt.time <= afternoon_end)
+            ]
+            
+            # 合并上午和下午数据
+            trading_data = pd.concat([morning_data, afternoon_data])
+            
+            if len(trading_data) == 0:
+                logger.warning("没有交易时间内的数据可绘制")
+                return
+            
+            logger.info(f"上午数据: {len(morning_data)} 条")
+            logger.info(f"下午数据: {len(afternoon_data)} 条")
+            logger.info(f"总交易数据: {len(trading_data)} 条")
+            
+            # 使用交易数据的时间作为索引
+            trading_data = trading_data.set_index('timestamp')
+            
+            # 确保索引为升序、唯一、无NaN
+            complete_df = trading_data.copy()
+            complete_df = complete_df.sort_index()
+            complete_df = complete_df[~complete_df.index.duplicated(keep='first')]
+            complete_df = complete_df[complete_df.index.notnull()]
+
+            # 创建三联图，专门用于买卖点分析
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(20, 24), height_ratios=[2, 1, 1])
+
+            # 创建时间轴映射，保持时间连续性但保留原始时间信息
+            def create_time_mapping(df):
+                """创建时间轴映射，保持图表连续性"""
+                new_times = []
+                time_mapping = {}
+                original_time_mapping = {}  # 保存原始时间到映射时间的对应关系
+                
+                for idx in df.index:
+                    current_time = idx.time()
+                    
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        new_time = idx
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
+                        new_time = idx - timedelta(hours=1, minutes=30)
+                    else:
+                        # 午休时间的数据跳过
+                        continue
+                    
+                    new_times.append(new_time)
+                    time_mapping[idx] = new_time
+                    original_time_mapping[new_time] = idx  # 反向映射
+                
+                return pd.DatetimeIndex(new_times), time_mapping, original_time_mapping
+            
+            # 创建时间映射
+            new_index, time_mapping, original_time_mapping = create_time_mapping(complete_df)
+            
+            # 重新索引数据
+            mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
+            mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
+            
+            # 设置x轴范围
+            x_min = new_index.min()
+            x_max = new_index.max()
+            
+            # 为每个子图设置相同的x轴范围
+            for ax in [ax1, ax2, ax3]:
+                ax.set_xlim(x_min, x_max)
+
+            # ====== ax1主图（价格走势 + 买卖点） ======
+            # 绘制价格走势（使用更清晰的线条，设置较高的zorder确保在买卖点之上）
+            ax1.plot(mapped_df.index, mapped_df['price'], linewidth=1.0, color='darkblue', alpha=1.0, label='价格走势', zorder=20)
+            
+            # 标记关键价格点
+            valid_prices = mapped_df['price'].dropna()
+            if len(valid_prices) > 0:
+                # 开盘价（第一个有效价格）
+                open_price = valid_prices.iloc[0]
+                open_time = valid_prices.index[0]
+                ax1.scatter(open_time, open_price, color='black', s=80, marker='o', label='开盘', zorder=5)
+                
+                # 当前价（最后一个有效价格）
+                current_price = valid_prices.iloc[-1]
+                current_time = valid_prices.index[-1]
+                ax1.scatter(current_time, current_price, color='black', s=80, marker='o', label='当前', zorder=5)
+                
+                # 最高价
+                high_price = valid_prices.max()
+                high_time = valid_prices.idxmax()
+                ax1.scatter(high_time, high_price, color='orange', s=60, marker='^', label='最高', zorder=5)
+                
+                # 最低价
+                low_price = valid_prices.min()
+                low_time = valid_prices.idxmin()
+                ax1.scatter(low_time, low_price, color='purple', s=60, marker='v', label='最低', zorder=5)
+                
+                # 添加价格信息
+                price_info = f'开盘: {open_price:.3f} ({open_time.strftime("%H:%M")})\n'
+                price_info += f'当前: {current_price:.3f} ({current_time.strftime("%H:%M")})\n'
+                price_info += f'最高: {high_price:.3f} ({high_time.strftime("%H:%M")})\n'
+                price_info += f'最低: {low_price:.3f} ({low_time.strftime("%H:%M")})'
+                
+                ax1.text(0.02, 0.98, price_info, 
+                       transform=ax1.transAxes, verticalalignment='top', 
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            ax1.set_title(chart_title, fontsize=16, fontweight='bold')
+            ax1.set_ylabel('价格', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            
+            # 添加买卖点标记
+            if trade_signals and len(trade_signals) > 0:
+                buy_signals = []
+                sell_signals = []
+                hold_signals = []
+                watch_signals = []
+                
+                # 添加调试日志
+                logger.info(f"开始处理 {len(trade_signals)} 个交易信号...")
+                logger.info(f"图表时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
+                
+                for i, signal in enumerate(trade_signals):
+                    logger.info(f"处理第 {i+1} 个信号: {signal}")
+                    
+                    # 转换时间戳为pandas datetime
+                    if isinstance(signal['timestamp'], str):
+                        signal_time = pd.to_datetime(signal['timestamp'])
+                    else:
+                        signal_time = signal['timestamp']
+                    
+                    # 确保时间戳有时区信息，与图表数据保持一致
+                    if not isinstance(signal_time, pd.Timestamp):
+                        signal_time = pd.Timestamp(signal_time)
+                    
+                    if signal_time.tz is None:
+                        # 如果没有时区信息，假设是UTC时间，转换为北京时间
+                        import pytz
+                        utc_tz = pytz.UTC
+                        beijing_tz = pytz.timezone('Asia/Shanghai')
+                        signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
+                    
+                    logger.info(f"信号 {i+1} 原始时间: {signal_time}")
+                    
+                    # 应用相同的时间映射，保持图表连续性
+                    current_time = signal_time.time()
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        mapped_signal_time = signal_time
+                        logger.info(f"信号 {i+1} 上午时间，映射后时间: {mapped_signal_time}")
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
+                        mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
+                        logger.info(f"信号 {i+1} 下午时间，映射后时间: {mapped_signal_time}")
+                    else:
+                        # 午休时间的信号跳过
+                        logger.warning(f"信号 {i+1} 在午休时间 {current_time}，跳过")
+                        continue
+                    
+                    # 检查映射后的时间是否在图表范围内，如果超出范围则调整到最近的有效时间
+                    if mapped_signal_time < mapped_df.index.min():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 早于图表开始时间，调整到 {mapped_df.index.min()}")
+                        mapped_signal_time = mapped_df.index.min()
+                    elif mapped_signal_time > mapped_df.index.max():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 晚于图表结束时间，调整到 {mapped_df.index.max()}")
+                        mapped_signal_time = mapped_df.index.max()
+                    
+                    logger.info(f"信号 {i+1} 最终映射时间: {mapped_signal_time}")
+                    
+                    # 所有信号都添加到对应列表（经过时间调整后）
+                    if signal['side'] == 'BUY':
+                        buy_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'SELL':
+                        sell_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'HOLD':
+                        hold_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'WATCH':
+                        watch_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                
+                logger.info(f"信号处理完成: 买入={len(buy_signals)}, 卖出={len(sell_signals)}, 持有={len(hold_signals)}, 观望={len(watch_signals)}")
+                
+                # 绘制买入点（红色三角形向上，更大更显眼）
+                if buy_signals:
+                    buy_df = pd.DataFrame(buy_signals)
+                    ax1.scatter(buy_df['timestamp'], buy_df['price'], 
+                               color='red', marker='^', s=200, label='买入信号', zorder=25, alpha=0.9)
+                    # 添加买入点标注
+                    for _, row in buy_df.iterrows():
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'买入\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 15), textcoords='offset points',
+                                   fontsize=10, color='red', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.5', facecolor='red', alpha=0.3))
+                
+                # 绘制卖出点（绿色三角形向下，更大更显眼）
+                if sell_signals:
+                    sell_df = pd.DataFrame(sell_signals)
+                    ax1.scatter(sell_df['timestamp'], sell_df['price'], 
+                               color='green', marker='v', s=200, label='卖出信号', zorder=25, alpha=0.9)
+                    # 添加卖出点标注
+                    for _, row in sell_df.iterrows():
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'卖出\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, -25), textcoords='offset points',
+                                   fontsize=10, color='green', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.5', facecolor='green', alpha=0.3))
+                
+                # 绘制持有点（蓝色圆点）
+                if hold_signals:
+                    hold_df = pd.DataFrame(hold_signals)
+                    ax1.scatter(hold_df['timestamp'], hold_df['price'], 
+                               color='blue', marker='o', s=120, label='持有信号', zorder=25, alpha=0.8)
+                    # 添加持有点标注
+                    for _, row in hold_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'持有\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 0), textcoords='offset points',
+                                   fontsize=9, color='blue', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.2))
+                
+                # 绘制观望点（黄色方块）
+                if watch_signals:
+                    watch_df = pd.DataFrame(watch_signals)
+                    ax1.scatter(watch_df['timestamp'], watch_df['price'], 
+                               color='orange', marker='s', s=120, label='观望信号', zorder=25, alpha=0.8)
+                    # 添加观望点标注
+                    for _, row in watch_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'观望\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 0), textcoords='offset points',
+                                   fontsize=9, color='orange', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.4', facecolor='orange', alpha=0.2))
+                
+                logger.info(f"添加了 {len(buy_signals)} 个买入点、{len(sell_signals)} 个卖出点、{len(hold_signals)} 个持有点、{len(watch_signals)} 个观望点")
+            else:
+                logger.info("没有交易信号数据")
+            
+            # 添加信号类型说明
+            signal_info = "信号说明:\n"
+            signal_info += "▲ 买入信号: 金叉出现，无持仓时买入\n"
+            signal_info += "▼ 卖出信号: 死叉出现，有持仓时卖出\n"
+            signal_info += "● 持有信号: 金叉出现，已有持仓时持有\n"
+            signal_info += "■ 观望信号: 死叉出现，无持仓时观望"
+            
+            ax1.text(0.02, 0.85, signal_info, 
+                   transform=ax1.transAxes, verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+                   fontsize=10)
+            
+            ax1.legend(loc='upper right')
+            
+            # 设置x轴格式 - 显示北京时间
+            ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # 设置y轴格式 - 价格三位小数
+            import matplotlib.ticker as mticker
+            ax1.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+
+            # 添加x轴标签（明确标注北京时间）
+            ax1.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            
+            # ====== ax2成交量 ======
+            # 跳过第一条（因为是累积成交量）
+            vol_df = mapped_df.iloc[1:].copy()
+            if len(vol_df) > 0:
+                # 计算涨跌颜色
+                price_arr = vol_df['price'].values
+                prev_price_arr = mapped_df['price'].values[:-1]
+                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+                
+                # 绘制成交量柱状图
+                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+                ax2.set_title('成交量', fontsize=12)
+                ax2.set_ylabel('成交量', fontsize=10)
+                ax2.grid(True, alpha=0.3)
+                
+                # 设置x轴格式
+                ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+            
+            # ====== ax3 MACD指标 ======
+            # 生成1分钟K线收盘价序列，用于技术指标
+            minute_close = mapped_df['price'].resample('1min').last().dropna()
+            minute_index = minute_close.index
+            
+            if len(minute_close) > 0:
+                ema12 = minute_close.ewm(span=12, adjust=False).mean()
+                ema26 = minute_close.ewm(span=26, adjust=False).mean()
+                dif = ema12 - ema26  # DIF
+                dea = dif.ewm(span=9, adjust=False).mean()  # DEA
+                macd_hist = 2 * (dif - dea) # MACD柱子
+                macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
+                
+                ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
+                ax3.plot(minute_index, dif, color='orange', linewidth=1.5, label='DIF线')
+                ax3.plot(minute_index, dea, color='deepskyblue', linewidth=1.5, label='DEA线')
+                ax3.set_title('MACD指标 (12,26,9)', fontsize=12)
+                ax3.set_ylabel('MACD', fontsize=10)
+                ax3.set_xlabel('时间 (北京时间)', fontsize=13)
+                ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
+                ax3.legend(loc='upper right')
+                ax3.grid(True, alpha=0.3)
+            
+            # 调整布局
+            plt.tight_layout()
+            
+            # 保存图片
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                logger.info(f"买卖点图表已保存到: {save_path}")
+            
+            # 显示图表（非阻塞模式）
+            plt.show(block=False)
+            
+            logger.info("买卖点图表生成完成")
+            
+        except Exception as e:
+            logger.error(f"生成买卖点图表失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+    
+    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
         """绘制价格走势图"""
         try:
             # 获取数据
@@ -696,11 +1107,13 @@ class ETF159506RedisKlineGenerator:
             ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             
             # ====== 添加买卖点标记 ======
+            # 初始化信号列表
+            buy_signals = []
+            sell_signals = []
+            hold_signals = []
+            watch_signals = []
+            
             if trade_signals and len(trade_signals) > 0:
-                buy_signals = []
-                sell_signals = []
-                hold_signals = []
-                watch_signals = []
                 
                 # 添加调试日志
                 logger.info(f"开始处理 {len(trade_signals)} 个交易信号...")
@@ -785,6 +1198,85 @@ class ETF159506RedisKlineGenerator:
                 
                 logger.info(f"信号处理完成: 买入={len(buy_signals)}, 卖出={len(sell_signals)}, 持有={len(hold_signals)}, 观望={len(watch_signals)}")
                 logger.info(f"总共 {len(buy_signals) + len(sell_signals) + len(hold_signals) + len(watch_signals)} 个信号被添加到图表")
+            
+            # ====== 添加技术指标信号标记 ======
+            technical_markers = []
+            if technical_signals and len(technical_signals) > 0:
+                logger.info(f"开始处理 {len(technical_signals)} 个技术指标信号...")
+                
+                for i, signal in enumerate(technical_signals):
+                    logger.info(f"处理第 {i+1} 个技术信号: {signal}")
+                    
+                    # 转换时间戳为pandas datetime
+                    if isinstance(signal['timestamp'], str):
+                        signal_time = pd.to_datetime(signal['timestamp'])
+                    else:
+                        signal_time = signal['timestamp']
+                    
+                    # 确保时间戳有时区信息，与图表数据保持一致
+                    if not isinstance(signal_time, pd.Timestamp):
+                        signal_time = pd.Timestamp(signal_time)
+                    
+                    if signal_time.tz is None:
+                        # 如果没有时区信息，假设是UTC时间，转换为北京时间
+                        import pytz
+                        utc_tz = pytz.UTC
+                        beijing_tz = pytz.timezone('Asia/Shanghai')
+                        signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
+                    
+                    # 应用相同的时间映射，保持图表连续性
+                    current_time = signal_time.time()
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        mapped_signal_time = signal_time
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
+                        mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
+                    else:
+                        # 午休时间的信号跳过
+                        logger.warning(f"技术信号 {i+1} 在午休时间 {current_time}，跳过")
+                        continue
+                    
+                    # 检查映射后的时间是否在图表范围内
+                    if mapped_signal_time < mapped_df.index.min():
+                        mapped_signal_time = mapped_df.index.min()
+                    elif mapped_signal_time > mapped_df.index.max():
+                        mapped_signal_time = mapped_df.index.max()
+                    
+                    # 根据信号类型设置不同的标记样式
+                    signal_type = signal.get('signal_type', 'unknown')
+                    if signal_type == 'golden_cross':
+                        marker_style = '^'  # 上三角
+                        marker_color = 'green'
+                        marker_size = 100
+                    elif signal_type == 'death_cross':
+                        marker_style = 'v'  # 下三角
+                        marker_color = 'red'
+                        marker_size = 100
+                    elif signal_type == 'top_divergence':
+                        marker_style = 's'  # 正方形
+                        marker_color = 'orange'
+                        marker_size = 80
+                    elif signal_type == 'bottom_divergence':
+                        marker_style = 's'  # 正方形
+                        marker_color = 'purple'
+                        marker_size = 80
+                    else:
+                        marker_style = 'o'  # 圆形
+                        marker_color = 'gray'
+                        marker_size = 60
+                    
+                    technical_markers.append({
+                        'timestamp': mapped_signal_time,
+                        'price': signal['price'],
+                        'signal_type': signal_type,
+                        'marker_style': marker_style,
+                        'marker_color': marker_color,
+                        'marker_size': marker_size,
+                        'signal_value': signal.get('signal_value', 0)
+                    })
+                
+                logger.info(f"技术信号处理完成: {len(technical_markers)} 个技术信号被添加到图表")
                 
                 # 绘制买入点（红色三角形向上）
                 if buy_signals:
@@ -847,6 +1339,115 @@ class ETF159506RedisKlineGenerator:
                 logger.info(f"添加了 {len(buy_signals)} 个买入点、{len(sell_signals)} 个卖出点、{len(hold_signals)} 个持有点、{len(watch_signals)} 个观望点")
             else:
                 logger.info("没有交易信号数据")
+            
+            # ====== 绘制技术指标信号标记 ======
+            if technical_markers:
+                technical_df = pd.DataFrame(technical_markers)
+                for _, row in technical_df.iterrows():
+                    ax1.scatter(row['timestamp'], row['price'], 
+                               color=row['marker_color'], marker=row['marker_style'], 
+                               s=row['marker_size'], alpha=0.7, zorder=5)
+                    
+                    # 添加技术信号标注
+                    signal_type = row['signal_type']
+                    if signal_type == 'golden_cross':
+                        label = '金叉'
+                        color = 'green'
+                    elif signal_type == 'death_cross':
+                        label = '死叉'
+                        color = 'red'
+                    elif signal_type == 'top_divergence':
+                        label = '顶背离'
+                        color = 'orange'
+                    elif signal_type == 'bottom_divergence':
+                        label = '底背离'
+                        color = 'purple'
+                    else:
+                        label = signal_type
+                        color = 'gray'
+                    
+                    ax1.annotate(f'{label}\n{row["price"]:.3f}', 
+                               xy=(row['timestamp'], row['price']),
+                               xytext=(5, 5), textcoords='offset points',
+                               fontsize=7, color=color, weight='bold',
+                               bbox=dict(boxstyle='round,pad=0.2', facecolor=color, alpha=0.1))
+                
+                logger.info(f"添加了 {len(technical_markers)} 个技术指标信号标记")
+            else:
+                logger.info("没有技术指标信号数据")
+            
+            # ====== 添加极值点标记 ======
+            if extremes_data and len(extremes_data) > 0:
+                logger.info("开始处理极值点数据...")
+                
+                # 处理价格极值点
+                if 'price_peaks' in extremes_data and extremes_data['price_peaks']:
+                    price_peaks = extremes_data['price_peaks']
+                    logger.info(f"处理 {len(price_peaks)} 个价格峰值点")
+                    
+                    for peak in price_peaks:
+                        try:
+                            # 极值点格式: (timestamp, price, dif_value)
+                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            peak_price = peak[1]
+                            
+                            # 应用时间映射
+                            current_time = peak_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_peak_time = peak_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_peak_time < mapped_df.index.min():
+                                mapped_peak_time = mapped_df.index.min()
+                            elif mapped_peak_time > mapped_df.index.max():
+                                mapped_peak_time = mapped_df.index.max()
+                            
+                            # 绘制价格峰值点（紫色菱形）
+                            ax1.scatter(mapped_peak_time, peak_price, 
+                                       color='purple', marker='D', s=80, label='价格峰值', zorder=8, alpha=0.7)
+                            
+                        except Exception as e:
+                            logger.warning(f"处理价格峰值点失败: {e}")
+                
+                if 'price_troughs' in extremes_data and extremes_data['price_troughs']:
+                    price_troughs = extremes_data['price_troughs']
+                    logger.info(f"处理 {len(price_troughs)} 个价格谷值点")
+                    
+                    for trough in price_troughs:
+                        try:
+                            # 极值点格式: (timestamp, price, dif_value)
+                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            trough_price = trough[1]
+                            
+                            # 应用时间映射
+                            current_time = trough_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_trough_time = trough_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_trough_time < mapped_df.index.min():
+                                mapped_trough_time = mapped_df.index.min()
+                            elif mapped_trough_time > mapped_df.index.max():
+                                mapped_trough_time = mapped_df.index.max()
+                            
+                            # 绘制价格谷值点（棕色菱形）
+                            ax1.scatter(mapped_trough_time, trough_price, 
+                                       color='brown', marker='D', s=80, label='价格谷值', zorder=8, alpha=0.7)
+                            
+                        except Exception as e:
+                            logger.warning(f"处理价格谷值点失败: {e}")
+                
+                logger.info("极值点处理完成")
+            else:
+                logger.info("没有极值点数据")
             
             # ====== ax2成交量 ======
             # 跳过第一条（因为是累积成交量）
@@ -1032,20 +1633,21 @@ class ETF159506RedisKlineGenerator:
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
                 logger.info(f"价格走势图已保存到: {save_path}")
             
-            plt.show()
+            # 显示图表（非阻塞模式）
+            plt.show(block=False)
             
         except Exception as e:
             logger.error(f"绘制价格走势图失败: {e}")
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
     
-    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
+    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
         """启动实时图表更新"""
         def update_chart():
             while True:
                 try:
                     time.sleep(1)  # 每30秒更新一次
-                    self._plot_kline_chart(save_path, target_date, trade_signals)
+                    self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
                     logger.info("实时K线图已更新")
                 except Exception as e:
                     logger.error(f"实时图表更新失败: {e}")
@@ -1055,6 +1657,753 @@ class ETF159506RedisKlineGenerator:
         update_thread = threading.Thread(target=update_chart, daemon=True)
         update_thread.start()
         logger.info("实时K线图更新已启动")
+
+    def create_extremes_chart(self, save_path: str = None, target_date: datetime.date = None, extremes_data: Dict = None):
+        """创建专门的极值点图表"""
+        try:
+            # 获取数据
+            kline_data = self.get_today_kline_data(target_date)
+            
+            if not kline_data:
+                logger.warning("没有数据可绘制")
+                return
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(kline_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # 检查是否需要时区转换
+            if df['timestamp'].dt.tz is None:
+                # 假设是UTC时间，转换为北京时间
+                import pytz
+                utc_tz = pytz.UTC
+                beijing_tz = pytz.timezone('Asia/Shanghai')
+                
+                # 添加UTC时区信息
+                df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                # 转换为北京时间
+                df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                logger.info("已将UTC时间转换为北京时间")
+            
+            df = df.sort_values('timestamp')
+            
+            # 检查数据时间范围
+            start_time = df['timestamp'].min()
+            end_time = df['timestamp'].max()
+            data_date = start_time.date()
+            logger.info(f"数据时间范围: {start_time} 到 {end_time}")
+            logger.info(f"数据条数: {len(df)}")
+            
+            # 确定图表标题
+            if target_date:
+                chart_title = f'159506 ETF {target_date} 极值点分析 (北京时间)'
+            else:
+                chart_title = f'159506 ETF {data_date} 极值点分析 (北京时间)'
+            
+            # 过滤交易时间内的数据，正确处理午休时间
+            from datetime import time as datetime_time
+            morning_start = datetime_time(9, 30)
+            morning_end = datetime_time(11, 30)
+            afternoon_start = datetime_time(13, 0)
+            afternoon_end = datetime_time(15, 0)
+            
+            # 分别获取上午和下午的数据
+            morning_data = df[
+                (df['timestamp'].dt.time >= morning_start) & 
+                (df['timestamp'].dt.time <= morning_end)
+            ]
+            
+            afternoon_data = df[
+                (df['timestamp'].dt.time >= afternoon_start) & 
+                (df['timestamp'].dt.time <= afternoon_end)
+            ]
+            
+            # 合并上午和下午数据
+            trading_data = pd.concat([morning_data, afternoon_data])
+            
+            if len(trading_data) == 0:
+                logger.warning("没有交易时间内的数据可绘制")
+                return
+            
+            logger.info(f"上午数据: {len(morning_data)} 条")
+            logger.info(f"下午数据: {len(afternoon_data)} 条")
+            logger.info(f"总交易数据: {len(trading_data)} 条")
+            
+            # 使用交易数据的时间作为索引
+            trading_data = trading_data.set_index('timestamp')
+            
+            # 创建时间映射，处理午休时间
+            from datetime import timedelta
+            
+            # 创建映射后的时间索引
+            mapped_times = []
+            for timestamp in trading_data.index:
+                current_time = timestamp.time()
+                if current_time < datetime_time(11, 30):
+                    # 上午时间保持不变
+                    mapped_time = timestamp
+                elif current_time > datetime_time(13, 0):
+                    # 下午时间减去1.5小时（午休时间），保持图表连续
+                    mapped_time = timestamp - timedelta(hours=1, minutes=30)
+                else:
+                    # 午休时间的数据跳过
+                    continue
+                mapped_times.append(mapped_time)
+            
+            # 创建映射后的DataFrame
+            mapped_df = trading_data.copy()
+            mapped_df.index = mapped_times
+            mapped_df = mapped_df.sort_index()
+            
+            logger.info(f"映射后数据时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
+            logger.info(f"映射后数据条数: {len(mapped_df)}")
+            
+            # 创建图表
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12), height_ratios=[3, 1, 2])
+            fig.suptitle(chart_title, fontsize=16, fontweight='bold')
+            
+            # ====== ax1主图（价格走势 + 极值点） ======
+            # 绘制价格走势（使用更清晰的线条，设置较高的zorder确保在极值点之上）
+            ax1.plot(mapped_df.index, mapped_df['price'], linewidth=1.0, color='darkblue', alpha=1.0, label='价格走势', zorder=20)
+            
+            # 添加极值点标记
+            if extremes_data and len(extremes_data) > 0:
+                logger.info("开始处理极值点数据...")
+                
+                # 处理价格极值点
+                if 'price_peaks' in extremes_data and extremes_data['price_peaks']:
+                    price_peaks = extremes_data['price_peaks']
+                    logger.info(f"处理 {len(price_peaks)} 个价格峰值点")
+                    
+                    for peak in price_peaks:
+                        try:
+                            # 极值点格式: (timestamp, price, dif_value)
+                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            peak_price = peak[1]
+                            
+                            # 应用时间映射
+                            current_time = peak_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_peak_time = peak_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_peak_time < mapped_df.index.min():
+                                mapped_peak_time = mapped_df.index.min()
+                            elif mapped_peak_time > mapped_df.index.max():
+                                mapped_peak_time = mapped_df.index.max()
+                            
+                            # 绘制价格峰值点（紫色菱形）
+                            ax1.scatter(mapped_peak_time, peak_price, 
+                                       color='purple', marker='D', s=100, label='价格峰值', zorder=25, alpha=0.8)
+                            
+                            # 添加峰值标注
+                            ax1.annotate(f'峰值\n{peak_price:.3f}', 
+                                       xy=(mapped_peak_time, peak_price),
+                                       xytext=(5, 10), textcoords='offset points',
+                                       fontsize=8, color='purple', weight='bold',
+                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.1))
+                            
+                        except Exception as e:
+                            logger.warning(f"处理价格峰值点失败: {e}")
+                
+                if 'price_troughs' in extremes_data and extremes_data['price_troughs']:
+                    price_troughs = extremes_data['price_troughs']
+                    logger.info(f"处理 {len(price_troughs)} 个价格谷值点")
+                    
+                    for trough in price_troughs:
+                        try:
+                            # 极值点格式: (timestamp, price, dif_value)
+                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            trough_price = trough[1]
+                            
+                            # 应用时间映射
+                            current_time = trough_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_trough_time = trough_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_trough_time < mapped_df.index.min():
+                                mapped_trough_time = mapped_df.index.min()
+                            elif mapped_trough_time > mapped_df.index.max():
+                                mapped_trough_time = mapped_df.index.max()
+                            
+                            # 绘制价格谷值点（棕色菱形）
+                            ax1.scatter(mapped_trough_time, trough_price, 
+                                       color='brown', marker='D', s=100, label='价格谷值', zorder=25, alpha=0.8)
+                            
+                            # 添加谷值标注
+                            ax1.annotate(f'谷值\n{trough_price:.3f}', 
+                                       xy=(mapped_trough_time, trough_price),
+                                       xytext=(5, -15), textcoords='offset points',
+                                       fontsize=8, color='brown', weight='bold',
+                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='brown', alpha=0.1))
+                            
+                        except Exception as e:
+                            logger.warning(f"处理价格谷值点失败: {e}")
+                
+                logger.info("极值点处理完成")
+            else:
+                logger.info("没有极值点数据")
+            
+            # 设置主图属性
+            ax1.set_title('价格走势与极值点', fontsize=14)
+            ax1.set_ylabel('价格', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='upper left')
+            
+            # 设置x轴格式
+            ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # ====== ax2成交量 ======
+            # 跳过第一条（因为是累积成交量）
+            vol_df = mapped_df.iloc[1:].copy()
+            if len(vol_df) > 0:
+                # 计算涨跌颜色
+                price_arr = vol_df['price'].values
+                prev_price_arr = mapped_df['price'].values[:-1]
+                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+                
+                # 绘制成交量柱状图
+                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+            
+            ax2.set_title('成交量', fontsize=12)
+            ax2.set_ylabel('成交量', fontsize=10)
+            ax2.grid(True, alpha=0.3)
+            ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+            
+            # ====== ax3 MACD副图 ======
+            # 生成1分钟K线收盘价序列，用于技术指标
+            minute_close = mapped_df['price'].resample('1min').last().dropna()
+            minute_index = minute_close.index
+
+            # 计算MACD
+            ema12 = minute_close.ewm(span=12, adjust=False).mean()
+            ema26 = minute_close.ewm(span=26, adjust=False).mean()
+            dif = ema12 - ema26  # DIF
+            dea = dif.ewm(span=9, adjust=False).mean()  # DEA
+            macd_hist = 2 * (dif - dea) # MACD柱子
+            
+            # 绘制MACD
+            macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
+            ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
+            ax3.plot(minute_index, dif, color='orange', label='DIF线')
+            ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线')
+            
+            # 添加DIF极值点
+            if extremes_data and len(extremes_data) > 0:
+                if 'dif_peaks' in extremes_data and extremes_data['dif_peaks']:
+                    dif_peaks = extremes_data['dif_peaks']
+                    logger.info(f"处理 {len(dif_peaks)} 个DIF峰值点")
+                    
+                    for peak in dif_peaks:
+                        try:
+                            # 极值点格式: (timestamp, dif_value, price_value)
+                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            peak_dif = peak[1]
+                            
+                            # 应用时间映射
+                            current_time = peak_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_peak_time = peak_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_peak_time < minute_index.min():
+                                mapped_peak_time = minute_index.min()
+                            elif mapped_peak_time > minute_index.max():
+                                mapped_peak_time = minute_index.max()
+                            
+                            # 绘制DIF峰值点（红色三角形）
+                            ax3.scatter(mapped_peak_time, peak_dif, 
+                                       color='red', marker='^', s=80, label='DIF峰值', zorder=25, alpha=0.8)
+                            
+                        except Exception as e:
+                            logger.warning(f"处理DIF峰值点失败: {e}")
+                
+                if 'dif_troughs' in extremes_data and extremes_data['dif_troughs']:
+                    dif_troughs = extremes_data['dif_troughs']
+                    logger.info(f"处理 {len(dif_troughs)} 个DIF谷值点")
+                    
+                    for trough in dif_troughs:
+                        try:
+                            # 极值点格式: (timestamp, dif_value, price_value)
+                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            trough_dif = trough[1]
+                            
+                            # 应用时间映射
+                            current_time = trough_timestamp.time()
+                            if current_time < datetime_time(11, 30):
+                                mapped_trough_time = trough_timestamp
+                            elif current_time > datetime_time(13, 0):
+                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
+                            else:
+                                continue
+                            
+                            # 检查时间范围
+                            if mapped_trough_time < minute_index.min():
+                                mapped_trough_time = minute_index.min()
+                            elif mapped_trough_time > minute_index.max():
+                                mapped_trough_time = minute_index.max()
+                            
+                            # 绘制DIF谷值点（绿色三角形）
+                            ax3.scatter(mapped_trough_time, trough_dif, 
+                                       color='green', marker='v', s=80, label='DIF谷值', zorder=25, alpha=0.8)
+                            
+                        except Exception as e:
+                            logger.warning(f"处理DIF谷值点失败: {e}")
+            
+            ax3.set_title('MACD指标与DIF极值点', fontsize=12)
+            ax3.set_ylabel('MACD', fontsize=10)
+            ax3.set_xlabel('时间 (北京时间)', fontsize=12)
+            ax3.grid(True, alpha=0.3)
+            ax3.legend(loc='upper left')
+            ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
+            
+            # 调整布局
+            plt.tight_layout()
+            
+            # 保存图片
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                logger.info(f"极值点图表已保存到: {save_path}")
+            
+            # 显示图表（非阻塞模式）
+            plt.show(block=False)
+            
+            logger.info("极值点图表生成完成")
+            
+        except Exception as e:
+            logger.error(f"创建极值点图表失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+
+    def create_trade_points_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
+        """创建专门的买卖点图表"""
+        try:
+            # 获取数据
+            kline_data = self.get_today_kline_data(target_date)
+            
+            if not kline_data:
+                logger.warning("没有数据可绘制")
+                return
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(kline_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # 检查是否需要时区转换
+            if df['timestamp'].dt.tz is None:
+                # 假设是UTC时间，转换为北京时间
+                import pytz
+                utc_tz = pytz.UTC
+                beijing_tz = pytz.timezone('Asia/Shanghai')
+                
+                # 添加UTC时区信息
+                df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                # 转换为北京时间
+                df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                logger.info("已将UTC时间转换为北京时间")
+            
+            df = df.sort_values('timestamp')
+            
+            # 检查数据时间范围
+            start_time = df['timestamp'].min()
+            end_time = df['timestamp'].max()
+            data_date = start_time.date()
+            logger.info(f"数据时间范围: {start_time} 到 {end_time}")
+            logger.info(f"数据条数: {len(df)}")
+            
+            # 确定图表标题
+            if target_date:
+                chart_title = f'159506 ETF {target_date} 买卖点分析 (北京时间)'
+            else:
+                chart_title = f'159506 ETF {data_date} 买卖点分析 (北京时间)'
+            
+            # 过滤交易时间内的数据，正确处理午休时间
+            from datetime import time as datetime_time
+            morning_start = datetime_time(9, 30)
+            morning_end = datetime_time(11, 30)
+            afternoon_start = datetime_time(13, 0)
+            afternoon_end = datetime_time(15, 0)
+            
+            # 分别获取上午和下午的数据
+            morning_data = df[
+                (df['timestamp'].dt.time >= morning_start) & 
+                (df['timestamp'].dt.time <= morning_end)
+            ]
+            
+            afternoon_data = df[
+                (df['timestamp'].dt.time >= afternoon_start) & 
+                (df['timestamp'].dt.time <= afternoon_end)
+            ]
+            
+            # 合并上午和下午数据
+            trading_data = pd.concat([morning_data, afternoon_data])
+            
+            if len(trading_data) == 0:
+                logger.warning("没有交易时间内的数据可绘制")
+                return
+            
+            logger.info(f"上午数据: {len(morning_data)} 条")
+            logger.info(f"下午数据: {len(afternoon_data)} 条")
+            logger.info(f"总交易数据: {len(trading_data)} 条")
+            
+            # 使用交易数据的时间作为索引
+            trading_data = trading_data.set_index('timestamp')
+            
+            # 确保索引为升序、唯一、无NaN
+            complete_df = trading_data.copy()
+            complete_df = complete_df.sort_index()
+            complete_df = complete_df[~complete_df.index.duplicated(keep='first')]
+            complete_df = complete_df[complete_df.index.notnull()]
+
+            # 创建三联图，专门用于买卖点分析
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(20, 24), height_ratios=[2, 1, 1])
+
+            # 创建时间轴映射，保持时间连续性但保留原始时间信息
+            def create_time_mapping(df):
+                """创建时间轴映射，保持图表连续性"""
+                new_times = []
+                time_mapping = {}
+                original_time_mapping = {}  # 保存原始时间到映射时间的对应关系
+                
+                for idx in df.index:
+                    current_time = idx.time()
+                    
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        new_time = idx
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
+                        new_time = idx - timedelta(hours=1, minutes=30)
+                    else:
+                        # 午休时间的数据跳过
+                        continue
+                    
+                    new_times.append(new_time)
+                    time_mapping[idx] = new_time
+                    original_time_mapping[new_time] = idx  # 反向映射
+                
+                return pd.DatetimeIndex(new_times), time_mapping, original_time_mapping
+            
+            # 创建时间映射
+            new_index, time_mapping, original_time_mapping = create_time_mapping(complete_df)
+            
+            # 重新索引数据
+            mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
+            mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
+            
+            # 设置x轴范围
+            x_min = new_index.min()
+            x_max = new_index.max()
+            
+            # 为每个子图设置相同的x轴范围
+            for ax in [ax1, ax2, ax3]:
+                ax.set_xlim(x_min, x_max)
+
+            # ====== ax1主图（价格走势 + 买卖点） ======
+            # 绘制价格走势（使用较细的线条）
+            ax1.plot(mapped_df.index, mapped_df['price'], linewidth=0.8, color='lightgray', alpha=0.6, label='价格走势')
+            
+            # 标记关键价格点
+            valid_prices = mapped_df['price'].dropna()
+            if len(valid_prices) > 0:
+                # 开盘价（第一个有效价格）
+                open_price = valid_prices.iloc[0]
+                open_time = valid_prices.index[0]
+                ax1.scatter(open_time, open_price, color='black', s=80, marker='o', label='开盘', zorder=5)
+                
+                # 当前价（最后一个有效价格）
+                current_price = valid_prices.iloc[-1]
+                current_time = valid_prices.index[-1]
+                ax1.scatter(current_time, current_price, color='black', s=80, marker='o', label='当前', zorder=5)
+                
+                # 最高价
+                high_price = valid_prices.max()
+                high_time = valid_prices.idxmax()
+                ax1.scatter(high_time, high_price, color='orange', s=60, marker='^', label='最高', zorder=5)
+                
+                # 最低价
+                low_price = valid_prices.min()
+                low_time = valid_prices.idxmin()
+                ax1.scatter(low_time, low_price, color='purple', s=60, marker='v', label='最低', zorder=5)
+                
+                # 添加价格信息
+                price_info = f'开盘: {open_price:.3f} ({open_time.strftime("%H:%M")})\n'
+                price_info += f'当前: {current_price:.3f} ({current_time.strftime("%H:%M")})\n'
+                price_info += f'最高: {high_price:.3f} ({high_time.strftime("%H:%M")})\n'
+                price_info += f'最低: {low_price:.3f} ({low_time.strftime("%H:%M")})'
+                
+                ax1.text(0.02, 0.98, price_info, 
+                       transform=ax1.transAxes, verticalalignment='top', 
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            ax1.set_title(chart_title, fontsize=16, fontweight='bold')
+            ax1.set_ylabel('价格', fontsize=12)
+            ax1.grid(True, alpha=0.3)
+            
+            # 添加买卖点标记
+            if trade_signals and len(trade_signals) > 0:
+                buy_signals = []
+                sell_signals = []
+                hold_signals = []
+                watch_signals = []
+                
+                # 添加调试日志
+                logger.info(f"开始处理 {len(trade_signals)} 个交易信号...")
+                logger.info(f"图表时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
+                
+                for i, signal in enumerate(trade_signals):
+                    logger.info(f"处理第 {i+1} 个信号: {signal}")
+                    
+                    # 转换时间戳为pandas datetime
+                    if isinstance(signal['timestamp'], str):
+                        signal_time = pd.to_datetime(signal['timestamp'])
+                    else:
+                        signal_time = signal['timestamp']
+                    
+                    # 确保时间戳有时区信息，与图表数据保持一致
+                    if not isinstance(signal_time, pd.Timestamp):
+                        signal_time = pd.Timestamp(signal_time)
+                    
+                    if signal_time.tz is None:
+                        # 如果没有时区信息，假设是UTC时间，转换为北京时间
+                        import pytz
+                        utc_tz = pytz.UTC
+                        beijing_tz = pytz.timezone('Asia/Shanghai')
+                        signal_time = signal_time.tz_localize(utc_tz).tz_convert(beijing_tz)
+                    
+                    logger.info(f"信号 {i+1} 原始时间: {signal_time}")
+                    
+                    # 应用相同的时间映射，保持图表连续性
+                    current_time = signal_time.time()
+                    if current_time < datetime_time(11, 30):
+                        # 上午时间保持不变
+                        mapped_signal_time = signal_time
+                        logger.info(f"信号 {i+1} 上午时间，映射后时间: {mapped_signal_time}")
+                    elif current_time > datetime_time(13, 0):
+                        # 下午时间减去1.5小时（午休时间），保持图表连续
+                        mapped_signal_time = signal_time - timedelta(hours=1, minutes=30)
+                        logger.info(f"信号 {i+1} 下午时间，映射后时间: {mapped_signal_time}")
+                    else:
+                        # 午休时间的信号跳过
+                        logger.warning(f"信号 {i+1} 在午休时间 {current_time}，跳过")
+                        continue
+                    
+                    # 检查映射后的时间是否在图表范围内，如果超出范围则调整到最近的有效时间
+                    if mapped_signal_time < mapped_df.index.min():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 早于图表开始时间，调整到 {mapped_df.index.min()}")
+                        mapped_signal_time = mapped_df.index.min()
+                    elif mapped_signal_time > mapped_df.index.max():
+                        logger.warning(f"信号 {i+1} 映射后时间 {mapped_signal_time} 晚于图表结束时间，调整到 {mapped_df.index.max()}")
+                        mapped_signal_time = mapped_df.index.max()
+                    
+                    logger.info(f"信号 {i+1} 最终映射时间: {mapped_signal_time}")
+                    
+                    # 所有信号都添加到对应列表（经过时间调整后）
+                    if signal['side'] == 'BUY':
+                        buy_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'SELL':
+                        sell_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'HOLD':
+                        hold_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                    elif signal['side'] == 'WATCH':
+                        watch_signals.append({
+                            'timestamp': mapped_signal_time,
+                            'price': signal['price'],
+                            'original_time': signal_time,  # 保存原始时间
+                            'signal_type': signal.get('signal_type', 'unknown')
+                        })
+                
+                logger.info(f"信号处理完成: 买入={len(buy_signals)}, 卖出={len(sell_signals)}, 持有={len(hold_signals)}, 观望={len(watch_signals)}")
+                
+                # 绘制买入点（红色三角形向上，更大更显眼）
+                if buy_signals:
+                    buy_df = pd.DataFrame(buy_signals)
+                    ax1.scatter(buy_df['timestamp'], buy_df['price'], 
+                               color='red', marker='^', s=200, label='买入信号', zorder=15, alpha=0.9)
+                    # 添加买入点标注
+                    for _, row in buy_df.iterrows():
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'买入\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 15), textcoords='offset points',
+                                   fontsize=10, color='red', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.5', facecolor='red', alpha=0.3))
+                
+                # 绘制卖出点（绿色三角形向下，更大更显眼）
+                if sell_signals:
+                    sell_df = pd.DataFrame(sell_signals)
+                    ax1.scatter(sell_df['timestamp'], sell_df['price'], 
+                               color='green', marker='v', s=200, label='卖出信号', zorder=15, alpha=0.9)
+                    # 添加卖出点标注
+                    for _, row in sell_df.iterrows():
+                        # 显示原始时间（北京时间）
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'卖出\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, -25), textcoords='offset points',
+                                   fontsize=10, color='green', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.5', facecolor='green', alpha=0.3))
+                
+                # 绘制持有点（蓝色圆点）
+                if hold_signals:
+                    hold_df = pd.DataFrame(hold_signals)
+                    ax1.scatter(hold_df['timestamp'], hold_df['price'], 
+                               color='blue', marker='o', s=120, label='持有信号', zorder=15, alpha=0.8)
+                    # 添加持有点标注
+                    for _, row in hold_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'持有\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 0), textcoords='offset points',
+                                   fontsize=9, color='blue', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.4', facecolor='blue', alpha=0.2))
+                
+                # 绘制观望点（黄色方块）
+                if watch_signals:
+                    watch_df = pd.DataFrame(watch_signals)
+                    ax1.scatter(watch_df['timestamp'], watch_df['price'], 
+                               color='orange', marker='s', s=120, label='观望信号', zorder=15, alpha=0.8)
+                    # 添加观望点标注
+                    for _, row in watch_df.iterrows():
+                        original_time_str = row['original_time'].strftime('%H:%M')
+                        signal_type = row.get('signal_type', 'unknown')
+                        ax1.annotate(f'观望\n{row["price"]:.3f}\n{original_time_str}\n{signal_type}', 
+                                   xy=(row['timestamp'], row['price']),
+                                   xytext=(15, 0), textcoords='offset points',
+                                   fontsize=9, color='orange', weight='bold',
+                                   bbox=dict(boxstyle='round,pad=0.4', facecolor='orange', alpha=0.2))
+                
+                logger.info(f"添加了 {len(buy_signals)} 个买入点、{len(sell_signals)} 个卖出点、{len(hold_signals)} 个持有点、{len(watch_signals)} 个观望点")
+            else:
+                logger.info("没有交易信号数据")
+            
+            # 添加信号类型说明
+            signal_info = "信号说明:\n"
+            signal_info += "▲ 买入信号: 金叉出现，无持仓时买入\n"
+            signal_info += "▼ 卖出信号: 死叉出现，有持仓时卖出\n"
+            signal_info += "● 持有信号: 金叉出现，已有持仓时持有\n"
+            signal_info += "■ 观望信号: 死叉出现，无持仓时观望"
+            
+            ax1.text(0.02, 0.85, signal_info, 
+                   transform=ax1.transAxes, verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+                   fontsize=10)
+            
+            ax1.legend(loc='upper right')
+            
+            # 设置x轴格式 - 显示北京时间
+            ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+            
+            # 设置y轴格式 - 价格三位小数
+            import matplotlib.ticker as mticker
+            ax1.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.3f'))
+
+            # 添加x轴标签（明确标注北京时间）
+            ax1.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            
+            # ====== ax2成交量 ======
+            # 跳过第一条（因为是累积成交量）
+            vol_df = mapped_df.iloc[1:].copy()
+            if len(vol_df) > 0:
+                # 计算涨跌颜色
+                price_arr = vol_df['price'].values
+                prev_price_arr = mapped_df['price'].values[:-1]
+                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+                
+                # 绘制成交量柱状图
+                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+                ax2.set_title('成交量', fontsize=12)
+                ax2.set_ylabel('成交量', fontsize=10)
+                ax2.grid(True, alpha=0.3)
+                
+                # 设置x轴格式
+                ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+            
+            # ====== ax3 MACD指标 ======
+            # 生成1分钟K线收盘价序列，用于技术指标
+            minute_close = mapped_df['price'].resample('1min').last().dropna()
+            minute_index = minute_close.index
+            
+            if len(minute_close) > 0:
+                ema12 = minute_close.ewm(span=12, adjust=False).mean()
+                ema26 = minute_close.ewm(span=26, adjust=False).mean()
+                dif = ema12 - ema26  # DIF
+                dea = dif.ewm(span=9, adjust=False).mean()  # DEA
+                macd_hist = 2 * (dif - dea) # MACD柱子
+                macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
+                
+                ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
+                ax3.plot(minute_index, dif, color='orange', linewidth=1.5, label='DIF线')
+                ax3.plot(minute_index, dea, color='deepskyblue', linewidth=1.5, label='DEA线')
+                ax3.set_title('MACD指标 (12,26,9)', fontsize=12)
+                ax3.set_ylabel('MACD', fontsize=10)
+                ax3.set_xlabel('时间 (北京时间)', fontsize=13)
+                ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+                ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
+                ax3.legend(loc='upper right')
+                ax3.grid(True, alpha=0.3)
+            
+            # 调整布局
+            plt.tight_layout()
+            
+            # 保存图片
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                logger.info(f"买卖点图表已保存到: {save_path}")
+            
+            # 显示图表
+            plt.show()
+            
+            logger.info("买卖点图表生成完成")
+            
+        except Exception as e:
+            logger.error(f"生成买卖点图表失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
 
 
 def main():
