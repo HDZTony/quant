@@ -321,7 +321,6 @@ class ETF159506OfficialBacktest:
                 target_date=start_date,
                 trade_signals=self.trade_signals,
                 technical_signals=self.technical_signals,
-                extremes_data=self.extremes_data
             )
             
             logger.info("回测结果K线图已显示")

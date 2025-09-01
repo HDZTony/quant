@@ -494,12 +494,12 @@ class ETF159506RedisKlineGenerator:
         """从catalog文件获取今日数据（保持向后兼容）"""
         return self._get_data_from_catalog(datetime.now().date())
     
-    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
+    def create_realtime_kline_chart(self, save_path: str = None, auto_refresh: bool = True, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None):
         """创建实时K线图"""
         if auto_refresh:
-            self._start_realtime_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
+            self._start_realtime_chart(save_path, target_date, trade_signals, technical_signals)
         else:
-            self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
+            self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals)
     
     def create_trade_points_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None):
         """创建专门的买卖点图表"""
@@ -912,7 +912,7 @@ class ETF159506RedisKlineGenerator:
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
     
-    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
+    def _plot_kline_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None):
         """绘制价格走势图"""
         try:
             # 获取数据
@@ -1376,86 +1376,7 @@ class ETF159506RedisKlineGenerator:
             else:
                 logger.info("没有技术指标信号数据")
             
-            # ====== 添加极值点标记 ======
-            if extremes_data and len(extremes_data) > 0:
-                logger.info("开始处理极值点数据...")
-                
-                # 处理价格极值点
-                if 'price_peaks' in extremes_data and extremes_data['price_peaks']:
-                    price_peaks = extremes_data['price_peaks']
-                    logger.info(f"处理 {len(price_peaks)} 个价格峰值点")
-                    
-                    for peak in price_peaks:
-                        try:
-                            # 极值点格式: (timestamp, price, dif_value)
-                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
-                            # 确保时间戳有时区信息，与mapped_df.index保持一致
-                            if peak_timestamp.tz is None:
-                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            peak_price = peak[1]
-                            
-                            # 应用时间映射
-                            current_time = peak_timestamp.time()
-                            if current_time < datetime_time(11, 30):
-                                mapped_peak_time = peak_timestamp
-                            elif current_time > datetime_time(13, 0):
-                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
-                            else:
-                                continue
-                            
-                            # 检查时间范围
-                            if mapped_peak_time < mapped_df.index.min():
-                                mapped_peak_time = mapped_df.index.min()
-                            elif mapped_peak_time > mapped_df.index.max():
-                                mapped_peak_time = mapped_df.index.max()
-                            
-                            # 绘制价格峰值点（紫色菱形）
-                            ax1.scatter(mapped_peak_time, peak_price, 
-                                       color='purple', marker='D', s=80, label='价格峰值', zorder=8, alpha=0.7)
-                            
-                        except Exception as e:
-                            logger.warning(f"处理价格峰值点失败: {e}")
-                
-                if 'price_troughs' in extremes_data and extremes_data['price_troughs']:
-                    price_troughs = extremes_data['price_troughs']
-                    logger.info(f"处理 {len(price_troughs)} 个价格谷值点")
-                    
-                    for trough in price_troughs:
-                        try:
-                            # 极值点格式: (timestamp, price, dif_value)
-                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
-                            # 确保时间戳有时区信息，与mapped_df.index保持一致
-                            if trough_timestamp.tz is None:
-                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            trough_price = trough[1]
-                            
-                            # 应用时间映射
-                            current_time = trough_timestamp.time()
-                            if current_time < datetime_time(11, 30):
-                                mapped_trough_time = trough_timestamp
-                            elif current_time > datetime_time(13, 0):
-                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
-                            else:
-                                continue
-                            
-                            # 检查时间范围
-                            if mapped_trough_time < mapped_df.index.min():
-                                mapped_trough_time = mapped_df.index.min()
-                            elif mapped_trough_time > mapped_df.index.max():
-                                mapped_trough_time = mapped_df.index.max()
-                            
-                            # 绘制价格谷值点（棕色菱形）
-                            ax1.scatter(mapped_trough_time, trough_price, 
-                                       color='brown', marker='D', s=80, label='价格谷值', zorder=8, alpha=0.7)
-                            
-                        except Exception as e:
-                            logger.warning(f"处理价格谷值点失败: {e}")
-                
-                logger.info("极值点处理完成")
-            else:
-                logger.info("没有极值点数据")
-            
-            # ====== ax2成交量 ======
+           
             # 跳过第一条（因为是累积成交量）
             vol_df = mapped_df.iloc[1:].copy()
             if len(vol_df) == 0:
@@ -1647,13 +1568,13 @@ class ETF159506RedisKlineGenerator:
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
     
-    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, extremes_data: Dict = None):
+    def _start_realtime_chart(self, save_path: str = None, target_date: datetime.date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None):
         """启动实时图表更新"""
         def update_chart():
             while True:
                 try:
                     time.sleep(1)  # 每30秒更新一次
-                    self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals, extremes_data)
+                    self._plot_kline_chart(save_path, target_date, trade_signals, technical_signals)
                     logger.info("实时K线图已更新")
                 except Exception as e:
                     logger.error(f"实时图表更新失败: {e}")
@@ -1807,7 +1728,7 @@ class ETF159506RedisKlineGenerator:
                             
                             # 绘制价格峰值点（紫色菱形）
                             ax1.scatter(mapped_peak_time, peak_price, 
-                                       color='purple', marker='D', s=100, label='价格峰值', zorder=25, alpha=0.8)
+                                       color='purple', marker='D', s=100, label='', zorder=25, alpha=0.8)
                             
                             # 添加峰值标注
                             ax1.annotate(f'峰值\n{peak_price:.3f}', 
@@ -1849,7 +1770,7 @@ class ETF159506RedisKlineGenerator:
                             
                             # 绘制价格谷值点（棕色菱形）
                             ax1.scatter(mapped_trough_time, trough_price, 
-                                       color='brown', marker='D', s=100, label='价格谷值', zorder=25, alpha=0.8)
+                                       color='brown', marker='D', s=100, label='', zorder=25, alpha=0.8)
                             
                             # 添加谷值标注
                             ax1.annotate(f'谷值\n{trough_price:.3f}', 
@@ -1945,7 +1866,7 @@ class ETF159506RedisKlineGenerator:
                             
                             # 绘制DIF峰值点（红色三角形）
                             ax3.scatter(mapped_peak_time, peak_dif, 
-                                       color='red', marker='^', s=80, label='DIF峰值', zorder=25, alpha=0.8)
+                                       color='red', marker='^', s=80, label='', zorder=25, alpha=0.8)
                             
                         except Exception as e:
                             logger.warning(f"处理DIF峰值点失败: {e}")
@@ -1980,7 +1901,7 @@ class ETF159506RedisKlineGenerator:
                             
                             # 绘制DIF谷值点（绿色三角形）
                             ax3.scatter(mapped_trough_time, trough_dif, 
-                                       color='green', marker='v', s=80, label='DIF谷值', zorder=25, alpha=0.8)
+                                       color='green', marker='v', s=80, label='', zorder=25, alpha=0.8)
                             
                         except Exception as e:
                             logger.warning(f"处理DIF谷值点失败: {e}")
@@ -2146,12 +2067,12 @@ class ETF159506RedisKlineGenerator:
                 # 开盘价（第一个有效价格）
                 open_price = valid_prices.iloc[0]
                 open_time = valid_prices.index[0]
-                ax1.scatter(open_time, open_price, color='black', s=80, marker='o', label='开盘', zorder=5)
+                ax1.scatter(open_time, open_price, color='black', s=80, marker='o', label='', zorder=5)
                 
                 # 当前价（最后一个有效价格）
                 current_price = valid_prices.iloc[-1]
                 current_time = valid_prices.index[-1]
-                ax1.scatter(current_time, current_price, color='black', s=80, marker='o', label='当前', zorder=5)
+                ax1.scatter(current_time, current_price, color='black', s=80, marker='o', label='', zorder=5)
                 
                 # 最高价
                 high_price = valid_prices.max()
