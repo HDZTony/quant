@@ -1389,6 +1389,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, price, dif_value)
                             peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            # 确保时间戳有时区信息，与mapped_df.index保持一致
+                            if peak_timestamp.tz is None:
+                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             peak_price = peak[1]
                             
                             # 应用时间映射
@@ -1421,6 +1424,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, price, dif_value)
                             trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            # 确保时间戳有时区信息，与mapped_df.index保持一致
+                            if trough_timestamp.tz is None:
+                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             trough_price = trough[1]
                             
                             # 应用时间映射
@@ -1779,6 +1785,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, price, dif_value)
                             peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            # 确保时间戳有时区信息，与mapped_df.index保持一致
+                            if peak_timestamp.tz is None:
+                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             peak_price = peak[1]
                             
                             # 应用时间映射
@@ -1818,6 +1827,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, price, dif_value)
                             trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            # 确保时间戳有时区信息，与mapped_df.index保持一致
+                            if trough_timestamp.tz is None:
+                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             trough_price = trough[1]
                             
                             # 应用时间映射
@@ -1911,6 +1923,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, dif_value, price_value)
                             peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            # 确保时间戳有时区信息，与minute_index保持一致
+                            if peak_timestamp.tz is None:
+                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             peak_dif = peak[1]
                             
                             # 应用时间映射
@@ -1943,6 +1958,9 @@ class ETF159506RedisKlineGenerator:
                         try:
                             # 极值点格式: (timestamp, dif_value, price_value)
                             trough_timestamp = pd.to_datetime(trough[0], unit='ns')
+                            # 确保时间戳有时区信息，与minute_index保持一致
+                            if trough_timestamp.tz is None:
+                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
                             trough_dif = trough[1]
                             
                             # 应用时间映射
