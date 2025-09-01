@@ -2396,8 +2396,7 @@ class ETF159506RedisKlineGenerator:
                 logger.info(f"买卖点图表已保存到: {save_path}")
             
             # 显示图表
-            plt.show()
-            
+            plt.show(block=False)            
             logger.info("买卖点图表生成完成")
             
         except Exception as e:
