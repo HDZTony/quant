@@ -73,7 +73,6 @@ class ETF159506Strategy(Strategy):
         self.divergence_threshold = config.divergence_threshold
         self.advance_trading_bars = config.advance_trading_bars
         self.confirmation_bars = config.confirmation_bars
-        self.max_divergence_duration = config.max_divergence_duration
         
         # 背离检测改进：记录历史极值点
         self.price_peaks = deque(maxlen=config.max_extremes)  # 存储价格峰值点 (timestamp, price, dif_value)
@@ -363,7 +362,7 @@ class ETF159506Strategy(Strategy):
         if golden_cross:
             self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             
-            # 检查MACD值是否足够大
+            # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
             if current_macd_abs < macd_threshold:
                 self._log.info(f"金叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
                 return
@@ -396,7 +395,7 @@ class ETF159506Strategy(Strategy):
         elif death_cross:
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
             
-            # 检查MACD值是否足够大
+            # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
             if current_macd_abs < macd_threshold:
                 self._log.info(f"死叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
                 return
@@ -426,7 +425,7 @@ class ETF159506Strategy(Strategy):
                 self.execute_sell_signal(bar)
                 self.technical_signal = 0  # 信号归零
     
-    def check_divergence(self, bar: Bar):
+    def check_divergence(self, bar: Bar, action: str):
         """检查DIF背离信号"""
         # 需要足够的极值点来检测背离
         if len(self.price_peaks) < 2 or len(self.price_troughs) < 2 or len(self.dif_peaks) < 2 or len(self.dif_troughs) < 2:
@@ -438,9 +437,9 @@ class ETF159506Strategy(Strategy):
         
         # 处理背离信号
         if top_divergence:
-            self.handle_top_divergence(bar)
+            self.handle_top_divergence(bar, action)
         elif bottom_divergence:
-            self.handle_bottom_divergence(bar)
+            self.handle_bottom_divergence(bar, action)
     
     def detect_top_divergence(self):
         """检测顶背离：在DIF新高点判断价格变化"""
@@ -708,19 +707,20 @@ class ETF159506Strategy(Strategy):
                         self.macd_extremes_history.append((prev_macd_timestamp, prev_macd, 'trough'))
                         self._log.debug(f"检测到新DIF谷值: 时间{prev_macd_timestamp}, DIF{prev_macd:.6f}, 价格{prev_price:.4f}")
                     
-                    self.check_divergence(bar)
+                    self.check_divergence(bar, action)
                 else:
                     self._log.debug(f"略过DIF{macd_type}: 时间{prev_macd_timestamp}, DIF{prev_macd:.6f} (差异太小)")
             else:
                 self._log.debug(f"未检测到DIF极值点: 上一个DIF={prev_macd:.6f}")
     
-    def handle_top_divergence(self, bar: Bar):
+    def handle_top_divergence(self, bar: Bar, action: str):
         """处理顶背离信号"""
         self._log.info("检测到顶背离信号：DIF创新高但价格未创新高，看跌信号")
         self.last_divergence_signal = "top_divergence"
         
         # 累积卖出信号
-        self.technical_signal -= 30
+        if action == 'keep':
+            self.technical_signal -= 30
         self._log.info(f"顶背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录顶背离技术信号
@@ -740,13 +740,14 @@ class ETF159506Strategy(Strategy):
             self.execute_divergence_sell_signal(bar)
             self.technical_signal = 0  # 信号归零
     
-    def handle_bottom_divergence(self, bar: Bar):
+    def handle_bottom_divergence(self, bar: Bar, action: str):
         """处理底背离信号"""
         self._log.info("检测到底背离信号：DIF创新低但价格未创新低，看涨信号")
         self.last_divergence_signal = "bottom_divergence"
         
         # 累积买入信号
-        self.technical_signal += 30
+        if action == 'keep':
+            self.technical_signal += 30
         self._log.info(f"底背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录底背离技术信号

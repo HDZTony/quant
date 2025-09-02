@@ -400,10 +400,8 @@ class ETF159506OfficialBacktest:
                             "initial_position_quantity": 0,  # 添加：初始持仓数量
                             # 背离检测参数
                             "dea_trend_period": 3,
-                            "divergence_threshold": 0.0001,
                             "advance_trading_bars": 1,
                             "confirmation_bars": 1,
-                            "max_divergence_duration": 8,
                         },
                     )
                 ],

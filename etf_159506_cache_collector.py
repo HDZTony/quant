@@ -1002,7 +1002,7 @@ class ETF159506CacheWebSocketClient:
         self.start_time = datetime.now()
         
         # 配置 - 优化数据保存
-        self.save_interval = 10  # 5分钟保存一次（减少文件数量）
+        self.save_interval = 300  # 5分钟保存一次（减少文件数量）
         self.merge_interval = 3600  # 1小时合并一次文件
         self.trading_time_check_interval = 60  # 改为60秒检查一次交易时间，减少检查频率
         self.data_integrity_check_interval = 1800  # 30分钟检查一次数据完整性
