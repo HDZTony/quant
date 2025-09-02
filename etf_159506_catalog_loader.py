@@ -1698,89 +1698,61 @@ class ETF159506RedisKlineGenerator:
                 logger.info("开始处理极值点数据...")
                 
                 # 处理价格极值点
-                if 'price_peaks' in extremes_data and extremes_data['price_peaks']:
-                    price_peaks = extremes_data['price_peaks']
-                    logger.info(f"处理 {len(price_peaks)} 个价格峰值点")
+                if 'price_extremes_history' in extremes_data and extremes_data['price_extremes_history']:
+                    price_extremes = extremes_data['price_extremes_history']
+                    logger.info(f"处理 {len(price_extremes)} 个价格极值点")
                     
-                    for peak in price_peaks:
+                    for extreme in price_extremes:
                         try:
-                            # 极值点格式: (timestamp, price, dif_value)
-                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            # 极值点格式: (timestamp, price, 'peak'/'trough')
+                            extreme_timestamp = pd.to_datetime(extreme[0], unit='ns')
                             # 确保时间戳有时区信息，与mapped_df.index保持一致
-                            if peak_timestamp.tz is None:
-                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            peak_price = peak[1]
+                            if extreme_timestamp.tz is None:
+                                extreme_timestamp = extreme_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
+                            extreme_price = extreme[1]
+                            extreme_type = extreme[2]  # 'peak' 或 'trough'
                             
                             # 应用时间映射
-                            current_time = peak_timestamp.time()
+                            current_time = extreme_timestamp.time()
                             if current_time < datetime_time(11, 30):
-                                mapped_peak_time = peak_timestamp
+                                mapped_extreme_time = extreme_timestamp
                             elif current_time > datetime_time(13, 0):
-                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
+                                mapped_extreme_time = extreme_timestamp - timedelta(hours=1, minutes=30)
                             else:
                                 continue
                             
                             # 检查时间范围
-                            if mapped_peak_time < mapped_df.index.min():
-                                mapped_peak_time = mapped_df.index.min()
-                            elif mapped_peak_time > mapped_df.index.max():
-                                mapped_peak_time = mapped_df.index.max()
+                            if mapped_extreme_time < mapped_df.index.min():
+                                mapped_extreme_time = mapped_df.index.min()
+                            elif mapped_extreme_time > mapped_df.index.max():
+                                mapped_extreme_time = mapped_df.index.max()
                             
-                            # 绘制价格峰值点（紫色菱形）
-                            ax1.scatter(mapped_peak_time, peak_price, 
-                                       color='purple', marker='D', s=100, label='', zorder=25, alpha=0.8)
-                            
-                            # 添加峰值标注
-                            ax1.annotate(f'峰值\n{peak_price:.5f}', 
-                                       xy=(mapped_peak_time, peak_price),
-                                       xytext=(5, 15), textcoords='offset points',
-                                       fontsize=8, color='purple', weight='bold',
-                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.1))
-                            
-                        except Exception as e:
-                            logger.warning(f"处理价格峰值点失败: {e}")
-                
-                if 'price_troughs' in extremes_data and extremes_data['price_troughs']:
-                    price_troughs = extremes_data['price_troughs']
-                    logger.info(f"处理 {len(price_troughs)} 个价格谷值点")
-                    
-                    for trough in price_troughs:
-                        try:
-                            # 极值点格式: (timestamp, price, dif_value)
-                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
-                            # 确保时间戳有时区信息，与mapped_df.index保持一致
-                            if trough_timestamp.tz is None:
-                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            trough_price = trough[1]
-                            
-                            # 应用时间映射
-                            current_time = trough_timestamp.time()
-                            if current_time < datetime_time(11, 30):
-                                mapped_trough_time = trough_timestamp
-                            elif current_time > datetime_time(13, 0):
-                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
-                            else:
-                                continue
-                            
-                            # 检查时间范围
-                            if mapped_trough_time < mapped_df.index.min():
-                                mapped_trough_time = mapped_df.index.min()
-                            elif mapped_trough_time > mapped_df.index.max():
-                                mapped_trough_time = mapped_df.index.max()
-                            
-                            # 绘制价格谷值点（棕色菱形）
-                            ax1.scatter(mapped_trough_time, trough_price, 
-                                       color='brown', marker='D', s=100, label='', zorder=25, alpha=0.8)
-                            
-                            # 添加谷值标注
-                            ax1.annotate(f'谷值\n{trough_price:.5f}', 
-                                       xy=(mapped_trough_time, trough_price),
-                                       xytext=(5, -20), textcoords='offset points',
-                                       fontsize=8, color='brown', weight='bold',
-                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='brown', alpha=0.1))
+                            # 根据极值类型绘制不同的标记
+                            if extreme_type == 'peak':
+                                # 绘制价格峰值点（紫色菱形）
+                                ax1.scatter(mapped_extreme_time, extreme_price, 
+                                           color='purple', marker='D', s=100, label='', zorder=25, alpha=0.8)
+                                
+                                # 添加峰值标注
+                                ax1.annotate(f'峰值\n{extreme_price:.5f}', 
+                                           xy=(mapped_extreme_time, extreme_price),
+                                           xytext=(5, 15), textcoords='offset points',
+                                           fontsize=8, color='purple', weight='bold',
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.1))
+                            else:  # extreme_type == 'trough'
+                                # 绘制价格谷值点（棕色菱形）
+                                ax1.scatter(mapped_extreme_time, extreme_price, 
+                                           color='brown', marker='D', s=100, label='', zorder=25, alpha=0.8)
+                                
+                                # 添加谷值标注
+                                ax1.annotate(f'谷值\n{extreme_price:.5f}', 
+                                           xy=(mapped_extreme_time, extreme_price),
+                                           xytext=(5, -20), textcoords='offset points',
+                                           fontsize=8, color='brown', weight='bold',
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='brown', alpha=0.1))
                             
                         except Exception as e:
-                            logger.warning(f"处理价格谷值点失败: {e}")
+                            logger.warning(f"处理价格极值点失败: {e}")
                 
                 logger.info("极值点处理完成")
             else:
@@ -1836,87 +1808,64 @@ class ETF159506RedisKlineGenerator:
             
             # 添加DIF极值点
             if extremes_data and len(extremes_data) > 0:
-                if 'dif_peaks' in extremes_data and extremes_data['dif_peaks']:
-                    dif_peaks = extremes_data['dif_peaks']
-                    logger.info(f"处理 {len(dif_peaks)} 个DIF峰值点")
+                # 处理MACD极值点
+                if 'macd_extremes_history' in extremes_data and extremes_data['macd_extremes_history']:
+                    macd_extremes = extremes_data['macd_extremes_history']
+                    logger.info(f"处理 {len(macd_extremes)} 个MACD极值点")
                     
-                    for peak in dif_peaks:
+                    for extreme in macd_extremes:
                         try:
-                            # 极值点格式: (timestamp, dif_value, price_value)
-                            peak_timestamp = pd.to_datetime(peak[0], unit='ns')
+                            # 极值点格式: (timestamp, dif_value, 'peak'/'trough')
+                            extreme_timestamp = pd.to_datetime(extreme[0], unit='ns')
                             # 确保时间戳有时区信息，与minute_index保持一致
-                            if peak_timestamp.tz is None:
-                                peak_timestamp = peak_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            peak_dif = peak[1]
+                            if extreme_timestamp.tz is None:
+                                extreme_timestamp = extreme_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
+                            extreme_dif = extreme[1]
+                            extreme_type = extreme[2]  # 'peak' 或 'trough'
                             
                             # 应用时间映射
-                            current_time = peak_timestamp.time()
+                            current_time = extreme_timestamp.time()
                             if current_time < datetime_time(11, 30):
-                                mapped_peak_time = peak_timestamp
+                                mapped_extreme_time = extreme_timestamp
                             elif current_time > datetime_time(13, 0):
-                                mapped_peak_time = peak_timestamp - timedelta(hours=1, minutes=30)
+                                mapped_extreme_time = extreme_timestamp - timedelta(hours=1, minutes=30)
                             else:
                                 continue
                             
                             # 检查时间范围
-                            if mapped_peak_time < minute_index.min():
-                                mapped_peak_time = minute_index.min()
-                            elif mapped_peak_time > minute_index.max():
-                                mapped_peak_time = minute_index.max()
+                            if mapped_extreme_time < minute_index.min():
+                                mapped_extreme_time = minute_index.min()
+                            elif mapped_extreme_time > minute_index.max():
+                                mapped_extreme_time = minute_index.max()
                             
-                            # 绘制DIF峰值点（红色三角形）
-                            ax3.scatter(mapped_peak_time, peak_dif, 
-                                       color='red', marker='^', s=80, label='', zorder=25, alpha=0.8)
-                            # 添加峰值标注
-                            ax3.annotate(f'峰值\n{peak_dif:.3f}', 
-                                       xy=(mapped_peak_time, peak_dif),
-                                       xytext=(5, 15), textcoords='offset points',
-                                       fontsize=8, color='red', weight='bold',
-                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='red', alpha=0.1))
+                            # 根据极值类型绘制不同的标记
+                            if extreme_type == 'peak':
+                                # 绘制DIF峰值点（红色三角形）
+                                ax3.scatter(mapped_extreme_time, extreme_dif, 
+                                           color='red', marker='^', s=80, label='', zorder=25, alpha=0.8)
+                                # 添加峰值标注
+                                ax3.annotate(f'峰值\n{extreme_dif:.8f}', 
+                                           xy=(mapped_extreme_time, extreme_dif),
+                                           xytext=(5, 15), textcoords='offset points',
+                                           fontsize=8, color='red', weight='bold',
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='red', alpha=0.1))
+                            else:  # extreme_type == 'trough'
+                                # 绘制DIF谷值点（绿色三角形）
+                                ax3.scatter(mapped_extreme_time, extreme_dif, 
+                                           color='green', marker='v', s=80, label='', zorder=25, alpha=0.8)
+                                # 添加谷值标注
+                                ax3.annotate(f'谷值\n{extreme_dif:.8f}', 
+                                           xy=(mapped_extreme_time, extreme_dif),
+                                           xytext=(5, -20), textcoords='offset points',
+                                           fontsize=8, color='green', weight='bold',
+                                           bbox=dict(boxstyle='round,pad=0.2', facecolor='green', alpha=0.1))
                             
                         except Exception as e:
-                            logger.warning(f"处理DIF峰值点失败: {e}")
-                
-                if 'dif_troughs' in extremes_data and extremes_data['dif_troughs']:
-                    dif_troughs = extremes_data['dif_troughs']
-                    logger.info(f"处理 {len(dif_troughs)} 个DIF谷值点")
+                            logger.warning(f"处理MACD极值点失败: {e}")
                     
-                    for trough in dif_troughs:
-                        try:
-                            # 极值点格式: (timestamp, dif_value, price_value)
-                            trough_timestamp = pd.to_datetime(trough[0], unit='ns')
-                            # 确保时间戳有时区信息，与minute_index保持一致
-                            if trough_timestamp.tz is None:
-                                trough_timestamp = trough_timestamp.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                            trough_dif = trough[1]
-                            
-                            # 应用时间映射
-                            current_time = trough_timestamp.time()
-                            if current_time < datetime_time(11, 30):
-                                mapped_trough_time = trough_timestamp
-                            elif current_time > datetime_time(13, 0):
-                                mapped_trough_time = trough_timestamp - timedelta(hours=1, minutes=30)
-                            else:
-                                continue
-                            
-                            # 检查时间范围
-                            if mapped_trough_time < minute_index.min():
-                                mapped_trough_time = minute_index.min()
-                            elif mapped_trough_time > minute_index.max():
-                                mapped_trough_time = minute_index.max()
-                            
-                            # 绘制DIF谷值点（绿色三角形）
-                            ax3.scatter(mapped_trough_time, trough_dif, 
-                                       color='green', marker='v', s=80, label='', zorder=25, alpha=0.8)
-                            # 添加峰值标注
-                            ax3.annotate(f'谷值\n{trough_dif:.5f}', 
-                                       xy=(mapped_trough_time, trough_dif),
-                                       xytext=(5, -20), textcoords='offset points',
-                                       fontsize=8, color='green', weight='bold',
-                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='green', alpha=0.1))
-                            
-                        except Exception as e:
-                            logger.warning(f"处理DIF谷值点失败: {e}")
+                    logger.info("MACD极值点处理完成")
+                else:
+                    logger.info("没有MACD极值点数据")
             
             ax3.set_title('MACD指标与DIF极值点', fontsize=12)
             ax3.set_ylabel('MACD', fontsize=10)

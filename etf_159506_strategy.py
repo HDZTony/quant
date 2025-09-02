@@ -162,8 +162,8 @@ class ETF159506Strategy(Strategy):
             }
             self._log.info(f"策略停止时保存了 {len(self.price_peaks)} 个价格峰值, {len(self.price_troughs)} 个价格谷值, {len(self.dif_peaks)} 个DIF峰值, {len(self.dif_troughs)} 个DIF谷值")
         
-        self._log.info("ETF159506 MACD金叉死叉策略已停止")
-
+        self.print_extremes_history()
+        
     def on_bar(self, bar: Bar):
         """处理K线数据"""
         # 更新MACD指标
@@ -501,7 +501,7 @@ class ETF159506Strategy(Strategy):
         return False
     
     
-    def _is_relative_extreme(self, extreme_type, prev_value, prev_timestamp, data_type='price', min_extreme_distance=None):
+    def _is_relative_extreme(self, extreme_type, prev_value, data_type, min_extreme_distance=None):
         """检查前值是否相对于上一个极值点是真正的极值
         
         规则：
@@ -511,16 +511,15 @@ class ETF159506Strategy(Strategy):
         Args:
             extreme_type: 极值类型 ('peak' 或 'trough')
             prev_value: 前一个值
-            prev_timestamp: 前一个时间戳
             data_type: 数据类型 ('price' 或 'macd')
             min_extreme_distance: 最小极值距离（如果为None，则根据数据类型自动设置）
         """
         # 根据数据类型自动设置最小极值距离
         if min_extreme_distance is None:
             if data_type == 'price':
-                min_extreme_distance = 0.001  # 价格最小差异0.001元
+                min_extreme_distance = 0  # 价格最小差异0.001元
             else:  # data_type == 'macd'
-                min_extreme_distance = 0.00001  # DIF最小差异0.00001
+                min_extreme_distance = 0  # DIF最小差异0.00001
         # 根据数据类型选择对应的历史记录
         if data_type == 'price':
             history = self.price_extremes_history
@@ -550,9 +549,6 @@ class ETF159506Strategy(Strategy):
         
         # 如果新极值与上一个极值类型相同
         else:
-            # 计算与上一个极值的绝对差异
-            diff_absolute = abs(prev_value - last_extreme_value)
-            
             # 根据极值类型决定保留策略
             if extreme_type == 'peak':
                 # 峰值：保留更大的值
@@ -620,7 +616,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"检测到价格极值点: 类型={price_type}, 价格={prev_price:.4f}")
                 
                 # 使用新的相对极值检测逻辑
-                is_extreme, action = self._is_relative_extreme(price_type, prev_price, prev_price_timestamp, 'price')
+                is_extreme, action = self._is_relative_extreme(price_type, prev_price, 'price')
                 
                 if is_extreme:
                     # 处理替换逻辑
@@ -672,7 +668,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"检测到DIF极值点: 类型={macd_type}, DIF={prev_macd:.6f}")
                 
                 # 使用新的相对极值检测逻辑
-                is_extreme, action = self._is_relative_extreme(macd_type, prev_macd, prev_macd_timestamp, 'macd')
+                is_extreme, action = self._is_relative_extreme(macd_type, prev_macd, 'macd')
             
                 if is_extreme:
                     if action == 'replace':
@@ -969,4 +965,56 @@ class ETF159506Strategy(Strategy):
 
     def on_dispose(self):
         """策略销毁时调用"""
-        self._log.info("ETF159506 MACD金叉死叉策略已销毁") 
+        self._log.info("ETF159506 MACD金叉死叉策略已销毁")
+    
+    def print_extremes_history(self):
+        """打印所有极值点历史内容"""
+        self._log.info("=" * 80)
+        self._log.info("价格极值点历史 (price_extremes_history) 详细内容:")
+        self._log.info("=" * 80)
+        if self.price_extremes_history:
+            for i, (timestamp, price, extreme_type) in enumerate(self.price_extremes_history):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"  [{i+1:3d}] 时间: {time_str}, 价格: {price:.4f}, 类型: {extreme_type}")
+        else:
+            self._log.info("  无价格极值点历史记录")
+        
+        self._log.info("=" * 80)
+        self._log.info("MACD极值点历史 (macd_extremes_history) 详细内容:")
+        self._log.info("=" * 80)
+        if self.macd_extremes_history:
+            for i, (timestamp, macd_value, extreme_type) in enumerate(self.macd_extremes_history):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"  [{i+1:3d}] 时间: {time_str}, DIF值: {macd_value:.6f}, 类型: {extreme_type}")
+        else:
+            self._log.info("  无MACD极值点历史记录")
+        
+        self._log.info("=" * 80)
+        
+        # 同时打印当前deque中的极值点
+        self._log.info("当前deque中的极值点:")
+        self._log.info(f"  价格峰值 (price_peaks): {len(self.price_peaks)} 个")
+        if self.price_peaks:
+            for i, (timestamp, price, dif_value) in enumerate(self.price_peaks):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"    [{i+1:3d}] 时间: {time_str}, 价格: {price:.4f}, DIF: {dif_value:.6f}")
+        
+        self._log.info(f"  价格谷值 (price_troughs): {len(self.price_troughs)} 个")
+        if self.price_troughs:
+            for i, (timestamp, price, dif_value) in enumerate(self.price_troughs):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"    [{i+1:3d}] 时间: {time_str}, 价格: {price:.4f}, DIF: {dif_value:.6f}")
+        
+        self._log.info(f"  DIF峰值 (dif_peaks): {len(self.dif_peaks)} 个")
+        if self.dif_peaks:
+            for i, (timestamp, dif_value, price_value) in enumerate(self.dif_peaks):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"    [{i+1:3d}] 时间: {time_str}, DIF: {dif_value:.6f}, 价格: {price_value:.4f}")
+        
+        self._log.info(f"  DIF谷值 (dif_troughs): {len(self.dif_troughs)} 个")
+        if self.dif_troughs:
+            for i, (timestamp, dif_value, price_value) in enumerate(self.dif_troughs):
+                time_str = pd.to_datetime(timestamp, unit='ns').strftime('%Y-%m-%d %H:%M:%S')
+                self._log.info(f"    [{i+1:3d}] 时间: {time_str}, DIF: {dif_value:.6f}, 价格: {price_value:.4f}")
+        
+        self._log.info("=" * 80) 
