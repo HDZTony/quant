@@ -1731,9 +1731,9 @@ class ETF159506RedisKlineGenerator:
                                        color='purple', marker='D', s=100, label='', zorder=25, alpha=0.8)
                             
                             # 添加峰值标注
-                            ax1.annotate(f'峰值\n{peak_price:.3f}', 
+                            ax1.annotate(f'峰值\n{peak_price:.5f}', 
                                        xy=(mapped_peak_time, peak_price),
-                                       xytext=(5, 10), textcoords='offset points',
+                                       xytext=(5, 15), textcoords='offset points',
                                        fontsize=8, color='purple', weight='bold',
                                        bbox=dict(boxstyle='round,pad=0.2', facecolor='purple', alpha=0.1))
                             
@@ -1773,9 +1773,9 @@ class ETF159506RedisKlineGenerator:
                                        color='brown', marker='D', s=100, label='', zorder=25, alpha=0.8)
                             
                             # 添加谷值标注
-                            ax1.annotate(f'谷值\n{trough_price:.3f}', 
+                            ax1.annotate(f'谷值\n{trough_price:.5f}', 
                                        xy=(mapped_trough_time, trough_price),
-                                       xytext=(5, -15), textcoords='offset points',
+                                       xytext=(5, -20), textcoords='offset points',
                                        fontsize=8, color='brown', weight='bold',
                                        bbox=dict(boxstyle='round,pad=0.2', facecolor='brown', alpha=0.1))
                             
@@ -1867,6 +1867,12 @@ class ETF159506RedisKlineGenerator:
                             # 绘制DIF峰值点（红色三角形）
                             ax3.scatter(mapped_peak_time, peak_dif, 
                                        color='red', marker='^', s=80, label='', zorder=25, alpha=0.8)
+                            # 添加峰值标注
+                            ax3.annotate(f'峰值\n{peak_dif:.3f}', 
+                                       xy=(mapped_peak_time, peak_dif),
+                                       xytext=(5, 15), textcoords='offset points',
+                                       fontsize=8, color='red', weight='bold',
+                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='red', alpha=0.1))
                             
                         except Exception as e:
                             logger.warning(f"处理DIF峰值点失败: {e}")
@@ -1902,6 +1908,12 @@ class ETF159506RedisKlineGenerator:
                             # 绘制DIF谷值点（绿色三角形）
                             ax3.scatter(mapped_trough_time, trough_dif, 
                                        color='green', marker='v', s=80, label='', zorder=25, alpha=0.8)
+                            # 添加峰值标注
+                            ax3.annotate(f'谷值\n{trough_dif:.5f}', 
+                                       xy=(mapped_trough_time, trough_dif),
+                                       xytext=(5, -20), textcoords='offset points',
+                                       fontsize=8, color='green', weight='bold',
+                                       bbox=dict(boxstyle='round,pad=0.2', facecolor='green', alpha=0.1))
                             
                         except Exception as e:
                             logger.warning(f"处理DIF谷值点失败: {e}")
