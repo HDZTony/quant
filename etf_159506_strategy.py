@@ -517,9 +517,9 @@ class ETF159506Strategy(Strategy):
         # 根据数据类型自动设置最小极值距离
         if min_extreme_distance is None:
             if data_type == 'price':
-                min_extreme_distance = 0  # 价格最小差异0.001元
+                min_extreme_distance = 0.001  # 价格最小差异0.001元
             else:  # data_type == 'macd'
-                min_extreme_distance = 0  # DIF最小差异0.00001
+                min_extreme_distance = 0.0001  # DIF最小差异0.0001
         # 根据数据类型选择对应的历史记录
         if data_type == 'price':
             history = self.price_extremes_history
@@ -549,6 +549,12 @@ class ETF159506Strategy(Strategy):
         
         # 如果新极值与上一个极值类型相同
         else:
+            # 计算与上一个极值的绝对差异
+            diff_absolute = abs(prev_value - last_extreme_value)
+            
+            # 如果差异太小，略过当前极值
+            if diff_absolute < min_extreme_distance:
+                return False, None
             # 根据极值类型决定保留策略
             if extreme_type == 'peak':
                 # 峰值：保留更大的值

@@ -44,7 +44,12 @@ def is_relative_extreme(extreme_type, current_value, current_timestamp,
     
     # 如果新极值与上一个极值类型相同
     else:
+         # 计算与上一个极值的绝对差异
+        diff_absolute = abs(current_value - last_extreme_value)
         
+        # 如果差异太小，略过当前极值
+        if diff_absolute < min_extreme_distance:
+            return False, None
         # 根据极值类型决定保留策略
         if extreme_type == 'peak':
             # 峰值：保留更大的值
