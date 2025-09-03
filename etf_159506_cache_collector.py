@@ -348,31 +348,54 @@ class ETF159506CacheManager:
         logger.info(f"工具已添加到Cache: {self.instrument_id}")
     
     def store_quote_tick(self, data: Dict):
-        """存储报价tick数据到Cache"""
+        """存储报价tick数据到Cache - 修复版本"""
         try:
+            # 检查数据是否为None
+            if data is None:
+                logger.warning("收到None数据，跳过存储")
+                return
+            
             # 安全地转换数据类型
             bid_price = data.get('bid_price', data.get('price', 0))
             ask_price = data.get('ask_price', data.get('price', 0))
             bid_size = data.get('bid_size', 0)
             ask_size = data.get('ask_size', 0)
             
-            # 确保价格和数量是有效的数值
+            # 数据验证和修复
             if not isinstance(bid_price, (int, float)) or bid_price <= 0:
-                bid_price = 0
+                logger.warning(f"无效买价: {bid_price}，跳过存储")
+                return
             if not isinstance(ask_price, (int, float)) or ask_price <= 0:
-                ask_price = 0
+                logger.warning(f"无效卖价: {ask_price}，跳过存储")
+                return
             if not isinstance(bid_size, (int, float)) or bid_size < 0:
                 bid_size = 0
             if not isinstance(ask_size, (int, float)) or ask_size < 0:
                 ask_size = 0
             
-            # 创建QuoteTick对象 - 使用instrument的方法
+            # 修复精度问题：统一到3位小数
+            bid_price = round(float(bid_price), 3)
+            ask_price = round(float(ask_price), 3)
+            
+            # 修复数据类型问题：确保数量为整数
+            bid_size = int(float(bid_size))
+            ask_size = int(float(ask_size))
+            
+            # 验证价差合理性
+            spread = ask_price - bid_price
+            if spread < 0:
+                logger.warning(f"价差异常: 卖价{ask_price} < 买价{bid_price}，跳过存储")
+                return
+            if spread > 0.01:  # 价差超过1分钱，可能是异常数据
+                logger.warning(f"价差过大: {spread:.4f}，可能是异常数据")
+            
+            # 创建QuoteTick对象 - 使用修复后的数据
             quote_tick = QuoteTick(
                 instrument_id=self.instrument_id,
-                bid_price=self.instrument.make_price(bid_price),  # 使用instrument的make_price方法
-                ask_price=self.instrument.make_price(ask_price),  # 使用instrument的make_price方法
-                bid_size=Quantity.from_int(int(float(bid_size))),  # 使用from_int方法
-                ask_size=Quantity.from_int(int(float(ask_size))),  # 使用from_int方法
+                bid_price=self.instrument.make_price(bid_price),
+                ask_price=self.instrument.make_price(ask_price),
+                bid_size=Quantity.from_int(bid_size),
+                ask_size=Quantity.from_int(ask_size),
                 ts_event=self.clock.timestamp_ns(),
                 ts_init=self.clock.timestamp_ns(),
             )
@@ -384,10 +407,17 @@ class ETF159506CacheManager:
         except Exception as e:
             logger.error(f"存储QuoteTick失败: {e}")
             logger.error(f"数据内容: {data}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
     
     def store_trade_tick(self, data: Dict):
         """存储交易tick数据到Cache"""
         try:
+            # 检查数据是否为None
+            if data is None:
+                logger.warning("收到None数据，跳过存储")
+                return
+            
             # 安全地转换数据类型
             price = data.get('price', 0)
             volume = data.get('volume', 0)
@@ -400,13 +430,20 @@ class ETF159506CacheManager:
                 logger.warning(f"无效成交量: {volume}")
                 return
             
-            # 将成交量转换为整数（避免数据类型问题）
-            volume_int = int(float(volume))  # 确保是整数
+            # 修复精度问题：统一到3位小数
+            price = round(float(price), 3)
+            
+            # 修复数据类型问题：确保成交量为整数
+            volume_int = int(float(volume))
             
             # 验证成交量必须大于0
             if volume_int <= 0:
                 logger.warning(f"成交量为0或负数，跳过存储: {volume_int}")
                 return
+            
+            # 验证成交量合理性（避免异常大的成交量）
+            if volume_int > 1000000000:  # 超过10亿股，可能是异常数据
+                logger.warning(f"成交量异常大: {volume_int}，可能是异常数据")
             
             # 创建TradeTick对象
             current_time_ns = self.clock.timestamp_ns()
@@ -452,19 +489,68 @@ class ETF159506CacheManager:
             return {}
     
     def get_historical_data(self, limit: int = 100000) -> Dict:
-        """获取历史数据"""
+        """获取历史数据 - 修复版本"""
         try:
-            quote_ticks = self.cache.quote_ticks(self.instrument_id)[-limit:]
-            trade_ticks = self.cache.trade_ticks(self.instrument_id)[-limit:]
+            # 添加数据验证和错误处理
+            if not hasattr(self, 'cache') or self.cache is None:
+                logger.error("Cache未初始化")
+                return {}
             
-            return {
-                'quote_ticks': quote_ticks,
-                'trade_ticks': trade_ticks,
-                'total_quotes': len(quote_ticks),
-                'total_trades': len(trade_ticks)
+            if not hasattr(self, 'instrument_id') or self.instrument_id is None:
+                logger.error("Instrument ID未初始化")
+                return {}
+            
+            # 获取数据并添加错误处理
+            try:
+                quote_ticks = self.cache.quote_ticks(self.instrument_id)[-limit:]
+            except Exception as e:
+                logger.error(f"获取报价数据失败: {e}")
+                quote_ticks = []
+            
+            try:
+                trade_ticks = self.cache.trade_ticks(self.instrument_id)[-limit:]
+            except Exception as e:
+                logger.error(f"获取交易数据失败: {e}")
+                trade_ticks = []
+            
+            # 验证数据完整性
+            valid_quotes = []
+            for quote in quote_ticks:
+                try:
+                    # 验证QuoteTick对象的完整性
+                    if (hasattr(quote, 'bid_price') and hasattr(quote, 'ask_price') and
+                        hasattr(quote, 'bid_size') and hasattr(quote, 'ask_size')):
+                        valid_quotes.append(quote)
+                    else:
+                        logger.warning(f"跳过无效的QuoteTick: {quote}")
+                except Exception as e:
+                    logger.warning(f"验证QuoteTick时出错: {e}")
+            
+            valid_trades = []
+            for trade in trade_ticks:
+                try:
+                    # 验证TradeTick对象的完整性
+                    if (hasattr(trade, 'price') and hasattr(trade, 'size')):
+                        valid_trades.append(trade)
+                    else:
+                        logger.warning(f"跳过无效的TradeTick: {trade}")
+                except Exception as e:
+                    logger.warning(f"验证TradeTick时出错: {e}")
+            
+            result = {
+                'quote_ticks': valid_quotes,
+                'trade_ticks': valid_trades,
+                'total_quotes': len(valid_quotes),
+                'total_trades': len(valid_trades)
             }
+            
+            logger.debug(f"获取历史数据成功: 报价{len(valid_quotes)}条, 交易{len(valid_trades)}条")
+            return result
+            
         except Exception as e:
             logger.error(f"获取历史数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
             return {}
     
     def save_to_parquet(self, filepath: str):
@@ -866,19 +952,35 @@ class ETF159506CacheDataProcessor:
                     best_bid = bid_asks['bids'][0] if bid_asks['bids'] else {'price': latest_price, 'volume': 0}
                     best_ask = bid_asks['asks'][0] if bid_asks['asks'] else {'price': latest_price, 'volume': 0}
                     
+                    # 数据验证和修复
+                    bid_price = best_bid.get('price', latest_price)
+                    ask_price = best_ask.get('price', latest_price)
+                    bid_volume = best_bid.get('volume', 0)
+                    ask_volume = best_ask.get('volume', 0)
+                    
+                    # 验证价格合理性
+                    if bid_price <= 0 or ask_price <= 0:
+                        logger.warning(f"价格异常: 买价{bid_price}, 卖价{ask_price}，跳过存储")
+                        return
+                    
+                    # 验证价差合理性
+                    spread = ask_price - bid_price
+                    if spread < 0:
+                        logger.warning(f"价差异常: 卖价{ask_price} < 买价{bid_price}，跳过存储")
+                        return
+                    
                     quote_data = {
-                        'bid_price': best_bid['price'],      # 买一价
-                        'ask_price': best_ask['price'],      # 卖一价
-                        'bid_size': best_bid['volume'],      # 买一量
-                        'ask_size': best_ask['volume'],      # 卖一量
+                        'bid_price': bid_price,      # 买一价
+                        'ask_price': ask_price,      # 卖一价
+                        'bid_size': bid_volume,      # 买一量
+                        'ask_size': ask_volume,      # 卖一量
                     }
                     self.cache_manager.store_quote_tick(quote_data)
                     
                     # 计算并记录价差信息
-                    spread = best_ask['price'] - best_bid['price']
                     if self.total_processed % 50 == 0:  # 每50条记录一次价差
-                        logger.info(f"价差信息: 买一{best_bid['price']:.3f}({best_bid['volume']}) "
-                                   f"卖一{best_ask['price']:.3f}({best_ask['volume']}) "
+                        logger.info(f"价差信息: 买一{bid_price:.3f}({bid_volume}) "
+                                   f"卖一{ask_price:.3f}({ask_volume}) "
                                    f"价差{spread:.4f}")
                 
                 # 计算增量成交量（当前累计成交量 - 上次累计成交量）
@@ -891,6 +993,14 @@ class ETF159506CacheDataProcessor:
                 
                 # 只有当增量成交量大于0时才存储交易数据
                 if volume_increment > 0:
+                    # 数据验证
+                    if latest_price <= 0:
+                        logger.warning(f"价格异常: {latest_price}，跳过存储交易数据")
+                        return
+                    
+                    if volume_increment > 1000000000:  # 超过10亿股，可能是异常数据
+                        logger.warning(f"增量成交量异常大: {volume_increment}，可能是异常数据")
+                    
                     trade_data = {
                         'price': latest_price,                   # 成交价
                         'volume': volume_increment,              # 增量成交量
@@ -2072,7 +2182,7 @@ Cache统计:
         # 修改：在断开连接前强制保存所有数据，确保数据不丢失
         try:
             logger.info("断开连接前强制保存数据...")
-            self._save_buffer_data()
+            self._force_save_all_data()  # 使用新的强制保存方法
             logger.info("数据保存完成")
         except Exception as e:
             logger.error(f"断开连接前保存数据失败: {e}")
@@ -2088,7 +2198,7 @@ Cache统计:
         
         # 保存最终数据（再次确保数据保存）
         try:
-            self._save_buffer_data()
+            self._force_save_all_data()  # 使用新的强制保存方法
         except Exception as e:
             logger.error(f"最终数据保存失败: {e}")
         
@@ -2148,6 +2258,128 @@ Cache统计:
             
         except Exception as e:
             logger.error(f"重连失败: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
+    
+    def _force_save_all_data(self):
+        """强制保存所有缓存数据 - 不依赖缓存管理器格式"""
+        try:
+            print("开始强制保存所有缓存数据...")
+            
+            # 获取所有缓存的数据
+            all_data = []
+            
+            # 保存报价数据
+            if hasattr(self, 'quote_cache') and self.quote_cache:
+                print(f"保存 {len(self.quote_cache)} 条报价数据...")
+                for quote in self.quote_cache:
+                    try:
+                        all_data.append({
+                            'timestamp': pd.to_datetime(quote.ts_event, unit='ns'),
+                            'bid_price': float(quote.bid_price),
+                            'ask_price': float(quote.ask_price),
+                            'bid_size': int(quote.bid_size),
+                            'ask_size': int(quote.ask_size),
+                            'type': 'quote'
+                        })
+                    except Exception as e:
+                        print(f"处理报价数据时出错: {e}")
+                        continue
+            
+            # 保存交易数据
+            if hasattr(self, 'trade_cache') and self.trade_cache:
+                print(f"保存 {len(self.trade_cache)} 条交易数据...")
+                for trade in self.trade_cache:
+                    try:
+                        all_data.append({
+                            'timestamp': pd.to_datetime(trade.ts_event, unit='ns'),
+                            'price': float(trade.price),
+                            'size': int(trade.size),
+                            'trade_id': str(trade.trade_id),
+                            'type': 'trade'
+                        })
+                    except Exception as e:
+                        print(f"处理交易数据时出错: {e}")
+                        continue
+            
+            # 如果没有数据，尝试从缓存管理器获取
+            if not all_data:
+                print("尝试从缓存管理器获取数据...")
+                try:
+                    cache_data = self.cache_manager.get_historical_data(limit=100000)
+                    if cache_data:
+                        if cache_data.get('quote_ticks'):
+                            for quote in cache_data['quote_ticks']:
+                                try:
+                                    all_data.append({
+                                        'timestamp': pd.to_datetime(quote.ts_event, unit='ns'),
+                                        'bid_price': float(quote.bid_price),
+                                        'ask_price': float(quote.ask_price),
+                                        'bid_size': int(quote.bid_size),
+                                        'ask_size': int(quote.ask_size),
+                                        'type': 'quote'
+                                    })
+                                except Exception as e:
+                                    continue
+                        
+                        if cache_data.get('trade_ticks'):
+                            for trade in cache_data['trade_ticks']:
+                                try:
+                                    all_data.append({
+                                        'timestamp': pd.to_datetime(trade.ts_event, unit='ns'),
+                                        'price': float(trade.price),
+                                        'size': int(trade.size),
+                                        'trade_id': str(trade.trade_id),
+                                        'type': 'trade'
+                                    })
+                                except Exception as e:
+                                    continue
+                except Exception as e:
+                    print(f"从缓存管理器获取数据失败: {e}")
+            
+            if not all_data:
+                print("没有找到可保存的数据")
+                return
+            
+            print(f"找到 {len(all_data)} 条数据，开始保存...")
+            
+            # 按日期分组保存
+            today = datetime.now().date()
+            filename = f"cache_data_{today.strftime('%Y%m%d')}.parquet"
+            filepath = Path(self.catalog_path) / filename
+            
+            # 确保目录存在
+            catalog_dir = Path(self.catalog_path).resolve()
+            catalog_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 创建DataFrame
+            df = pd.DataFrame(all_data)
+            
+            # 如果文件已存在，合并数据
+            if filepath.exists():
+                try:
+                    existing_df = pd.read_parquet(filepath)
+                    df = pd.concat([existing_df, df], ignore_index=True)
+                    df = df.drop_duplicates(subset=['timestamp'], keep='last')
+                    df = df.sort_values('timestamp')
+                except Exception as e:
+                    print(f"合并现有数据失败，创建新文件: {e}")
+            
+            # 保存文件
+            temp_filepath = filepath.with_suffix('.tmp')
+            df.to_parquet(temp_filepath, index=False)
+            
+            # 原子性替换文件
+            if filepath.exists():
+                filepath.unlink()
+            temp_filepath.rename(filepath)
+            
+            print(f"数据已保存到: {filepath} ({len(df)} 条记录)")
+            logger.info(f"强制保存完成: {filepath} ({len(df)} 条记录)")
+            
+        except Exception as e:
+            print(f"强制保存数据失败: {e}")
+            logger.error(f"强制保存数据失败: {e}")
             import traceback
             logger.error(f"详细错误信息: {traceback.format_exc()}")
 
@@ -2404,6 +2636,17 @@ def main():
                     
     except KeyboardInterrupt:
         print("\n用户中断，正在保存数据...")
+        
+        # 强制保存所有缓存数据
+        try:
+            print("正在保存缓存数据...")
+            # 直接调用保存方法，不依赖缓存管理器的数据格式
+            client._force_save_all_data()
+            print("数据保存完成")
+        except Exception as e:
+            print(f"保存数据时出错: {e}")
+            logger.error(f"保存数据时出错: {e}")
+        
         client.disconnect()
         print("系统已退出")
     
