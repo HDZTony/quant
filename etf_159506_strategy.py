@@ -573,7 +573,7 @@ class ETF159506Strategy(Strategy):
             self.last_signal = "golden_cross"
             
             # 累积买入信号
-            self.technical_signal += 30
+            self.technical_signal += 20000*current_macd_abs
             self._log.info(f"金叉买入信号累积: 当前信号值={self.technical_signal}")
 
             # 检查RSI条件
@@ -636,7 +636,7 @@ class ETF159506Strategy(Strategy):
             self.last_signal = "death_cross"
             
             # 累积卖出信号
-            self.technical_signal -= 30
+            self.technical_signal -= 20000*current_macd_abs
             self._log.info(f"死叉卖出信号累积: 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
