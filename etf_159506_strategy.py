@@ -374,7 +374,11 @@ class ETF159506Strategy(Strategy):
         self.rsi.handle_bar(bar)
         
         # 添加调试信息
-        self._log.info(f"处理K线: 时间={pd.to_datetime(bar.ts_event, unit='ns')}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
+        # 转换为北京时间格式
+        utc_time = pd.to_datetime(bar.ts_event, unit='ns')
+        beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        beijing_time_str = beijing_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        self._log.info(f"处理K线: 时间={beijing_time_str}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
         if self.kdj.initialized:
             self._log.info(f"KDJ状态: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
         if self.rsi.initialized:
@@ -583,19 +587,22 @@ class ETF159506Strategy(Strategy):
             has_sell_operation = False
             current_timestamp = pd.to_datetime(bar.ts_event, unit='ns')
             
-            # 倒序查找最后一个卖出交易
-            for signal in reversed(self.trade_signals):
-                if signal.get('side') == 'SELL':
-                    signal_timestamp = signal.get('timestamp')
-                    if signal_timestamp is not None:
-                        # 计算时间差
-                        # 如果最后一个卖出交易在最近5分钟内
-                        has_sell_operation = True
-                        break  # 找到最后一个卖出交易后退出
+            # 只检查最后一个交易是否为SELL
+            if self.trade_signals:
+                last_signal = self.trade_signals[-1]
+                if last_signal.get('side') == 'SELL':
+                    has_sell_operation = True
+                    self._log.info(f"最后一个交易是SELL，阻止卖出操作")
+                else:
+                    self._log.info(f"最后一个交易是{last_signal.get('side')}，允许卖出操作")
             
-            # 如果前5个DIF单调递减且当前DIF<0且没有卖出操作，执行全部卖出
+            # 添加调试日志
+            self._log.info(f"DIF单调递减检查: 前5个DIF值={last_five_dif}, 当前DIF={current_dif}, 是否单调递减={is_monotonic_decreasing}")
+            self._log.info(f"卖出操作检查: 当前时间={current_timestamp}, 是否有卖出操作={has_sell_operation}")
+            
+            # 如果前5个DIF单调递减且当前DIF<0且最后一个交易不是SELL，执行全部卖出
             if is_monotonic_decreasing and not has_sell_operation:
-                self._log.info(f"检测到DIF<0且前5个DIF单调递减且无卖出操作，执行全部卖出")
+                self._log.info(f"检测到DIF<0且前5个DIF单调递减且最后一个交易不是SELL，执行全部卖出")
                 self._log.info(f"前5个DIF值: {last_five_dif}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
@@ -1377,7 +1384,9 @@ class ETF159506Strategy(Strategy):
         
         # 添加调试信息
         self._log.info(f"定时买入检查: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
-        self._log.info(f"目标买入时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}, 当前北京时间: {current_time_only.strftime('%H:%M:%S')}")
+        # 转换为北京时间格式显示
+        beijing_time_str = current_time_beijing.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        self._log.info(f"目标买入时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}, 当前北京时间: {beijing_time_str}")
         
         # 检查是否已经在该日期执行过定时买入
         if self.last_scheduled_buy_date == current_date:
