@@ -23,6 +23,193 @@ import pandas as pd
 from etf_159506_strategy_config import ETF159506Config
 
 
+class CatalogRSIIndicator:
+    """
+    基于etf_159506_catalog_loader.py的RSI指标实现
+    使用pandas rolling window计算，与catalog_loader保持一致
+    """
+    
+    def __init__(self, period=6):
+        self.period = period
+        
+        # 存储历史数据
+        self.closes = deque(maxlen=period + 10)  # 存储收盘价历史
+        
+        # 当前RSI值
+        self.value = 50.0
+        
+        # 初始化状态
+        self.initialized = False
+    
+    def update_raw(self, close: float):
+        """
+        更新RSI指标值
+        
+        Parameters
+        ----------
+        close : float
+            收盘价
+        """
+        # 添加新数据
+        self.closes.append(close)
+        
+        # 检查是否足够数据计算RSI
+        if len(self.closes) >= 2:  # 至少需要2个数据点计算差值
+            # 转换为pandas Series进行计算
+            close_series = pd.Series(list(self.closes))
+            
+            # 计算价格变化
+            delta = close_series.diff()
+            gain = delta.where(delta > 0, 0.0)
+            loss = -delta.where(delta < 0, 0.0)
+            
+            # 计算平均收益和损失
+            avg_gain = gain.rolling(window=self.period, min_periods=1).mean()
+            avg_loss = loss.rolling(window=self.period, min_periods=1).mean()
+            
+            # 计算相对强弱
+            rs = avg_gain / avg_loss
+            
+            # 计算RSI
+            rsi = 100 - (100 / (1 + rs))
+            
+            # 获取最新值
+            self.value = rsi.iloc[-1]
+            
+            # 标记已初始化
+            if not self.initialized and len(self.closes) >= self.period:
+                self.initialized = True
+    
+    def handle_bar(self, bar: Bar):
+        """
+        处理K线数据
+        
+        Parameters
+        ----------
+        bar : Bar
+            K线数据
+        """
+        self.update_raw(bar.close.as_double())
+    
+    def reset(self):
+        """重置指标状态"""
+        self.closes.clear()
+        self.value = 50.0
+        self.initialized = False
+    
+    def __str__(self) -> str:
+        return f"CatalogRSIIndicator({self.period})"
+    
+    def __repr__(self) -> str:
+        return f"CatalogRSIIndicator({self.period})"
+    
+class CatalogKDJIndicator:
+    """
+    基于etf_159506_catalog_loader.py的KDJ指标实现
+    使用pandas rolling window计算，与catalog_loader保持一致
+    """
+    def __init__(self, n=9, k_period=3, d_period=3):
+        self.n = n
+        self.k_period = k_period
+        self.d_period = d_period
+        
+        # 存储历史数据
+        self.highs = deque(maxlen=n)
+        self.lows = deque(maxlen=n)
+        self.closes = deque(maxlen=n)
+        
+        # 当前KDJ值
+        self.value_k = 50.0
+        self.value_d = 50.0
+        self.value_j = 50.0
+        
+        # 初始化状态
+        self.initialized = False
+    
+    def update_raw(self, high: float, low: float, close: float):
+        """
+        更新KDJ指标值
+        
+        Parameters
+        ----------
+        high : float
+            最高价
+        low : float
+            最低价
+        close : float
+            收盘价
+        """
+        # 添加新数据
+        self.highs.append(high)
+        self.lows.append(low)
+        self.closes.append(close)
+        
+        # 检查是否足够数据计算KDJ
+        if len(self.closes) >= self.n:
+            # 转换为pandas Series进行计算
+            close_series = pd.Series(list(self.closes))
+            high_series = pd.Series(list(self.highs))
+            low_series = pd.Series(list(self.lows))
+            
+            # 计算N周期内的最低价和最高价
+            low_list = close_series.rolling(window=self.n, min_periods=1).min()
+            high_list = close_series.rolling(window=self.n, min_periods=1).max()
+            
+            # 计算RSV：RSV = (CLOSE - LLV(LOW, N)) / (HHV(HIGH, N) - LLV(LOW, N)) * 100
+            rsv = (close_series - low_list) / (high_list - low_list) * 100
+            
+            # 计算K值：K = MA(RSV, k_period)
+            k = rsv.rolling(window=self.k_period, min_periods=1).mean()
+            
+            # 计算D值：D = MA(K, d_period)
+            d = k.rolling(window=self.d_period, min_periods=1).mean()
+            
+            # 计算J值：J = 3*K - 2*D
+            j = 3 * k - 2 * d
+            
+            # 获取最新值
+            self.value_k = k.iloc[-1]
+            self.value_d = d.iloc[-1]
+            self.value_j = j.iloc[-1]
+            
+            # 标记已初始化
+            if not self.initialized:
+                self.initialized = True
+    
+    def handle_bar(self, bar: Bar):
+        """
+        处理K线数据
+        
+        Parameters
+        ----------
+        bar : Bar
+            K线数据
+        """
+        self.update_raw(
+            bar.high.as_double(),
+            bar.low.as_double(),
+            bar.close.as_double(),
+        )
+    
+    def reset(self):
+        """重置指标状态"""
+        self.highs.clear()
+        self.lows.clear()
+        self.closes.clear()
+        
+        self.value_k = 50.0
+        self.value_d = 50.0
+        self.value_j = 50.0
+        
+        self.initialized = False
+    
+    def __str__(self) -> str:
+        return f"CatalogKDJIndicator({self.n}, {self.k_period}, {self.d_period})"
+    
+    def __repr__(self) -> str:
+        return f"CatalogKDJIndicator({self.n}, {self.k_period}, {self.d_period})"
+
+
 class ETF159506Strategy(Strategy):
     """
     159506 港股通医疗ETF富国交易策略
@@ -46,6 +233,12 @@ class ETF159506Strategy(Strategy):
             slow_period=config.slow_ema_period,
             price_type=PriceType.MID
         )
+        
+        # KDJ指标 - 使用自定义实现
+        self.kdj = CatalogKDJIndicator(n=9, k_period=3, d_period=3)
+        
+        # RSI指标 - 使用自定义实现
+        self.rsi = CatalogRSIIndicator(period=6)
         
         # 交易数量设置
         if config.trade_size == 0:
@@ -168,8 +361,18 @@ class ETF159506Strategy(Strategy):
         # 更新MACD指标
         self.macd.handle_bar(bar)
         
+        # 更新KDJ指标
+        self.kdj.handle_bar(bar)
+        
+        # 更新RSI指标
+        self.rsi.handle_bar(bar)
+        
         # 添加调试信息
         self._log.info(f"处理K线: 时间={pd.to_datetime(bar.ts_event, unit='ns')}, 价格={bar.close.as_double():.4f}, MACD初始化状态={self.macd.initialized}")
+        if self.kdj.initialized:
+            self._log.info(f"KDJ状态: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+        if self.rsi.initialized:
+            self._log.info(f"RSI状态: RSI={self.rsi.value:.2f}")
         
         
         # 无论MACD是否初始化，都计算图表MACD值
@@ -372,6 +575,32 @@ class ETF159506Strategy(Strategy):
             # 累积买入信号
             self.technical_signal += 30
             self._log.info(f"金叉买入信号累积: 当前信号值={self.technical_signal}")
+
+            # 检查RSI条件
+            if self.rsi.initialized:
+                self.technical_signal += 50-self.rsi.value
+                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+            else:
+                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
+                self._log.info(f"RSI条件不满足：RSI={rsi_status}")
+
+            # 检查KDJ条件
+            # 计算KDJ三个值的最大差值
+            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+            kdj_max_diff = max(kdj_values) - min(kdj_values)
+            
+            # 检查KDJ三个值是否都小于20（超卖条件）
+            kdj_oversold = all(val < 25 for val in kdj_values)
+            
+            self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+            self._log.info(f"KDJ最大差值={kdj_max_diff:.2f}, 超卖状态={kdj_oversold}")
+            
+            # 如果KDJ三个值最大差值小于10且都小于20，增强信号
+            if kdj_max_diff < 20 and kdj_oversold:
+                self.technical_signal += 40-kdj_max_diff
+                self._log.info("KDJ条件满足：最大差值<20且超卖，增强买入信号")
+            else:
+                self._log.info("KDJ条件不满足，使用标准信号")
             
             # 记录技术指标信号（金叉）
             technical_signal = {
@@ -381,7 +610,11 @@ class ETF159506Strategy(Strategy):
                 'signal_value': self.technical_signal,
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
-                'histogram': current_histogram
+                'histogram': current_histogram,
+                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                'kdj_j': self.kdj.value_j if self.kdj.initialized else None
             }
             self.technical_signals.append(technical_signal)
             self._log.info(f"记录金叉技术信号: {technical_signal}")
@@ -406,6 +639,30 @@ class ETF159506Strategy(Strategy):
             self.technical_signal -= 30
             self._log.info(f"死叉卖出信号累积: 当前信号值={self.technical_signal}")
             
+            # 检查RSI条件
+            if self.rsi.initialized and self.rsi.value < 50:
+                self.technical_signal += self.rsi.value
+                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强卖出信号")
+            else:
+                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
+                self._log.info(f"RSI条件不满足：RSI={rsi_status}")
+            # 检查KDJ条件
+            # 计算KDJ三个值的最大差值
+            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+            kdj_max_diff = max(kdj_values) - min(kdj_values)
+            
+            # 检查KDJ三个值是否都大于80（超买条件）
+            kdj_oversold = all(val > 80 for val in kdj_values)
+            
+            self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+            self._log.info(f"KDJ最大差值={kdj_max_diff:.2f}, 超买状态={kdj_oversold}")
+            
+            # 如果KDJ三个值最大差值小于10且都大于80，增强信号
+            if kdj_max_diff < 20 and kdj_oversold:
+                self.technical_signal -= 30-kdj_max_diff
+                self._log.info("KDJ条件满足：最大差值<20且超买，增强卖出信号")
+            else:
+                self._log.info("KDJ条件不满足，使用标准信号")
             # 记录技术指标信号（死叉）
             technical_signal = {
                 'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
@@ -414,7 +671,11 @@ class ETF159506Strategy(Strategy):
                 'signal_value': self.technical_signal,
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
-                'histogram': current_histogram
+                'histogram': current_histogram,
+                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                'kdj_j': self.kdj.value_j if self.kdj.initialized else None
             }
             self.technical_signals.append(technical_signal)
             self._log.info(f"记录死叉技术信号: {technical_signal}")
