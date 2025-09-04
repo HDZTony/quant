@@ -565,6 +565,55 @@ class ETF159506Strategy(Strategy):
         
         # 计算当前histogram值
         current_histogram = current_macd - current_signal
+
+        # 检查DIF<0且前五个DIF都是单调递减的情况
+        if current_macd < 0 and len(self.macd_history) >= 6:
+            # 获取前5个DIF值（不包括当前值）
+            last_five_dif = list(self.macd_history)[-6:-1]  # 前5个值
+            current_dif = current_macd
+            
+            # 检查是否单调递减（从历史到当前，即从旧到新）
+            is_monotonic_decreasing = True
+            for i in range(len(last_five_dif) - 1):
+                if last_five_dif[i] < last_five_dif[i + 1]:  # 如果从历史到当前不是递减（即后面的值比前面的大）
+                    is_monotonic_decreasing = False
+                    break
+            
+            # 检查前5分钟内是否有卖出操作（只检查最后一个卖出交易）
+            has_sell_operation = False
+            current_timestamp = pd.to_datetime(bar.ts_event, unit='ns')
+            
+            # 倒序查找最后一个卖出交易
+            for signal in reversed(self.trade_signals):
+                if signal.get('side') == 'SELL':
+                    signal_timestamp = signal.get('timestamp')
+                    if signal_timestamp is not None:
+                        # 计算时间差
+                        # 如果最后一个卖出交易在最近5分钟内
+                        has_sell_operation = True
+                        break  # 找到最后一个卖出交易后退出
+            
+            # 如果前5个DIF单调递减且当前DIF<0且没有卖出操作，执行全部卖出
+            if is_monotonic_decreasing and not has_sell_operation:
+                self._log.info(f"检测到DIF<0且前5个DIF单调递减且无卖出操作，执行全部卖出")
+                self._log.info(f"前5个DIF值: {last_five_dif}")
+                self._log.info(f"当前DIF值: {current_dif}")
+                self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
+                
+                # 执行全部卖出
+                self.execute_sell_signal(bar)
+                # 记录实际交易信号
+                trade_signal = {
+                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                    'price': bar.close.as_double(),
+                    'side': 'SELL',
+                    'order_id': 'close_position',
+                    'signal_type': 'executed_divergence_sell',
+                    'signal_value': self.technical_signal
+                }
+                self.trade_signals.append(trade_signal)
+                return
+        
         
         # 检测金叉：MACD线从下方向上穿越信号线
         golden_cross = (previous_macd < previous_signal and current_macd > current_signal)
@@ -1113,9 +1162,9 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        # 执行平仓操作
-        # self.close_position(current_position)
-        # self._log.info(f"执行卖出交易: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
+        # 执行全部平仓操作
+        self.close_all_positions(self.config.instrument_id, tags=["EXIT"])
+        self._log.info(f"执行全部卖出交易: 价格={bar.close.as_double():.4f}")
     
     def execute_divergence_buy_signal(self, bar: Bar):
         """执行背离买入信号"""
@@ -1184,9 +1233,9 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        # 执行平仓操作
-        # self.close_position(current_position)
-        # self._log.info(f"执行背离卖出交易: 价格={bar.close.as_double():.4f}, 数量={current_position.quantity.as_double()}")
+        # 执行全部平仓操作
+        self.close_all_positions(self.config.instrument_id, tags=["EXIT"])
+        self._log.info(f"执行背离全部卖出交易: 价格={bar.close.as_double():.4f}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
