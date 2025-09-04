@@ -19,6 +19,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model.data import Bar
 from collections import deque
 import pandas as pd
+from datetime import datetime, time
 
 from etf_159506_strategy_config import ETF159506Config
 
@@ -303,6 +304,11 @@ class ETF159506Strategy(Strategy):
         
         # 技术指标信号记录（金叉、死叉、背离等）
         self.technical_signals = []
+        
+        # 定时买入功能
+        self.scheduled_buy_time = time(14, 50)  # 2:50分买入（北京时间）
+        self.last_scheduled_buy_date = None  # 记录上次定时买入的日期
+        self._log.info(f"定时买入功能已启用: 每天北京时间 {self.scheduled_buy_time.strftime('%H:%M')} 执行买入")
 
     def on_start(self):
         """策略启动时调用"""
@@ -374,6 +380,8 @@ class ETF159506Strategy(Strategy):
         if self.rsi.initialized:
             self._log.info(f"RSI状态: RSI={self.rsi.value:.2f}")
         
+        # 检查定时买入信号
+        self.check_scheduled_buy(bar)
         
         # 无论MACD是否初始化，都计算图表MACD值
         chart_macd = self.calculate_chart_macd(bar)
@@ -419,17 +427,24 @@ class ETF159506Strategy(Strategy):
     def on_position_opened(self, event: PositionOpened) -> None:
         """持仓开启事件处理"""
         self.position = self.cache.position(event.position_id)
-        self._log.info(f"持仓已开启: {self.position}")
+        if self.position:
+            self._log.info(f"持仓已开启: {self.position.quantity.as_double()} 股, 方向: {self.position.side}")
+        else:
+            self._log.info("持仓开启事件：无法获取持仓信息")
     
     def on_position_changed(self, event: PositionChanged) -> None:
         """持仓变化事件处理"""
         self.position = self.cache.position(event.position_id)
-        self._log.info(f"持仓已变化: {self.position}")
+        if self.position:
+            self._log.info(f"持仓已变化: {self.position.quantity.as_double()} 股, 方向: {self.position.side}")
+        else:
+            self._log.info("持仓变化事件：无法获取持仓信息")
     
     def on_position_closed(self, event: PositionClosed) -> None:
         """持仓关闭事件处理"""
+        self._log.info(f"持仓关闭事件触发: position_id={event.position_id}")
         self.position = None
-        self._log.info("持仓已关闭")
+        self._log.info("持仓已关闭，实例变量已清空")
     
     def on_order_filled(self, event: OrderFilled) -> None:
         """订单成交事件处理"""
@@ -1198,9 +1213,16 @@ class ETF159506Strategy(Strategy):
 
     def get_current_position(self):
         """获取当前持仓状态 - 回测环境优化版本"""
+        self._log.info("开始查询当前持仓状态...")
+        
         # 方法1：检查实例变量（最优先）
         if self.position and self.position.quantity.as_double() > 0:
+            self._log.info(f"从实例变量获取持仓: {self.position.quantity.as_double()} 股")
             return self.position
+        elif self.position:
+            self._log.info(f"实例变量中的持仓数量为0或负数: {self.position.quantity.as_double()} 股")
+            # 如果实例变量中的持仓为0或负数，清空它
+            self.position = None
         
         # 方法2：从缓存查询当前工具的持仓（回测推荐）
         try:
@@ -1208,24 +1230,33 @@ class ETF159506Strategy(Strategy):
             if position and position.quantity.as_double() > 0:
                 # 更新实例变量
                 self.position = position
-                self._log.debug(f"从缓存恢复持仓状态: {position.quantity.as_double()} 股")
+                self._log.info(f"从缓存查询指定工具持仓成功: {position.quantity.as_double()} 股")
                 return position
+            elif position:
+                self._log.info(f"缓存中指定工具的持仓数量为0或负数: {position.quantity.as_double()} 股")
+            else:
+                self._log.info("缓存中未找到指定工具的持仓")
         except Exception as e:
-            self._log.debug(f"从缓存查询指定工具持仓失败: {e}")
+            self._log.info(f"从缓存查询指定工具持仓失败: {e}")
         
         # 方法3：从缓存查询所有持仓（备用方案）
         try:
             positions = self.cache.positions()
             if positions:
+                self._log.info(f"缓存中共有 {len(positions)} 个持仓")
                 for pos in positions:
+                    self._log.info(f"持仓详情: 工具={pos.instrument_id}, 数量={pos.quantity.as_double()}, 方向={pos.side}")
                     if pos.instrument_id == self.config.instrument_id and pos.quantity.as_double() > 0:
                         self.position = pos
-                        self._log.debug(f"从缓存恢复持仓状态: {pos.quantity.as_double()} 股")
+                        self._log.info(f"从缓存恢复持仓状态: {pos.quantity.as_double()} 股")
                         return pos
+            else:
+                self._log.info("缓存中没有任何持仓")
         except Exception as e:
-            self._log.debug(f"从缓存查询所有持仓失败: {e}")
+            self._log.info(f"从缓存查询所有持仓失败: {e}")
         
         # 没有持仓
+        self._log.info("确认：当前没有任何持仓")
         self.position = None
         return None
 
@@ -1284,3 +1315,94 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"    [{i+1:3d}] 时间: {time_str}, DIF: {dif_value:.6f}, 价格: {price_value:.4f}")
         
         self._log.info("=" * 80) 
+
+    def check_scheduled_buy(self, bar: Bar):
+        """检查定时买入信号"""
+        # 获取当前K线的时间（UTC时间）
+        current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        
+        # 转换为北京时间（UTC+8）
+        current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_date = current_time_beijing.date()
+        current_time_only = current_time_beijing.time()
+        
+        # 添加调试信息
+        self._log.info(f"定时买入检查: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log.info(f"目标买入时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}, 当前北京时间: {current_time_only.strftime('%H:%M:%S')}")
+        
+        # 检查是否已经在该日期执行过定时买入
+        if self.last_scheduled_buy_date == current_date:
+            self._log.info(f"今天 {current_date} 已经执行过定时买入，跳过")
+            return
+        
+        # 检查是否到达定时买入时间（2:50分）
+        if current_time_only >= self.scheduled_buy_time:
+            self._log.info(f"到达定时买入时间: {current_time_only.strftime('%H:%M:%S')}")
+            
+            # 检查是否已有持仓
+            # current_position = self.get_current_position()
+            # if current_position is not None:
+            #     self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过定时买入")
+            #     self.last_scheduled_buy_date = current_date
+            #     return
+            
+            # 执行定时买入
+            self.execute_scheduled_buy(bar)
+            
+            # 记录已执行定时买入的日期
+            self.last_scheduled_buy_date = current_date
+        else:
+            self._log.info(f"还未到达定时买入时间，当前时间: {current_time_only.strftime('%H:%M:%S')}, 目标时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}")
+
+    def execute_scheduled_buy(self, bar: Bar):
+        """执行定时买入"""
+        # 获取北京时间用于日志显示
+        current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        
+        self._log.info(f"执行定时买入: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # 计算交易数量
+        if self.trade_size is None:
+            account = self.cache.account_for_venue(self.config.venue)
+            available_balance = account.balance_total().as_double()
+            current_price = bar.close.as_double()
+            
+            # 检查可用余额
+            if available_balance <= 0:
+                self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过定时买入")
+                return
+                
+            quantity = int(available_balance / current_price)  # 使用100%资金满仓交易
+            
+            # 检查计算出的数量是否有效
+            if quantity <= 0:
+                self._log.info(f"计算出的交易数量无效: {quantity}，跳过定时买入")
+                return
+                
+            trade_quantity = Quantity.from_int(quantity)
+        else:
+            trade_quantity = self.trade_size
+
+        # 创建市价买入订单
+        order = self.order_factory.market(
+            instrument_id=self.config.instrument_id,
+            order_side=OrderSide.BUY,
+            quantity=trade_quantity,
+        )
+        self.submit_order(order)
+        
+        # 记录定时买入交易信号
+        trade_signal = {
+            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+            'price': bar.close.as_double(),
+            'side': 'BUY',
+            'quantity': trade_quantity.as_double(),
+            'order_id': str(order.client_order_id),
+            'signal_type': 'scheduled_buy',
+            'signal_value': 0  # 定时买入不依赖技术指标信号
+        }
+        self.trade_signals.append(trade_signal)
+        
+        self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        
