@@ -107,20 +107,22 @@ class ETF159506OfficialBacktest:
             
             # 强制重新加载数据以确保精度一致
             logger.info("强制重新加载数据以确保精度一致...")
-            self._load_data_with_catalog_loader()
+            # 移除硬编码的数据加载，改为在回测时动态加载
             
         except Exception as e:
             logger.error(f"初始化 Catalog 失败: {e}")
             raise
     
-    def _load_data_with_catalog_loader(self):
+    def _load_data_with_catalog_loader(self, target_date=None):
         """使用 catalog loader 加载数据"""
         try:
             # 创建 catalog loader
             catalog_loader = ETF159506RedisKlineGenerator(catalog_path=str(self.catalog_path))
             
-            # 加载 2025-07-25 的数据
-            target_date = datetime(2025, 7, 25).date()
+            # 如果没有指定日期，默认加载 2025-07-25 的数据
+            if target_date is None:
+                target_date = datetime(2025, 7, 25).date()
+            
             logger.info(f"正在加载 {target_date} 的数据...")
             
             # 获取数据
@@ -436,6 +438,9 @@ class ETF159506OfficialBacktest:
         try:
             logger.info(f"开始回测: {start_date} 到 {end_date}")
             
+            # 加载指定日期的数据
+            self._load_data_with_catalog_loader(start_date)
+            
             # 创建回测配置
             logger.info("创建回测配置...")
             run_config = self.create_backtest_config(start_date, end_date)
@@ -538,8 +543,8 @@ class ETF159506OfficialBacktest:
         """运行 7-25 日的回测"""
         try:
             # 设置回测日期
-            start_date = date(2025, 8, 18)
-            end_date = date(2025, 8, 18)
+            start_date = date(2025, 8, 19)
+            end_date = date(2025, 8, 19)
             
             logger.info(f"开始 7-25 日回测...")
             
