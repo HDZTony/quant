@@ -606,9 +606,10 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"前5个DIF值: {last_five_dif}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
-                
-                # 执行全部卖出
-                self.execute_sell_signal(bar)
+                # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
+                if self.is_after_scheduled_time(bar):
+                    self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
+                    return
                 # 记录实际交易信号
                 trade_signal = {
                     'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
@@ -619,6 +620,9 @@ class ETF159506Strategy(Strategy):
                     'signal_value': self.technical_signal
                 }
                 self.trade_signals.append(trade_signal)
+                # 执行全部卖出
+                self.execute_sell_signal(bar)
+                
                 return
         
         
@@ -1152,6 +1156,11 @@ class ETF159506Strategy(Strategy):
     
     def execute_sell_signal(self, bar: Bar):
         """执行卖出信号"""
+        # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
+        if self.is_after_scheduled_time(bar):
+            self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
+            return
+        
         # 检查是否有持仓 - 使用可靠的持仓查询方法
         # current_position = self.get_current_position()
         # if current_position is None:
@@ -1223,6 +1232,11 @@ class ETF159506Strategy(Strategy):
     
     def execute_divergence_sell_signal(self, bar: Bar):
         """执行背离卖出信号"""
+        # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
+        if self.is_after_scheduled_time(bar):
+            self._log.info(f"当前时间已过2:50分，跳过背离卖出信号执行")
+            return
+        
         # 检查是否有持仓
         # current_position = self.get_current_position()
         # if current_position is None:
@@ -1246,6 +1260,11 @@ class ETF159506Strategy(Strategy):
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
+        # 检查当前时间是否在2:50分之后，如果是则跳过风险管理
+        if self.is_after_scheduled_time(bar):
+            self._log.info(f"当前时间已过2:50分，跳过风险管理检查")
+            return
+        
         # 检查是否有持仓 - 使用可靠的持仓查询方法
         # current_position = self.get_current_position()
         # if current_position is None:
@@ -1464,3 +1483,14 @@ class ETF159506Strategy(Strategy):
         
         self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
         
+    def is_after_scheduled_time(self, bar: Bar) -> bool:
+        """检查当前时间是否在定时买入时间（2:50分）之后"""
+        # 获取当前K线的时间（UTC时间）
+        current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        
+        # 转换为北京时间（UTC+8）
+        current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_time_only = current_time_beijing.time()
+        
+        # 检查是否在2:50分之后
+        return current_time_only >= self.scheduled_buy_time
