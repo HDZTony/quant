@@ -552,6 +552,122 @@ class ETF159506Strategy(Strategy):
         dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
         return dea
     
+    def check_negative_positive_histogram(self, bar: Bar, lookback_minutes: int = 5):
+        """
+        循环计算前几个分钟的histogram值，检测histogram由正到负再到正的模式
+        
+        Parameters:
+        -----------
+        bar : Bar
+            当前K线数据
+        lookback_minutes : int
+            回看分钟数，默认5分钟
+            
+        Returns:
+        --------
+        dict or None
+            如果检测到模式，返回包含时间点信息的字典；否则返回None
+        """
+        # 需要足够的历史数据
+        if len(self.macd_history) < lookback_minutes or len(self.signal_history) < lookback_minutes:
+            self._log.info(f"历史数据不足，需要至少{lookback_minutes}个数据点")
+            return 
+        
+        # # 检查DIF值是否由负转正
+        if len(self.macd_history) >= 2:
+            current_dif = self.macd_history[-1]
+            previous_dif = self.macd_history[-2]
+            if previous_dif < 0 and current_dif >= 0:
+                self._log.info(f"DIF值由负转正: 前值={previous_dif:.6f}, 当前值={current_dif:.6f}")
+            else:
+                self._log.info(f"DIF值未由负转正: 前值={previous_dif:.6f}, 当前值={current_dif:.6f}")
+                return 
+        else:
+            self._log.info("DIF历史数据不足，无法判断由负转正")
+            return 
+        
+        # 计算每个时间点的histogram值（从当前到过去）
+        negative_point = False
+        positive_index = None
+        min_trough_info = None
+        
+        for i, histogram in enumerate(reversed(self.histogram_history)):
+            if histogram < 0:
+                negative_point = True
+            if histogram > 0 and negative_point:
+                # 计算实际索引（从最新开始反向）
+                actual_index = len(self.histogram_history) - 1 - i
+                positive_index = actual_index
+                self._log.info(f"找到histogram为正的时间点: 索引={actual_index}, histogram值={histogram:.6f}")
+                
+                # 获取对应的时间戳
+                if actual_index < len(self.timestamps):
+                    timestamp = self.timestamps[actual_index]
+                    # 转换为北京时间
+                    utc_time = pd.to_datetime(timestamp, unit='ns')
+                    beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+                    time_str = beijing_time.strftime('%H:%M:%S')
+                    self._log.info(f"对应时间: {time_str}")
+                    
+                    # 在macd_extremes_history中找到从该时间戳到当前时间中最小的极小值
+                    min_trough_value = None
+                    min_trough_timestamp = None
+                    
+                    for extreme_timestamp, extreme_value, extreme_type in self.macd_extremes_history:
+                        # 只考虑极小值（trough）
+                        if extreme_type == 'trough' and extreme_timestamp >= timestamp:
+                            if min_trough_value is None or extreme_value < min_trough_value:
+                                min_trough_value = extreme_value
+                                min_trough_timestamp = extreme_timestamp
+                    
+                    if min_trough_value is not None:
+                        # 转换为北京时间
+                        utc_trough_time = pd.to_datetime(min_trough_timestamp, unit='ns')
+                        beijing_trough_time = utc_trough_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+                        min_trough_time_str = beijing_trough_time.strftime('%H:%M:%S')
+                        self._log.info(f"从{time_str}到当前时间中最小的极小值: {min_trough_value:.6f}, 时间: {min_trough_time_str}")
+                        
+                        # 保存最小极小值信息
+                        min_trough_info = {
+                            'value': min_trough_value,
+                            'timestamp': min_trough_timestamp,
+                            'time_str': min_trough_time_str,
+                            'start_time': time_str,
+                            'start_timestamp': timestamp
+                        }
+                        if min_trough_value < -0.004:
+                            self.technical_signal += 200
+                            self._log.info(f"极小值信号触发: min_trough_value={min_trough_value:.6f} < -0.004, 买入信号+100, 当前信号值={self.technical_signal}")
+                            
+                            # 记录极小值技术指标信号
+                            technical_signal = {
+                                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                                'price': bar.close.as_double(),
+                                'signal_type': 'n2p',
+                                'signal_value': self.technical_signal,
+                                'min_trough_value': min_trough_value,
+                                'min_trough_time': min_trough_time_str,
+                                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                                'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                                'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                                'kdj_j': self.kdj.value_j if self.kdj.initialized else None
+                            }
+                            self.technical_signals.append(technical_signal)
+                            self._log.info(f"记录极小值技术信号: {technical_signal}")
+                            
+                            # 检查是否达到买入阈值
+                            if self.technical_signal >= self.buy_threshold:
+                                self._log.info(f"极小值买入信号达到阈值{self.buy_threshold}，执行买入操作")
+                                self.execute_buy_signal(bar)
+                                self.technical_signal = 0  # 信号归零
+                            
+                    else:
+                        self._log.info(f"从{time_str}到当前时间中未找到极小值")
+                
+                break
+        
+
+
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
         # 添加调试信息
@@ -569,7 +685,11 @@ class ETF159506Strategy(Strategy):
         
         # 计算当前histogram值
         current_histogram = current_macd - current_signal
-
+        
+        # 检查histogram模式
+        histogram_result = self.check_negative_positive_histogram(bar, lookback_minutes=5)
+        
+        
         # 检查DIF<0且前五个DIF都是单调递减的情况
         if current_macd < 0 and len(self.macd_history) >= 6:
             # 获取前5个DIF值（不包括当前值）

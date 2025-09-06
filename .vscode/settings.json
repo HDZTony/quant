@@ -3,5 +3,8 @@
     "python.terminal.activateEnvironment": true,
     "python.analysis.extraPaths": [
         "${workspaceFolder}\\.venv\\Lib\\site-packages"
+    ],
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}\\.venv\\Lib\\site-packages"
     ]
 } 
