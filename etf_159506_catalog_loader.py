@@ -849,17 +849,41 @@ class ETF159506RedisKlineGenerator:
             ax1.set_xlabel('时间 (北京时间)', fontsize=13)
             ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             
-            # ====== ax2成交量 ======
-            # 跳过第一条（因为是累积成交量）
-            vol_df = mapped_df.iloc[1:].copy()
-            if len(vol_df) > 0:
-                # 计算涨跌颜色
-                price_arr = vol_df['price'].values
-                prev_price_arr = mapped_df['price'].values[:-1]
-                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+            # ====== ax2成交量（按分钟聚合） ======
+            # 计算每分钟成交量
+            minute_volume_stats = self.calculate_minute_volume(target_date)
+            
+            if not minute_volume_stats.empty:
+                # 创建时间映射，与主图保持一致
+                minute_volume_filtered = minute_volume_stats[minute_volume_stats['minute_time'].dt.time < datetime_time(11, 30)]
+                minute_volume_afternoon = minute_volume_stats[minute_volume_stats['minute_time'].dt.time > datetime_time(13, 0)]
                 
-                # 绘制成交量柱状图
-                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+                # 合并上午和下午数据
+                minute_volume_trading = pd.concat([minute_volume_filtered, minute_volume_afternoon])
+                
+                if len(minute_volume_trading) > 0:
+                    # 应用时间映射
+                    minute_volume_mapped = minute_volume_trading.copy()
+                    minute_volume_mapped['mapped_time'] = minute_volume_mapped['minute_time'].apply(
+                        lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
+                    )
+                    
+                    # 计算涨跌颜色（基于开盘价和收盘价）
+                    colors = np.where(
+                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'], 
+                        'red', 
+                        np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
+                    )
+                    
+                    # 绘制每分钟成交量柱状图
+                    ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
+                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                    
+                    logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                else:
+                    logger.warning("没有交易时间内的分钟成交量数据")
+            else:
+                logger.warning("无法计算分钟成交量数据")
                 ax2.set_title('成交量', fontsize=12)
                 ax2.set_ylabel('成交量', fontsize=10)
                 ax2.grid(True, alpha=0.3)
@@ -1377,26 +1401,49 @@ class ETF159506RedisKlineGenerator:
                 logger.info("没有技术指标信号数据")
             
            
-            # 跳过第一条（因为是累积成交量）
-            vol_df = mapped_df.iloc[1:].copy()
-            if len(vol_df) == 0:
-                logger.warning("成交量数据不足，无法绘制")
-                return
+            # ====== ax2成交量（按分钟聚合） ======
+            # 计算每分钟成交量
+            minute_volume_stats = self.calculate_minute_volume(target_date)
             
-            # 计算涨跌颜色
-            price_arr = vol_df['price'].values
-            prev_price_arr = mapped_df['price'].values[:-1]
-            colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
-            
-            # 绘制成交量柱状图，使用更小的宽度避免重叠
-            ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
-            if target_date:
-                ax2.set_title(f'成交量 {target_date} (北京时间)')
+            if not minute_volume_stats.empty:
+                # 创建时间映射，与主图保持一致
+                minute_volume_filtered = minute_volume_stats[minute_volume_stats['minute_time'].dt.time < datetime_time(11, 30)]
+                minute_volume_afternoon = minute_volume_stats[minute_volume_stats['minute_time'].dt.time > datetime_time(13, 0)]
+                
+                # 合并上午和下午数据
+                minute_volume_trading = pd.concat([minute_volume_filtered, minute_volume_afternoon])
+                
+                if len(minute_volume_trading) > 0:
+                    # 应用时间映射
+                    minute_volume_mapped = minute_volume_trading.copy()
+                    minute_volume_mapped['mapped_time'] = minute_volume_mapped['minute_time'].apply(
+                        lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
+                    )
+                    
+                    # 计算涨跌颜色（基于开盘价和收盘价）
+                    colors = np.where(
+                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'], 
+                        'red', 
+                        np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
+                    )
+                    
+                    # 绘制每分钟成交量柱状图
+                    ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
+                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                    
+                    logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                else:
+                    logger.warning("没有交易时间内的分钟成交量数据")
             else:
-                ax2.set_title(f'成交量 {data_date} (北京时间)')
+                logger.warning("无法计算分钟成交量数据")
+            
+            if target_date:
+                ax2.set_title(f'每分钟成交量 {target_date} (北京时间)')
+            else:
+                ax2.set_title(f'每分钟成交量 {data_date} (北京时间)')
             ax2.set_ylabel('成交量')
             ax2.set_xlabel('时间 (北京时间)', fontsize=13)
-            ax2.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
+            ax2.annotate('每个柱子代表一分钟的总成交量', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax2.grid(True, alpha=0.3)
             
             # 设置x轴格式 - 显示北京时间
@@ -1585,6 +1632,139 @@ class ETF159506RedisKlineGenerator:
         update_thread.start()
         logger.info("实时K线图更新已启动")
 
+    def calculate_minute_volume(self, target_date: datetime.date = None) -> pd.DataFrame:
+        """
+        根据tick数据计算每分钟成交量（仅处理trade类型数据，不包含quote数据）
+        
+        Args:
+            target_date: 目标日期，如果为None则使用今日/最近交易日
+        
+        Returns:
+            DataFrame: 包含每分钟成交量统计的数据
+        """
+        try:
+            # 获取数据
+            kline_data = self.get_today_kline_data(target_date)
+            
+            if not kline_data:
+                logger.warning("没有数据可计算每分钟成交量")
+                return pd.DataFrame()
+            
+            # 转换为DataFrame
+            df = pd.DataFrame(kline_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # 确保只处理trade类型的数据（双重保险）
+            if 'type' in df.columns:
+                df = df[df['type'] == 'trade']
+                logger.info(f"过滤后剩余 {len(df)} 条trade类型数据")
+            
+            # 检查是否需要时区转换
+            if df['timestamp'].dt.tz is None:
+                # 假设是UTC时间，转换为北京时间
+                import pytz
+                utc_tz = pytz.UTC
+                beijing_tz = pytz.timezone('Asia/Shanghai')
+                
+                # 添加UTC时区信息
+                df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
+                # 转换为北京时间
+                df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
+                logger.info("已将UTC时间转换为北京时间")
+            
+            # 创建分钟级别的时间戳（向下取整到分钟）
+            df['minute_time'] = df['timestamp'].dt.floor('min')
+            
+            # 按分钟分组计算成交量统计
+            logger.info("正在计算每分钟成交量...")
+            minute_stats = df.groupby('minute_time').agg({
+                'volume': ['sum', 'count', 'mean', 'std'],  # 总成交量、交易次数、平均成交量、成交量标准差
+                'price': ['first', 'last', 'min', 'max', 'mean'],  # 开盘价、收盘价、最低价、最高价、平均价
+                'trade_id': 'count'  # 交易次数
+            }).round(4)
+            
+            # 重命名列
+            minute_stats.columns = [
+                '总成交量', '交易次数', '平均成交量', '成交量标准差',
+                '开盘价', '收盘价', '最低价', '最高价', '平均价', '交易笔数'
+            ]
+            
+            # 重置索引，使时间成为列
+            minute_stats = minute_stats.reset_index()
+            
+            logger.info(f"计算完成，生成了 {len(minute_stats)} 分钟的统计数据")
+            return minute_stats
+            
+        except Exception as e:
+            logger.error(f"计算每分钟成交量失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            return pd.DataFrame()
+    
+    def print_minute_volume_data(self, minute_stats: pd.DataFrame, start_time=None, end_time=None):
+        """
+        打印分钟成交量数据
+        
+        Args:
+            minute_stats: 分钟统计数据
+            start_time: 开始时间 (可选)
+            end_time: 结束时间 (可选)
+        """
+        if minute_stats.empty:
+            logger.warning("没有分钟统计数据可打印")
+            return
+        
+        # 如果指定了时间范围，进行筛选
+        if start_time and end_time:
+            mask = (minute_stats['minute_time'] >= start_time) & (minute_stats['minute_time'] <= end_time)
+            filtered_stats = minute_stats[mask]
+            print(f"\n筛选时间范围: {start_time} 到 {end_time}")
+            print(f"筛选到的分钟数: {len(filtered_stats)}")
+        else:
+            filtered_stats = minute_stats
+            print(f"\n总分钟数: {len(filtered_stats)}")
+        
+        print("\n每分钟成交量统计:")
+        print("=" * 120)
+        print(f"{'时间':<20} {'总成交量':<12} {'交易次数':<8} {'平均成交量':<12} {'开盘价':<8} {'收盘价':<8} {'最低价':<8} {'最高价':<8} {'平均价':<8}")
+        print("-" * 120)
+        
+        for _, row in filtered_stats.iterrows():
+            print(f"{row['minute_time'].strftime('%Y-%m-%d %H:%M'):<20} "
+                  f"{row['总成交量']:<12} "
+                  f"{row['交易次数']:<8} "
+                  f"{row['平均成交量']:<12} "
+                  f"{row['开盘价']:<8} "
+                  f"{row['收盘价']:<8} "
+                  f"{row['最低价']:<8} "
+                  f"{row['最高价']:<8} "
+                  f"{row['平均价']:<8}")
+    
+    def save_minute_volume_to_csv(self, minute_stats: pd.DataFrame, target_date: datetime.date = None, output_file: str = None):
+        """
+        保存每分钟成交量数据到CSV文件
+        
+        Args:
+            minute_stats: 分钟统计数据
+            target_date: 目标日期
+            output_file: 输出文件名，如果为None则自动生成
+        """
+        if minute_stats.empty:
+            logger.warning("没有分钟统计数据可保存")
+            return
+        
+        if not output_file:
+            if target_date:
+                output_file = f'minute_volume_{target_date}.csv'
+            else:
+                output_file = f'minute_volume_{datetime.now().date()}.csv'
+        
+        try:
+            minute_stats.to_csv(output_file, index=False, encoding='utf-8-sig')
+            logger.info(f"每分钟成交量数据已保存到: {output_file}")
+        except Exception as e:
+            logger.error(f"保存CSV文件失败: {e}")
+
     def create_extremes_chart(self, save_path: str = None, target_date: datetime.date = None, extremes_data: Dict = None):
         """创建专门的极值点图表"""
         try:
@@ -1769,17 +1949,41 @@ class ETF159506RedisKlineGenerator:
             ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
-            # ====== ax2成交量 ======
-            # 跳过第一条（因为是累积成交量）
-            vol_df = mapped_df.iloc[1:].copy()
-            if len(vol_df) > 0:
-                # 计算涨跌颜色
-                price_arr = vol_df['price'].values
-                prev_price_arr = mapped_df['price'].values[:-1]
-                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+            # ====== ax2成交量（按分钟聚合） ======
+            # 计算每分钟成交量
+            minute_volume_stats = self.calculate_minute_volume(target_date)
+            
+            if not minute_volume_stats.empty:
+                # 创建时间映射，与主图保持一致
+                minute_volume_filtered = minute_volume_stats[minute_volume_stats['minute_time'].dt.time < datetime_time(11, 30)]
+                minute_volume_afternoon = minute_volume_stats[minute_volume_stats['minute_time'].dt.time > datetime_time(13, 0)]
                 
-                # 绘制成交量柱状图
-                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+                # 合并上午和下午数据
+                minute_volume_trading = pd.concat([minute_volume_filtered, minute_volume_afternoon])
+                
+                if len(minute_volume_trading) > 0:
+                    # 应用时间映射
+                    minute_volume_mapped = minute_volume_trading.copy()
+                    minute_volume_mapped['mapped_time'] = minute_volume_mapped['minute_time'].apply(
+                        lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
+                    )
+                    
+                    # 计算涨跌颜色（基于开盘价和收盘价）
+                    colors = np.where(
+                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'], 
+                        'red', 
+                        np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
+                    )
+                    
+                    # 绘制每分钟成交量柱状图
+                    ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
+                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                    
+                    logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                else:
+                    logger.warning("没有交易时间内的分钟成交量数据")
+            else:
+                logger.warning("无法计算分钟成交量数据")
             
             ax2.set_title('成交量', fontsize=12)
             ax2.set_ylabel('成交量', fontsize=10)
@@ -2242,17 +2446,41 @@ class ETF159506RedisKlineGenerator:
             ax1.set_xlabel('时间 (北京时间)', fontsize=13)
             ax1.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             
-            # ====== ax2成交量 ======
-            # 跳过第一条（因为是累积成交量）
-            vol_df = mapped_df.iloc[1:].copy()
-            if len(vol_df) > 0:
-                # 计算涨跌颜色
-                price_arr = vol_df['price'].values
-                prev_price_arr = mapped_df['price'].values[:-1]
-                colors = np.where(price_arr > prev_price_arr, 'red', np.where(price_arr < prev_price_arr, 'green', 'gray'))
+            # ====== ax2成交量（按分钟聚合） ======
+            # 计算每分钟成交量
+            minute_volume_stats = self.calculate_minute_volume(target_date)
+            
+            if not minute_volume_stats.empty:
+                # 创建时间映射，与主图保持一致
+                minute_volume_filtered = minute_volume_stats[minute_volume_stats['minute_time'].dt.time < datetime_time(11, 30)]
+                minute_volume_afternoon = minute_volume_stats[minute_volume_stats['minute_time'].dt.time > datetime_time(13, 0)]
                 
-                # 绘制成交量柱状图
-                ax2.bar(vol_df.index, vol_df['volume'], alpha=0.6, color=colors, width=0.0005)
+                # 合并上午和下午数据
+                minute_volume_trading = pd.concat([minute_volume_filtered, minute_volume_afternoon])
+                
+                if len(minute_volume_trading) > 0:
+                    # 应用时间映射
+                    minute_volume_mapped = minute_volume_trading.copy()
+                    minute_volume_mapped['mapped_time'] = minute_volume_mapped['minute_time'].apply(
+                        lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
+                    )
+                    
+                    # 计算涨跌颜色（基于开盘价和收盘价）
+                    colors = np.where(
+                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'], 
+                        'red', 
+                        np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
+                    )
+                    
+                    # 绘制每分钟成交量柱状图
+                    ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
+                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                    
+                    logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                else:
+                    logger.warning("没有交易时间内的分钟成交量数据")
+            else:
+                logger.warning("无法计算分钟成交量数据")
                 ax2.set_title('成交量', fontsize=12)
                 ax2.set_ylabel('成交量', fontsize=10)
                 ax2.grid(True, alpha=0.3)
@@ -2318,6 +2546,11 @@ def main():
   python etf_159506_catalog_loader.py -d 2024-01-15      # 简写形式
   python etf_159506_catalog_loader.py --output my_chart.png  # 指定输出文件名
   python etf_159506_catalog_loader.py --date 2024-01-15 --output 2024-01-15_chart.png
+  
+每分钟成交量统计:
+  python etf_159506_catalog_loader.py --volume                    # 计算今日每分钟成交量
+  python etf_159506_catalog_loader.py --volume --date 2024-01-15   # 计算指定日期每分钟成交量
+  python etf_159506_catalog_loader.py --volume --volume-time 13:00-13:05  # 计算指定时间范围成交量
         """
     )
     
@@ -2337,6 +2570,18 @@ def main():
         '--realtime', '-r',
         action='store_true',
         help='启用实时更新模式 (每30秒自动更新)'
+    )
+    
+    parser.add_argument(
+        '--volume', '-v',
+        action='store_true',
+        help='计算并显示每分钟成交量统计'
+    )
+    
+    parser.add_argument(
+        '--volume-time',
+        type=str,
+        help='指定成交量统计的时间范围 (格式: HH:MM-HH:MM，例如: 13:00-13:05)'
     )
     
     args = parser.parse_args()
@@ -2446,6 +2691,65 @@ def main():
                 print(f"   最新成交价: {float(latest_trade.price):.4f}")
         else:
             print("⚠️  Redis中没有数据，将使用catalog文件数据")
+        
+        # 计算每分钟成交量
+        if args.volume:
+            print("\n" + "="*60)
+            print("每分钟成交量统计")
+            print("="*60)
+            
+            # 计算每分钟成交量
+            minute_stats = kline_generator.calculate_minute_volume(target_date)
+            
+            if not minute_stats.empty:
+                # 解析时间范围参数
+                start_time = None
+                end_time = None
+                
+                if args.volume_time:
+                    try:
+                        time_parts = args.volume_time.split('-')
+                        if len(time_parts) == 2:
+                            start_str, end_str = time_parts
+                            
+                            # 获取目标日期或使用数据中的日期
+                            if target_date:
+                                date_str = target_date.strftime('%Y-%m-%d')
+                            else:
+                                # 从数据中获取日期
+                                date_str = minute_stats['minute_time'].iloc[0].strftime('%Y-%m-%d')
+                            
+                            start_time = pd.Timestamp(f'{date_str} {start_str}', tz='Asia/Shanghai')
+                            end_time = pd.Timestamp(f'{date_str} {end_str}', tz='Asia/Shanghai')
+                            
+                            print(f"指定时间范围: {start_time} 到 {end_time}")
+                        else:
+                            print(f"时间范围格式错误: {args.volume_time}")
+                            print("正确格式: HH:MM-HH:MM，例如: 13:00-13:05")
+                    except Exception as e:
+                        print(f"解析时间范围失败: {e}")
+                        print("将显示所有时间的统计数据")
+                
+                # 打印统计数据
+                kline_generator.print_minute_volume_data(minute_stats, start_time, end_time)
+                
+                # 保存到CSV文件
+                csv_filename = f'minute_volume_{target_date if target_date else datetime.now().date()}.csv'
+                kline_generator.save_minute_volume_to_csv(minute_stats, target_date, csv_filename)
+                
+                # 输出统计摘要
+                print("\n" + "="*60)
+                print("统计摘要:")
+                print("="*60)
+                print(f"总分钟数: {len(minute_stats)}")
+                print(f"总成交量: {minute_stats['总成交量'].sum():,}")
+                print(f"总交易次数: {minute_stats['交易次数'].sum():,}")
+                print(f"平均每分钟成交量: {minute_stats['总成交量'].mean():,.0f}")
+                print(f"最大单分钟成交量: {minute_stats['总成交量'].max():,}")
+                print(f"最小单分钟成交量: {minute_stats['总成交量'].min():,}")
+                print(f"价格范围: {minute_stats['最低价'].min():.4f} - {minute_stats['最高价'].max():.4f}")
+            else:
+                print("❌ 没有数据可计算每分钟成交量")
         
         # 生成K线图
         if target_date:

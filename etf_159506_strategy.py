@@ -768,8 +768,11 @@ class ETF159506Strategy(Strategy):
             self.last_signal = "golden_cross"
             
             # 累积买入信号
-            self.technical_signal += 20000*current_macd_abs
-            self._log.info(f"金叉买入信号累积: 当前信号值={self.technical_signal}")
+            # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
+            is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
+            signal_coefficient = 40000 if is_first_golden_cross else 20000
+            self.technical_signal += signal_coefficient*current_macd_abs
+            self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
 
             # 检查RSI条件
             if self.rsi.initialized:
@@ -831,12 +834,15 @@ class ETF159506Strategy(Strategy):
             self.last_signal = "death_cross"
             
             # 累积卖出信号
-            self.technical_signal -= 20000*current_macd_abs
-            self._log.info(f"死叉卖出信号累积: 当前信号值={self.technical_signal}")
+            # 如果是第一个死叉技术信号，使用40000系数，否则使用20000
+            is_first_death_cross = not any(signal.get('signal_type') == 'death_cross' for signal in self.technical_signals)
+            signal_coefficient = 40000 if is_first_death_cross else 20000
+            self.technical_signal -= signal_coefficient*current_macd_abs
+            self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
             if self.rsi.initialized and self.rsi.value < 50:
-                self.technical_signal += self.rsi.value
+                self.technical_signal -= self.rsi.value
                 self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强卖出信号")
             else:
                 rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
