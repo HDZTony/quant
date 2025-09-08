@@ -309,6 +309,12 @@ class ETF159506Strategy(Strategy):
         self.scheduled_buy_time = time(14, 50)  # 2:50分买入（北京时间）
         self.last_scheduled_buy_date = None  # 记录上次定时买入的日期
         self._log.info(f"定时买入功能已启用: 每天北京时间 {self.scheduled_buy_time.strftime('%H:%M')} 执行买入")
+        
+        # 每分钟成交量记录
+        self.minute_volume_data = {}  # 存储每分钟成交量数据 {minute_key: total_volume}
+        self.current_minute = None  # 当前分钟标识
+        self.current_minute_volume = 0  # 当前分钟累计成交量
+        self._log.info("每分钟成交量记录功能已启用")
 
     def on_start(self):
         """策略启动时调用"""
@@ -360,10 +366,85 @@ class ETF159506Strategy(Strategy):
             }
             self._log.info(f"策略停止时保存了 {len(self.price_peaks)} 个价格峰值, {len(self.price_troughs)} 个价格谷值, {len(self.dif_peaks)} 个DIF峰值, {len(self.dif_troughs)} 个DIF谷值")
         
+        # 保存最后一分钟的成交量数据
+        if self.current_minute is not None and self.current_minute not in self.minute_volume_data:
+            self.minute_volume_data[self.current_minute] = self.current_minute_volume
+            self._log.info(f"保存最后一分钟成交量数据: {self.current_minute} - 成交量: {self.current_minute_volume}")
+        
+        # 保存每分钟成交量数据到策略实例变量中，供回测系统获取
+        if not hasattr(self, '_saved_minute_volume_data'):
+            self._saved_minute_volume_data = self.minute_volume_data.copy()
+            self._log.info(f"策略停止时保存了 {len(self.minute_volume_data)} 分钟的成交量数据")
+        
         self.print_extremes_history()
+        
+        # 打印每分钟成交量汇总
+        self.print_minute_volume_data()
+    
+    def record_minute_volume(self, bar: Bar):
+        """记录每分钟成交量数据"""
+        # 转换为北京时间
+        utc_time = pd.to_datetime(bar.ts_event, unit='ns')
+        beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        
+        # 创建分钟标识（格式：YYYY-MM-DD HH:MM）
+        minute_key = beijing_time.strftime('%Y-%m-%d %H:%M')
+        
+        # 如果进入新的分钟，保存上一分钟的数据
+        if self.current_minute is not None and self.current_minute != minute_key:
+            self.minute_volume_data[self.current_minute] = self.current_minute_volume
+            self._log.info(f"分钟成交量记录: {self.current_minute} - 成交量: {self.current_minute_volume}")
+            
+            # 重置当前分钟数据
+            self.current_minute_volume = 0
+        
+        # 更新当前分钟数据
+        self.current_minute = minute_key
+        self.current_minute_volume += bar.volume.as_double()
+    
+    def get_minute_volume_summary(self):
+        """获取每分钟成交量汇总数据"""
+        summary = []
+        for minute_key, volume in self.minute_volume_data.items():
+            summary.append({
+                'minute_time': minute_key,
+                'total_volume': volume
+            })
+        
+        # 按时间排序
+        summary.sort(key=lambda x: x['minute_time'])
+        return summary
+    
+    def print_minute_volume_data(self, start_time=None, end_time=None):
+        """打印每分钟成交量数据"""
+        summary = self.get_minute_volume_summary()
+        
+        if not summary:
+            self._log.info("没有每分钟成交量数据可显示")
+            return
+        
+        # 如果指定了时间范围，进行筛选
+        if start_time and end_time:
+            filtered_summary = [s for s in summary if start_time <= s['minute_time'] <= end_time]
+            self._log.info(f"筛选时间范围: {start_time} 到 {end_time}")
+            self._log.info(f"筛选到的分钟数: {len(filtered_summary)}")
+        else:
+            filtered_summary = summary
+            self._log.info(f"总分钟数: {len(filtered_summary)}")
+        
+        self._log.info("\n每分钟成交量统计:")
+        self._log.info("=" * 50)
+        self._log.info(f"{'时间':<20} {'成交量':<15}")
+        self._log.info("-" * 50)
+        
+        for data in filtered_summary:
+            self._log.info(f"{data['minute_time']:<20} {data['total_volume']:<15}")
         
     def on_bar(self, bar: Bar):
         """处理K线数据"""
+        # 记录每分钟成交量
+        self.record_minute_volume(bar)
+        
         # 更新MACD指标
         self.macd.handle_bar(bar)
         
