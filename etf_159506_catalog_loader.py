@@ -851,7 +851,7 @@ class ETF159506RedisKlineGenerator:
             
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -875,9 +875,18 @@ class ETF159506RedisKlineGenerator:
                         np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
                     )
                     
+                    # 计算一分钟在时间轴上的宽度
+                    if len(minute_volume_mapped) > 1:
+                        # 计算相邻时间点的平均间隔
+                        time_diffs = minute_volume_mapped['mapped_time'].diff().dropna()
+                        avg_time_diff = time_diffs.mean()
+                        bar_width = avg_time_diff.total_seconds() / 86400  # 转换为天为单位
+                    else:
+                        bar_width = 1/1440  # 默认一分钟的宽度（1/1440天）
+                    
                     # 绘制每分钟成交量柱状图
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
-                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                           alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
                     logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
@@ -1403,7 +1412,7 @@ class ETF159506RedisKlineGenerator:
            
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -1427,9 +1436,18 @@ class ETF159506RedisKlineGenerator:
                         np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
                     )
                     
+                    # 计算一分钟在时间轴上的宽度
+                    if len(minute_volume_mapped) > 1:
+                        # 计算相邻时间点的平均间隔
+                        time_diffs = minute_volume_mapped['mapped_time'].diff().dropna()
+                        avg_time_diff = time_diffs.mean()
+                        bar_width = avg_time_diff.total_seconds() / 86400  # 转换为天为单位
+                    else:
+                        bar_width = 1/1440  # 默认一分钟的宽度（1/1440天）
+                    
                     # 绘制每分钟成交量柱状图
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
-                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                           alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
                     logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
@@ -1632,7 +1650,7 @@ class ETF159506RedisKlineGenerator:
         update_thread.start()
         logger.info("实时K线图更新已启动")
 
-    def calculate_minute_volume(self, target_date: datetime.date = None) -> pd.DataFrame:
+    def calculate_minute_volume(self, target_date: datetime.date = None) -> tuple:
         """
         根据tick数据计算每分钟成交量（仅处理trade类型数据，不包含quote数据）
         
@@ -1640,7 +1658,7 @@ class ETF159506RedisKlineGenerator:
             target_date: 目标日期，如果为None则使用今日/最近交易日
         
         Returns:
-            DataFrame: 包含每分钟成交量统计的数据
+            tuple: (minute_stats, df) 包含每分钟成交量统计的数据和原始tick数据
         """
         try:
             # 获取数据
@@ -1648,7 +1666,7 @@ class ETF159506RedisKlineGenerator:
             
             if not kline_data:
                 logger.warning("没有数据可计算每分钟成交量")
-                return pd.DataFrame()
+                return pd.DataFrame(), pd.DataFrame()
             
             # 转换为DataFrame
             df = pd.DataFrame(kline_data)
@@ -1693,20 +1711,21 @@ class ETF159506RedisKlineGenerator:
             minute_stats = minute_stats.reset_index()
             
             logger.info(f"计算完成，生成了 {len(minute_stats)} 分钟的统计数据")
-            return minute_stats
+            return minute_stats, df
             
         except Exception as e:
             logger.error(f"计算每分钟成交量失败: {e}")
             import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
-            return pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame()
     
-    def print_minute_volume_data(self, minute_stats: pd.DataFrame, start_time=None, end_time=None):
+    def print_minute_volume_data(self, minute_stats: pd.DataFrame, df: pd.DataFrame = None, start_time=None, end_time=None):
         """
-        打印分钟成交量数据
+        打印分钟成交量数据，包括每笔交易的详情
         
         Args:
             minute_stats: 分钟统计数据
+            df: 原始tick数据（可选，用于显示每笔交易详情）
             start_time: 开始时间 (可选)
             end_time: 结束时间 (可选)
         """
@@ -1725,20 +1744,37 @@ class ETF159506RedisKlineGenerator:
             print(f"\n总分钟数: {len(filtered_stats)}")
         
         print("\n每分钟成交量统计:")
-        print("=" * 120)
-        print(f"{'时间':<20} {'总成交量':<12} {'交易次数':<8} {'平均成交量':<12} {'开盘价':<8} {'收盘价':<8} {'最低价':<8} {'最高价':<8} {'平均价':<8}")
-        print("-" * 120)
+        print("=" * 80)
+        print(f"{'时间':<20} {'每分钟成交量':<15} {'交易次数':<8}")
+        print("-" * 80)
         
         for _, row in filtered_stats.iterrows():
             print(f"{row['minute_time'].strftime('%Y-%m-%d %H:%M'):<20} "
-                  f"{row['总成交量']:<12} "
-                  f"{row['交易次数']:<8} "
-                  f"{row['平均成交量']:<12} "
-                  f"{row['开盘价']:<8} "
-                  f"{row['收盘价']:<8} "
-                  f"{row['最低价']:<8} "
-                  f"{row['最高价']:<8} "
-                  f"{row['平均价']:<8}")
+                  f"{row['总成交量']:<15} "
+                  f"{row['交易次数']:<8}")
+            
+            # 如果提供了原始数据，显示该分钟内的每笔交易详情
+            if df is not None and not df.empty:
+                minute_start = row['minute_time']
+                minute_end = minute_start + pd.Timedelta(minutes=1)
+                
+                # 筛选该分钟内的所有交易
+                minute_trades = df[(df['minute_time'] >= minute_start) & (df['minute_time'] < minute_end)]
+                
+                if len(minute_trades) > 0:
+                    print(f"  该分钟内的交易详情:")
+                    print(f"  {'时间':<20} {'价格':<10} {'成交量':<12} {'该分钟内累计':<12}")
+                    print(f"  {'-'*20} {'-'*10} {'-'*12} {'-'*12}")
+                    
+                    minute_cumulative = 0
+                    for _, trade in minute_trades.iterrows():
+                        minute_cumulative += trade['volume']
+                        print(f"  {trade['timestamp'].strftime('%H:%M:%S.%f')[:-3]:<20} "
+                              f"{trade['price']:<10} "
+                              f"{trade['volume']:<12} "
+                              f"{minute_cumulative:<12}")
+                    print(f"  该分钟总成交量: {row['总成交量']}")
+                    print()
     
     def save_minute_volume_to_csv(self, minute_stats: pd.DataFrame, target_date: datetime.date = None, output_file: str = None):
         """
@@ -1951,7 +1987,7 @@ class ETF159506RedisKlineGenerator:
             
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -1975,9 +2011,18 @@ class ETF159506RedisKlineGenerator:
                         np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
                     )
                     
+                    # 计算一分钟在时间轴上的宽度
+                    if len(minute_volume_mapped) > 1:
+                        # 计算相邻时间点的平均间隔
+                        time_diffs = minute_volume_mapped['mapped_time'].diff().dropna()
+                        avg_time_diff = time_diffs.mean()
+                        bar_width = avg_time_diff.total_seconds() / 86400  # 转换为天为单位
+                    else:
+                        bar_width = 1/1440  # 默认一分钟的宽度（1/1440天）
+                    
                     # 绘制每分钟成交量柱状图
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
-                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                           alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
                     logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
@@ -2448,7 +2493,7 @@ class ETF159506RedisKlineGenerator:
             
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -2472,9 +2517,18 @@ class ETF159506RedisKlineGenerator:
                         np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
                     )
                     
+                    # 计算一分钟在时间轴上的宽度
+                    if len(minute_volume_mapped) > 1:
+                        # 计算相邻时间点的平均间隔
+                        time_diffs = minute_volume_mapped['mapped_time'].diff().dropna()
+                        avg_time_diff = time_diffs.mean()
+                        bar_width = avg_time_diff.total_seconds() / 86400  # 转换为天为单位
+                    else:
+                        bar_width = 1/1440  # 默认一分钟的宽度（1/1440天）
+                    
                     # 绘制每分钟成交量柱状图
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
-                           alpha=0.7, color=colors, width=0.8, label='每分钟成交量')
+                           alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
                     logger.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
@@ -2699,7 +2753,7 @@ def main():
             print("="*60)
             
             # 计算每分钟成交量
-            minute_stats = kline_generator.calculate_minute_volume(target_date)
+            minute_stats, df = kline_generator.calculate_minute_volume(target_date)
             
             if not minute_stats.empty:
                 # 解析时间范围参数
@@ -2731,7 +2785,7 @@ def main():
                         print("将显示所有时间的统计数据")
                 
                 # 打印统计数据
-                kline_generator.print_minute_volume_data(minute_stats, start_time, end_time)
+                kline_generator.print_minute_volume_data(minute_stats, df, start_time, end_time)
                 
                 # 保存到CSV文件
                 csv_filename = f'minute_volume_{target_date if target_date else datetime.now().date()}.csv'
