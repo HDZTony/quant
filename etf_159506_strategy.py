@@ -311,7 +311,7 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"定时买入功能已启用: 每天北京时间 {self.scheduled_buy_time.strftime('%H:%M')} 执行买入")
         
         # 每分钟成交量记录
-        self.minute_volume_data = {}  # 存储每分钟成交量数据 {minute_key: total_volume}
+        self.minute_volume_data = deque(maxlen=1000)  # 存储每分钟成交量数据 [volume, ...]
         self.current_minute = None  # 当前分钟标识
         self.current_minute_volume = 0  # 当前分钟累计成交量
         self._log.info("每分钟成交量记录功能已启用")
@@ -367,13 +367,14 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"策略停止时保存了 {len(self.price_peaks)} 个价格峰值, {len(self.price_troughs)} 个价格谷值, {len(self.dif_peaks)} 个DIF峰值, {len(self.dif_troughs)} 个DIF谷值")
         
         # 保存最后一分钟的成交量数据
-        if self.current_minute is not None and self.current_minute not in self.minute_volume_data:
-            self.minute_volume_data[self.current_minute] = self.current_minute_volume
-            self._log.info(f"保存最后一分钟成交量数据: {self.current_minute} - 成交量: {self.current_minute_volume}")
+        if self.current_minute is not None and self.current_minute_volume > 0:
+            # 这里需要获取当前时间戳，但由于on_stop没有bar参数，我们使用一个估算值
+            # 在实际使用中，这个数据应该在record_minute_volume中已经保存了
+            self._log.info(f"最后一分钟成交量数据: {self.current_minute} - 成交量: {self.current_minute_volume}")
         
         # 保存每分钟成交量数据到策略实例变量中，供回测系统获取
         if not hasattr(self, '_saved_minute_volume_data'):
-            self._saved_minute_volume_data = self.minute_volume_data.copy()
+            self._saved_minute_volume_data = list(self.minute_volume_data)
             self._log.info(f"策略停止时保存了 {len(self.minute_volume_data)} 分钟的成交量数据")
         
         self.print_extremes_history()
@@ -392,7 +393,7 @@ class ETF159506Strategy(Strategy):
         
         # 如果进入新的分钟，保存上一分钟的数据
         if self.current_minute is not None and self.current_minute != minute_key:
-            self.minute_volume_data[self.current_minute] = self.current_minute_volume
+            self.minute_volume_data.append(self.current_minute_volume)
             self._log.info(f"分钟成交量记录: {self.current_minute} - 成交量: {self.current_minute_volume}")
             
             # 重置当前分钟数据
@@ -405,14 +406,23 @@ class ETF159506Strategy(Strategy):
     def get_minute_volume_summary(self):
         """获取每分钟成交量汇总数据"""
         summary = []
-        for minute_key, volume in self.minute_volume_data.items():
-            summary.append({
-                'minute_time': minute_key,
-                'total_volume': volume
-            })
+        for i, volume in enumerate(self.minute_volume_data):
+            # 通过索引获取对应的时间戳
+            if i < len(self.timestamps):
+                timestamp = self.timestamps[i]
+                # 转换为北京时间
+                utc_time = pd.to_datetime(timestamp, unit='ns')
+                beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+                minute_time = beijing_time.strftime('%Y-%m-%d %H:%M')
+                
+                summary.append({
+                    'minute_time': minute_time,
+                    'total_volume': volume,
+                    'timestamp': timestamp
+                })
         
         # 按时间排序
-        summary.sort(key=lambda x: x['minute_time'])
+        summary.sort(key=lambda x: x['timestamp'])
         return summary
     
     def print_minute_volume_data(self, start_time=None, end_time=None):
@@ -439,6 +449,62 @@ class ETF159506Strategy(Strategy):
         
         for data in filtered_summary:
             self._log.info(f"{data['minute_time']:<20} {data['total_volume']:<15}")
+    
+    def calculate_volume_ratio(self, index: int, current_bar: Bar) -> float:
+        """
+        计算成交量对比：从start_timestamp开始到前一分钟的每分钟平均成交量和当前成交量的比值
+        
+        Args:
+            start_timestamp: 开始时间戳（纳秒）
+            current_bar: 当前K线数据
+            
+        Returns:
+            成交量比值 (当前成交量 / 历史平均成交量)
+        """
+        try:
+            # 获取当前时间戳
+            current_timestamp = current_bar.ts_event
+            
+            # 获取当前成交量
+            current_volume = current_bar.volume.as_double()
+            
+            # 如果没有历史成交量数据，返回1.0
+            if not self.minute_volume_data:
+                self._log.info(f"无历史成交量数据，成交量比值设为1.0")
+                return 0
+            
+        
+            
+            # 筛选从index到当前时间前一分钟的数据
+            filtered_volumes = []
+            for i in range(index, len(self.minute_volume_data)):
+                filtered_volumes.append(self.minute_volume_data[i])
+                self._log.info(f"成交量对比计算: 历史成交量={self.minute_volume_data[i]:.2f}")
+            
+
+            
+            # 计算历史平均成交量
+            avg_historical_volume = sum(filtered_volumes) / len(filtered_volumes)
+            
+            # 计算成交量比值
+            volume_ratio = current_volume / avg_historical_volume
+            
+            # 转换为北京时间用于日志
+        
+            
+            current_utc_time = pd.to_datetime(current_timestamp, unit='ns')
+            current_beijing_time = current_utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+            current_time_str = current_beijing_time.strftime('%H:%M:%S')
+            
+            self._log.info(f"成交量对比计算: 开始索引={index}, 当前时间={current_time_str}, "
+                          f"历史数据点数={len(filtered_volumes)}, 历史平均成交量={avg_historical_volume:.2f}, "
+                          f"当前成交量={current_volume:.2f}, 成交量比值={volume_ratio:.4f}")
+            
+            return volume_ratio
+            
+        except Exception as e:
+            self._log.error(f"计算成交量比值时发生错误: {e}")
+            return 1.0
         
     def on_bar(self, bar: Bar):
         """处理K线数据"""
@@ -716,31 +782,43 @@ class ETF159506Strategy(Strategy):
                             'start_time': time_str,
                             'start_timestamp': timestamp
                         }
-                        if min_trough_value < -0.004:
-                            self.technical_signal += 200
-                            self._log.info(f"极小值信号触发: min_trough_value={min_trough_value:.6f} < -0.004, 买入信号+100, 当前信号值={self.technical_signal}")
-                            
-                            # 记录极小值技术指标信号
-                            technical_signal = {
-                                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                                'price': bar.close.as_double(),
-                                'signal_type': 'n2p',
-                                'signal_value': self.technical_signal,
-                                'min_trough_value': min_trough_value,
-                                'min_trough_time': min_trough_time_str,
-                                'rsi_value': self.rsi.value if self.rsi.initialized else None,
-                                'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
-                                'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
-                                'kdj_j': self.kdj.value_j if self.kdj.initialized else None
-                            }
-                            self.technical_signals.append(technical_signal)
-                            self._log.info(f"记录极小值技术信号: {technical_signal}")
-                            
-                            # 检查是否达到买入阈值
-                            if self.technical_signal >= self.buy_threshold:
-                                self._log.info(f"极小值买入信号达到阈值{self.buy_threshold}，执行买入操作")
-                                self.execute_buy_signal(bar)
-                                self.technical_signal = 0  # 信号归零
+                         # 计算成交量对比
+                        volume_ratio = self.calculate_volume_ratio(actual_index, bar)
+                        # 动态计算信号强度：min_trough_value越小，信号强度越大
+                        # 使用指数函数：signal_strength = base_signal * (1 + abs(min_trough_value) / threshold)^power
+                        base_signal = 10000  # 基础信号强度
+                        power = 1.5  # 指数幂，控制增长曲线
+                        
+                        # 计算动态信号强度
+                        signal_strength = (base_signal * abs(min_trough_value)) ** power * volume_ratio
+                        
+                        self.technical_signal += signal_strength
+                        self._log.info(f"极小值信号触发: min_trough_value={min_trough_value:.6f}, 动态信号强度={signal_strength:.1f}, 当前信号值={self.technical_signal}")
+                       
+                        # 记录极小值技术指标信号
+                        technical_signal = {
+                            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                            'price': bar.close.as_double(),
+                            'signal_type': 'n2p',
+                            'signal_value': self.technical_signal,
+                            'min_trough_value': min_trough_value,
+                            'min_trough_time': min_trough_time_str,
+                            'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                            'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                            'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                            'kdj_j': self.kdj.value_j if self.kdj.initialized else None,
+                            'volume_ratio': volume_ratio
+                        }
+                        
+                        
+                        self.technical_signals.append(technical_signal)
+                        self._log.info(f"记录极小值技术信号: {technical_signal}")
+                        
+                        # 检查是否达到买入阈值
+                        if self.technical_signal >= self.buy_threshold:
+                            self._log.info(f"极小值买入信号达到阈值{self.buy_threshold}，执行买入操作")
+                            self.execute_buy_signal(bar)
+                            self.technical_signal = 0  # 信号归零
                             
                     else:
                         self._log.info(f"从{time_str}到当前时间中未找到极小值")
@@ -1598,8 +1676,8 @@ class ETF159506Strategy(Strategy):
         
         self._log.info("=" * 80) 
 
-    def check_scheduled_buy(self, bar: Bar):
         """检查定时买入信号"""
+    def check_scheduled_buy(self, bar: Bar):
         # 获取当前K线的时间（UTC时间）
         current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
         
