@@ -284,6 +284,7 @@ class ETF159506Strategy(Strategy):
         self.buy_threshold = 100   # 买入信号阈值
         self.sell_threshold = -100 # 卖出信号阈值
         self.macd_top_signal = False
+        self.macd_bottom_signal = False
         # 记录极值点检测参数
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
         self._log.info(f"DIF信号过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤DIF绝对值小于此值的金叉死叉和背离信号)")
@@ -931,6 +932,7 @@ class ETF159506Strategy(Strategy):
                     self.execute_sell_signal(bar)
                     self.technical_signal = 0  # 信号归零
                     self.macd_top_signal = True
+                    self.macd_bottom_signal = False
             else:
                 self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
         else:
@@ -988,6 +990,7 @@ class ETF159506Strategy(Strategy):
                     self.execute_buy_signal(bar, signal_type='macd_bottom_signals')
                     self.technical_signal = 0  # 信号归零
                     self.macd_top_signal = False
+                    self.macd_bottom_signal = True
             else:
                 self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
         else:
@@ -1016,7 +1019,7 @@ class ETF159506Strategy(Strategy):
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0:
+        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0 and not self.macd_bottom_signal:
             # 获取前5个DIF值（不包括当前值）
             last_five_dif = list(self.macd_history)[-6:-1]  # 前5个值
             current_dif = current_macd
