@@ -277,13 +277,13 @@ class ETF159506Strategy(Strategy):
         
         # 分别存储价格和MACD的极值点历史（用于相对极值检测）
         self.price_extremes_history = []  # 存储价格极值点历史
-        self.macd_extremes_history = []    # 存储MACD极值点历史
+        self.macd_extremes_history = []    # 存储MACD极值点历史(prev_macd_timestamp, prev_macd, 'trough'))
         
         # 技术指标信号累积系统
         self.technical_signal = 0  # 技术指标信号累积值，+100买入，-100卖出
         self.buy_threshold = 100   # 买入信号阈值
         self.sell_threshold = -100 # 卖出信号阈值
-        
+        self.macd_top_signal = False
         # 记录极值点检测参数
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
         self._log.info(f"DIF信号过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤DIF绝对值小于此值的金叉死叉和背离信号)")
@@ -315,6 +315,9 @@ class ETF159506Strategy(Strategy):
         self.current_minute = None  # 当前分钟标识
         self.current_minute_volume = 0  # 当前分钟累计成交量
         self._log.info("每分钟成交量记录功能已启用")
+        
+        # MACD极值点时间差属性
+        self.time_diff_minutes_from_latest_extreme = None  # 距离最近极值点的分钟数
 
     def on_start(self):
         """策略启动时调用"""
@@ -452,10 +455,10 @@ class ETF159506Strategy(Strategy):
     
     def calculate_volume_ratio(self, index: int, current_bar: Bar) -> float:
         """
-        计算成交量对比：从start_timestamp开始到前一分钟的每分钟平均成交量和当前成交量的比值
+        计算成交量对比：从index开始到前一分钟的每分钟平均成交量和当前成交量的比值
         
         Args:
-            start_timestamp: 开始时间戳（纳秒）
+            index: 开始时间索引
             current_bar: 当前K线数据
             
         Returns:
@@ -558,11 +561,13 @@ class ETF159506Strategy(Strategy):
         
         # 统一的极值点检测（背离检测会在deque增加时自动执行）
         self.detect_and_record_extremes(bar)
-        
+        self.check_time_diff_minutes_MACD(bar)
         # 统一的交易信号检测和风险管理
         self.check_macd_signals(bar)
+        self.check_macd_top_signals(bar)
+        self.check_macd_bottom_signals(bar)
         self.check_risk_management(bar)
-        
+        self.technical_signal = 0
         # 定期监控持仓状态（每10个K线记录一次）
         # if len(self.macd_history) % 10 == 0:
         #     current_position = self.get_current_position()
@@ -826,6 +831,167 @@ class ETF159506Strategy(Strategy):
                 break
         
 
+    def check_macd_rank(self, extreme_type='peak'):
+        """
+        检查MACD极值排名：返回当前MACD值在指定类型极值中的排名比例
+        
+        Args:
+            extreme_type (str): 极值类型，'peak'表示极大值，'trough'表示极小值
+        
+        Returns:
+            float: 排名比例 (0=最低, 1=最高)
+        """
+        if not self.macd_extremes_history:
+            self._log.debug("MACD极值点历史为空，无法进行排序分析")
+            return 1
+        
+        # 获取当前MACD值
+        current_macd = self.macd_history[-1] if self.macd_history else 0
+        
+        # 根据极值类型筛选对应的极值点
+        filtered_extremes = [extreme for extreme in self.macd_extremes_history if extreme[2] == extreme_type]
+        
+        if not filtered_extremes:
+            self._log.debug(f"没有找到{extreme_type}类型的极值点")
+            return 1
+        
+        # 提取筛选后极值点的MACD值进行排序
+        macd_values = [extreme[1] for extreme in filtered_extremes]  # extreme[1]是MACD值
+        
+        # 对MACD值进行排序（从小到大）
+        sorted_macd_values = sorted(macd_values)
+        
+        # 计算当前MACD值的排名百分比
+        total_count = len(sorted_macd_values)
+        if total_count == 0:
+            return 1
+        
+        # 计算有多少个值小于当前值
+        values_below_current = sum(1 for val in sorted_macd_values if val < current_macd)
+        
+        rank_ratio = values_below_current / total_count
+
+        self._log.info(f"MACD{extreme_type}排序分析: 总{extreme_type}点数={total_count}, 当前MACD={current_macd:.6f}")
+        self._log.info(f"排名比例={rank_ratio:.3f} (0=最低, 1=最高)")
+        
+        return rank_ratio
+    def check_macd_top_signals(self, bar: Bar):
+        rank_ratio = self.check_macd_rank('peak')  # 比较极大值
+        if rank_ratio > 0.9 and self.latest_extreme_type == 'peak':
+            # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
+            if self.time_diff_minutes_from_latest_extreme is not None:
+                # 根据时间差计算索引
+                # time_diff_minutes_from_latest_extreme 表示距离最近极值点过了多少分钟
+                # 我们需要找到对应的成交量数据索引
+                
+                # 计算从最近极值点开始的索引
+                # 假设每分钟一个数据点，时间差就是索引差
+                time_diff_minutes = int(self.time_diff_minutes_from_latest_extreme)
+                
+                # 计算起始索引（从最近极值点开始）
+                start_index = max(0, len(self.minute_volume_data) - time_diff_minutes - 1)
+                
+                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9")
+                self._log.info(f"时间差分析: 距离最近极值点={self.time_diff_minutes_from_latest_extreme:.2f}分钟")
+                self._log.info(f"成交量分析: 起始索引={start_index}, 总数据点数={len(self.minute_volume_data)}")
+                
+                # 计算成交量比值
+                volume_ratio = self.calculate_volume_ratio(start_index, bar)
+                # 避免除零错误，当rank_ratio为0时使用一个很小的值
+                safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
+                self.technical_signal -= 10/volume_ratio+safe_rank_ratio*30
+                self._log.info(f"成交量比值: {volume_ratio:.4f}")
+                self._log.info(f"技术信号: {self.technical_signal:.2f}")
+                 # 检查RSI条件
+                if self.rsi.initialized:
+                    self.technical_signal -= self.rsi.value - 60
+                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
+
+                # 检查KDJ条件
+                # 计算KDJ三个值的最大差值
+                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                kdj_max_diff = max(kdj_values) - min(kdj_values)
+                
+                
+                self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                
+                # 如果KDJ三个值最大差值小于10且都小于20，增强信号
+                if kdj_max_diff < 20:
+                    self.technical_signal -= 40-kdj_max_diff
+                    self._log.info("KDJ条件满足：最大差值<20且超卖，增强买入信号")
+                else:
+                    self._log.info("KDJ条件不满足，使用标准信号")
+                self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
+        
+                
+                # 检查是否达到买入阈值
+                if self.technical_signal <= self.sell_threshold:
+                    self._log.info(f"卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
+                    self.execute_sell_signal(bar)
+                    self.technical_signal = 0  # 信号归零
+                    self.macd_top_signal = True
+            else:
+                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
+        else:
+            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} >= 0.2, 无需计算成交量比值")
+    def check_macd_bottom_signals(self, bar: Bar):
+        rank_ratio = self.check_macd_rank('trough')  # 比较极小值
+        if self.macd_top_signal and self.latest_extreme_type == 'trough':
+            # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
+            if self.time_diff_minutes_from_latest_extreme is not None:
+                # 根据时间差计算索引
+                # time_diff_minutes_from_latest_extreme 表示距离最近极值点过了多少分钟
+                # 我们需要找到对应的成交量数据索引
+                
+                # 计算从最近极值点开始的索引
+                # 假设每分钟一个数据点，时间差就是索引差
+                time_diff_minutes = int(self.time_diff_minutes_from_latest_extreme)
+                
+                # 计算起始索引（从最近极值点开始）
+                start_index = max(0, len(self.minute_volume_data) - time_diff_minutes - 1)
+                
+                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9")
+                self._log.info(f"时间差分析: 距离最近极值点={self.time_diff_minutes_from_latest_extreme:.2f}分钟")
+                self._log.info(f"成交量分析: 起始索引={start_index}, 总数据点数={len(self.minute_volume_data)}")
+                
+                # 计算成交量比值
+                volume_ratio = self.calculate_volume_ratio(start_index, bar)
+                # 避免除零错误，当rank_ratio为0时使用一个很小的值
+                safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
+                self.technical_signal += 10/volume_ratio+safe_rank_ratio*30
+                self._log.info(f"成交量比值: {volume_ratio:.4f}")
+                self._log.info(f"技术信号: {self.technical_signal:.2f}")
+                 # 检查RSI条件
+                if self.rsi.initialized:
+                    self.technical_signal += 80 - self.rsi.value 
+                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
+
+                # 检查KDJ条件
+                # 计算KDJ三个值的最大差值
+                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                kdj_max_diff = max(kdj_values) - min(kdj_values)
+                
+                
+                self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                
+                # 如果KDJ三个值最大差值小于10且都小于20，增强信号
+                self.technical_signal += 60-self.kdj.value_k
+                
+                self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
+        
+                
+                # 检查是否达到买入阈值
+                if self.technical_signal >= self.buy_threshold:
+                    self._log.info(f"买入信号达到阈值{self.buy_threshold}，执行买入操作")
+                    self.execute_buy_signal(bar, signal_type='macd_bottom_signals')
+                    self.technical_signal = 0  # 信号归零
+                    self.macd_top_signal = False
+            else:
+                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
+        else:
+            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f}, 无需计算成交量比值, 最近极值点类型={self.latest_extreme_type} 或 macd_top_signal={self.macd_top_signal}")
 
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
@@ -850,7 +1016,7 @@ class ETF159506Strategy(Strategy):
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_macd < 0 and len(self.macd_history) >= 6:
+        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0:
             # 获取前5个DIF值（不包括当前值）
             last_five_dif = list(self.macd_history)[-6:-1]  # 前5个值
             current_dif = current_macd
@@ -885,22 +1051,25 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"前5个DIF值: {last_five_dif}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
+                # 计算最近三个MACD极值点的DIF值及其最大差值
+                if len(self.macd_extremes_history) >= 3:
+                    last_three_extremes = self.macd_extremes_history[-3:]
+                    dif_values = [extreme[1] for extreme in last_three_extremes]
+                    max_dif = max(dif_values)
+                    min_dif = min(dif_values)
+                    max_dif_diff = max_dif - min_dif
+                    self._log.info(f"最近三个MACD极值点DIF值: {dif_values}, 最大差值: {max_dif_diff:.6f}")
+                    if max_dif_diff < 0.0005:
+                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值小于0.0005，跳过卖出操作")
+                        return
+                else:
+                    self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")
                 # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
                 if self.is_after_scheduled_time(bar):
                     self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
                     return
-                # 记录实际交易信号
-                trade_signal = {
-                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                    'price': bar.close.as_double(),
-                    'side': 'SELL',
-                    'order_id': 'close_position',
-                    'signal_type': 'executed_divergence_sell',
-                    'signal_value': self.technical_signal
-                }
-                self.trade_signals.append(trade_signal)
                 # 执行全部卖出
-                self.execute_sell_signal(bar)
+                self.execute_sell_signal(bar ,signal_type='DIF<0且前五个DIF都是单调递减')
                 
                 return
         
@@ -1329,11 +1498,50 @@ class ETF159506Strategy(Strategy):
                         self._log.debug(f"检测到新DIF谷值: 时间{prev_macd_timestamp}, DIF{prev_macd:.6f}, 价格{prev_price:.4f}")
                     
                     self.check_divergence(bar, action)
+                    
                 else:
                     self._log.debug(f"略过DIF{macd_type}: 时间{prev_macd_timestamp}, DIF{prev_macd:.6f} (差异太小)")
             else:
                 self._log.debug(f"未检测到DIF极值点: 上一个DIF={prev_macd:.6f}")
-    
+    def check_time_diff_minutes_MACD(self, bar: Bar):
+        """检查当前时间距离最近的极值点过了几分钟，并将结果存储为属性"""
+        if not self.macd_extremes_history:
+            self._log.debug("MACD极值点历史为空，无法计算时间差")
+            self.time_diff_minutes_from_latest_extreme = None
+            self.latest_extreme_type = None
+            return
+        
+        # 获取当前时间戳（纳秒）
+        current_timestamp = bar.ts_event
+        
+        # 获取最近的极值点
+        latest_extreme = self.macd_extremes_history[-1]
+        latest_extreme_timestamp = latest_extreme[0]
+        latest_extreme_value = latest_extreme[1]
+        latest_extreme_type = latest_extreme[2]
+        
+        # 计算时间差（纳秒）
+        time_diff_ns = current_timestamp - latest_extreme_timestamp
+        
+        # 转换为分钟
+        time_diff_minutes = time_diff_ns / (60 * 1_000_000_000)  # 纳秒转分钟
+        
+        # 存储为属性
+        self.time_diff_minutes_from_latest_extreme = time_diff_minutes
+        self.latest_extreme_type = latest_extreme_type
+        
+        # 转换为北京时间用于日志显示
+        current_time_utc = pd.to_datetime(current_timestamp, unit='ns')
+        current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        
+        latest_time_utc = pd.to_datetime(latest_extreme_timestamp, unit='ns')
+        latest_time_beijing = latest_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        
+        self._log.info(f"距离最近极值点时间差: {time_diff_minutes:.2f}分钟")
+        self._log.info(f"当前时间: {current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log.info(f"最近极值点时间: {latest_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log.info(f"最近极值点: DIF={latest_extreme_value:.6f}, 类型={latest_extreme_type}")
+        
     def handle_top_divergence(self, bar: Bar, action: str):
         """处理顶背离信号"""
         self._log.info("检测到顶背离信号：DIF创新高但价格未创新高，看跌信号")
@@ -1388,7 +1596,7 @@ class ETF159506Strategy(Strategy):
             self.execute_divergence_buy_signal(bar)
             self.technical_signal = 0  # 信号归零
     
-    def execute_buy_signal(self, bar: Bar):
+    def execute_buy_signal(self, bar: Bar, signal_type: str = 'executed_buy'):
         """执行买入信号"""
         # 检查是否已有持仓 - 使用可靠的持仓查询方法
         # current_position = self.get_current_position()
@@ -1432,14 +1640,14 @@ class ETF159506Strategy(Strategy):
             'side': 'BUY',
             'quantity': trade_quantity.as_double(),
             'order_id': str(order.client_order_id),
-            'signal_type': 'executed_buy',
+            'signal_type': signal_type,
             'signal_value': self.technical_signal
         }
         self.trade_signals.append(trade_signal)
         
         self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
     
-    def execute_sell_signal(self, bar: Bar):
+    def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
         """执行卖出信号"""
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
@@ -1458,7 +1666,7 @@ class ETF159506Strategy(Strategy):
             'price': bar.close.as_double(),
             'side': 'SELL',
             'order_id': 'close_position',
-            'signal_type': 'executed_sell',
+            'signal_type': signal_type,
             'signal_value': self.technical_signal
         }
         self.trade_signals.append(trade_signal)
