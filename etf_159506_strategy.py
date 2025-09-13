@@ -876,9 +876,56 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"排名比例={rank_ratio:.3f} (0=最低, 1=最高)")
         
         return rank_ratio
+    
+    def check_price_rank(self, extreme_type='peak'):
+        """
+        检查价格极值排名：返回当前价格在指定类型极值中的排名比例
+        
+        Args:
+            extreme_type (str): 极值类型，'peak'表示极大值，'trough'表示极小值
+        
+        Returns:
+            float: 排名比例 (0=最低, 1=最高)
+        """
+        if not self.price_extremes_history:
+            self._log.debug("价格极值点历史为空，无法进行排序分析")
+            return 1
+        
+        # 获取当前价格
+        current_price = self.price_history[-1] if self.price_history else 0
+        
+        # 根据极值类型筛选对应的极值点
+        filtered_extremes = [extreme for extreme in self.price_extremes_history if extreme[2] == extreme_type]
+        
+        if not filtered_extremes:
+            self._log.debug(f"没有找到{extreme_type}类型的极值点")
+            return 1
+        
+        # 提取筛选后极值点的价格值进行排序
+        price_values = [extreme[1] for extreme in filtered_extremes]  # extreme[1]是价格值
+        
+        # 对价格值进行排序（从小到大）
+        sorted_price_values = sorted(price_values)
+        
+        # 计算当前价格的排名百分比
+        total_count = len(sorted_price_values)
+        if total_count == 0:
+            return 1
+        
+        # 计算有多少个值小于当前值
+        values_below_current = sum(1 for val in sorted_price_values if val < current_price)
+        
+        rank_ratio = values_below_current / total_count
+
+        self._log.info(f"价格{extreme_type}排序分析: 总{extreme_type}点数={total_count}, 当前价格={current_price:.4f}")
+        self._log.info(f"排名比例={rank_ratio:.3f} (0=最低, 1=最高)")
+        
+        return rank_ratio
+    
     def check_macd_top_signals(self, bar: Bar):
         rank_ratio = self.check_macd_rank('peak')  # 比较极大值
-        if rank_ratio > 0.9 and self.latest_extreme_type == 'peak':
+        price_rank_ratio = self.check_price_rank('peak')
+        if rank_ratio > 0.9 and price_rank_ratio > 0.9 and self.latest_extreme_type == 'peak':
             # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
             if self.time_diff_minutes_from_latest_extreme is not None:
                 # 根据时间差计算索引
@@ -929,7 +976,7 @@ class ETF159506Strategy(Strategy):
                 # 检查是否达到买入阈值
                 if self.technical_signal <= self.sell_threshold:
                     self._log.info(f"卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
-                    self.execute_sell_signal(bar)
+                    self.execute_sell_signal(bar, signal_type='macd_top_signals')
                     self.technical_signal = 0  # 信号归零
                     self.macd_top_signal = True
                     self.macd_bottom_signal = False

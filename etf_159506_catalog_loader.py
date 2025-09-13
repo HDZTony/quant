@@ -2465,18 +2465,18 @@ class ETF159506RedisKlineGenerator:
                 logger.info("没有交易信号数据")
             
             # 添加信号类型说明
-            signal_info = "信号说明:\n"
-            signal_info += "▲ 买入信号: 金叉出现，无持仓时买入\n"
-            signal_info += "▼ 卖出信号: 死叉出现，有持仓时卖出\n"
-            signal_info += "● 持有信号: 金叉出现，已有持仓时持有\n"
-            signal_info += "■ 观望信号: 死叉出现，无持仓时观望"
+            # signal_info = "信号说明:\n"
+            # signal_info += "▲ 买入信号: 金叉出现，无持仓时买入\n"
+            # signal_info += "▼ 卖出信号: 死叉出现，有持仓时卖出\n"
+            # signal_info += "● 持有信号: 金叉出现，已有持仓时持有\n"
+            # signal_info += "■ 观望信号: 死叉出现，无持仓时观望"
             
-            ax1.text(0.02, 0.85, signal_info, 
-                   transform=ax1.transAxes, verticalalignment='top', 
-                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
-                   fontsize=10)
+            # ax1.text(0.02, 0.85, signal_info, 
+            #        transform=ax1.transAxes, verticalalignment='top', 
+            #        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
+            #        fontsize=10)
             
-            ax1.legend(loc='upper right')
+            # ax1.legend(loc='upper right')
             
             # 设置x轴格式 - 显示北京时间
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
