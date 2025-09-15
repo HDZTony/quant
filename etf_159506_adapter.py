@@ -277,6 +277,17 @@ class ETF159506DataProcessor:
             }
             
             self.total_processed += 1
+            
+            # 尝试保存数据到数据保存器
+            try:
+                from etf_159506_data_saver import get_global_data_saver
+                data_saver = get_global_data_saver()
+                if data_saver:
+                    # 转换为NautilusTrader格式并保存
+                    self._save_to_data_saver(data_saver, quote_data)
+            except Exception as save_error:
+                self.logger.debug(f"保存数据到数据保存器失败: {save_error}")
+            
             return quote_data
             
         except Exception as e:
@@ -309,6 +320,54 @@ class ETF159506DataProcessor:
         except Exception as e:
             self.logger.error(f"解析买卖五档数据失败: {e}")
             return {'bids': [], 'asks': []}
+    
+    def _save_to_data_saver(self, data_saver, quote_data: Dict):
+        """保存数据到数据保存器"""
+        try:
+            from nautilus_trader.model.data import QuoteTick
+            from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+            from nautilus_trader.model.objects import Price, Quantity
+            import time
+            
+            # 创建InstrumentId
+            instrument_id = InstrumentId(Symbol(self.stock_code), Venue("SZSE"))
+            
+            # 获取买卖价格和数量
+            bid_asks = quote_data.get('bid_asks', {'bids': [], 'asks': []})
+            
+            # 使用最优买卖价格，确保精度一致
+            if bid_asks['bids'] and bid_asks['asks']:
+                bid_price = Price.from_str(str(bid_asks['bids'][0]['price']))
+                ask_price = Price.from_str(str(bid_asks['asks'][0]['price']))
+                bid_size = Quantity.from_int(int(bid_asks['bids'][0]['volume']))
+                ask_size = Quantity.from_int(int(bid_asks['asks'][0]['volume']))
+            else:
+                # 如果没有买卖盘数据，使用最新价格
+                latest_price = quote_data.get('price', 0)
+                bid_price = Price.from_str(str(latest_price))
+                ask_price = Price.from_str(str(latest_price))
+                bid_size = Quantity.from_int(0)
+                ask_size = Quantity.from_int(0)
+            
+            # 创建时间戳
+            current_time_ns = int(time.time() * 1e9)
+            
+            # 创建QuoteTick
+            quote_tick = QuoteTick(
+                instrument_id=instrument_id,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                ts_event=current_time_ns,
+                ts_init=current_time_ns
+            )
+            
+            # 保存到数据保存器
+            data_saver.add_quote_tick(quote_tick)
+            
+        except Exception as e:
+            self.logger.debug(f"转换并保存QuoteTick失败: {e}")
 
 
 class ETF159506WebSocketClient:
