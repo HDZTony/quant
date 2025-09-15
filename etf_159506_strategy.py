@@ -6,7 +6,7 @@
 """
 
 from nautilus_trader.core.message import Event
-from nautilus_trader.indicators.macd import MovingAverageConvergenceDivergence
+from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
@@ -325,9 +325,6 @@ class ETF159506Strategy(Strategy):
         bar_type = self.config.bar_type
         self.subscribe_bars(bar_type)
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
-        
-        # 策略始终空仓开始
-        self._log.info("策略配置为空仓开始，等待交易信号")
         
         # # 检查初始持仓状态
         # initial_position = self.get_current_position()
@@ -1985,22 +1982,26 @@ class ETF159506Strategy(Strategy):
         # 计算交易数量
         if self.trade_size is None:
             account = self.cache.account_for_venue(self.config.venue)
-            available_balance = account.balance_total().as_double()
-            current_price = bar.close.as_double()
-            
-            # 检查可用余额
-            if available_balance <= 0:
-                self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过定时买入")
-                return
+            if account is None:
+                self._log.info("测试模式下无账户信息，使用固定交易数量")
+                trade_quantity = Quantity.from_int(100)  # 测试模式下使用固定数量
+            else:
+                available_balance = account.balance_total().as_double()
+                current_price = bar.close.as_double()
                 
-            quantity = int(available_balance / current_price)  # 使用100%资金满仓交易
-            
-            # 检查计算出的数量是否有效
-            if quantity <= 0:
-                self._log.info(f"计算出的交易数量无效: {quantity}，跳过定时买入")
-                return
+                # 检查可用余额
+                if available_balance <= 0:
+                    self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过定时买入")
+                    return
+                    
+                quantity = int(available_balance / current_price)  # 使用100%资金满仓交易
                 
-            trade_quantity = Quantity.from_int(quantity)
+                # 检查计算出的数量是否有效
+                if quantity <= 0:
+                    self._log.info(f"计算出的交易数量无效: {quantity}，跳过定时买入")
+                    return
+                    
+                trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
 
