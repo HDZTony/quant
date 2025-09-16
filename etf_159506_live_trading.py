@@ -128,7 +128,7 @@ class ETF159506LiveTradingSystem:
                     "instrument_id": str(instrument.id),
                     "bar_type": str(bar_type),
                     "venue": "SZSE",
-                    "trade_size": 0,  # 设置为0表示满仓交易（与回测一致）
+                    "trade_size": 10000,  # 每次交易10000股
                     "fast_ema_period": 12,
                     "slow_ema_period": 26,
                     "volume_threshold": 500000,
