@@ -313,7 +313,7 @@ class ETF159506LiveConfig:
             config_path="etf_159506_strategy_config:ETF159506Config",
             config={
                 "instrument_id": str(self.instrument_id),
-                "bar_type": str(self.bar_type),
+                "bar_type": self.bar_type,  # 直接传递BarType对象，不要转换为字符串
                 "venue": "SZSE",
                 "trade_size": 0,  # 0表示满仓交易
                 "fast_ema_period": 12,
@@ -365,10 +365,10 @@ class ETF159506LiveConfig:
             "bar_type": str(self.bar_type),
             "symbol": self.instrument.symbol.value,
             "venue": self.instrument.venue.value,
-            "currency": self.instrument.currency.code,
+            "currency": self.instrument.quote_currency.code,
             "price_precision": self.instrument.price_precision,
             "price_increment": str(self.instrument.price_increment),
-            "lot_size": self.instrument.lot_size.as_int(),
+            "lot_size": int(self.instrument.lot_size),
         }
     
     def validate_config(self) -> bool:

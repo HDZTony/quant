@@ -543,8 +543,8 @@ class ETF159506OfficialBacktest:
         """运行 7-25 日的回测"""
         try:
             # 设置回测日期
-            start_date = date(2025, 9, 12)
-            end_date = date(2025, 9, 12)
+            start_date = date(2025, 9, 17)
+            end_date = date(2025, 9, 17)
             
             logger.info(f"开始 7-25 日回测...")
             

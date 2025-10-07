@@ -19,209 +19,11 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model.data import Bar
 from collections import deque
 import pandas as pd
-from datetime import datetime, time
+from datetime import datetime, time, date, timedelta
+import pytz
 
-from nautilus_trader.indicators.base import Indicator
-from nautilus_trader.model.data import Bar
 from etf_159506_strategy_config import ETF159506Config
-
-
-class CatalogRSIIndicator(Indicator):
-    """
-    基于etf_159506_catalog_loader.py的RSI指标实现
-    使用pandas rolling window计算，与catalog_loader保持一致
-    """
-    
-    def __init__(self, period=6):
-        super().__init__([period])
-        self.period = period
-        
-        # 存储历史数据
-        self.closes = deque(maxlen=period + 10)  # 存储收盘价历史
-        
-        # 当前RSI值
-        self.value = 50.0
-    
-    def update_raw(self, close: float):
-        """
-        更新RSI指标值
-        
-        Parameters
-        ----------
-        close : float
-            收盘价
-        """
-        # 添加新数据
-        self.closes.append(close)
-        
-        # 检查是否足够数据计算RSI
-        if len(self.closes) >= 2:  # 至少需要2个数据点计算差值
-            # 转换为pandas Series进行计算
-            close_series = pd.Series(list(self.closes))
-            
-            # 计算价格变化
-            delta = close_series.diff()
-            gain = delta.where(delta > 0, 0.0)
-            loss = -delta.where(delta < 0, 0.0)
-            
-            # 计算平均收益和损失
-            avg_gain = gain.rolling(window=self.period, min_periods=1).mean()
-            avg_loss = loss.rolling(window=self.period, min_periods=1).mean()
-            
-            # 计算相对强弱
-            rs = avg_gain / avg_loss
-            
-            # 计算RSI
-            rsi = 100 - (100 / (1 + rs))
-            
-            # 获取最新值
-            self.value = rsi.iloc[-1]
-            
-            # 标记已初始化
-            if not self.initialized and len(self.closes) >= self.period:
-                self._set_initialized(True)
-    
-    def handle_bar(self, bar: Bar):
-        """
-        处理K线数据
-        
-        Parameters
-        ----------
-        bar : Bar
-            K线数据
-        """
-        self.update_raw(bar.close.as_double())
-    
-    def reset(self):
-        """重置指标状态"""
-        super().reset()
-        self.closes.clear()
-        self.value = 50.0
-    
-    def _reset(self):
-        """内部重置方法，由基类调用"""
-        self.closes.clear()
-        self.value = 50.0
-    
-    def __str__(self) -> str:
-        return f"CatalogRSIIndicator({self.period})"
-    
-    def __repr__(self) -> str:
-        return f"CatalogRSIIndicator({self.period})"
-    
-class CatalogKDJIndicator(Indicator):
-    """
-    基于etf_159506_catalog_loader.py的KDJ指标实现
-    使用pandas rolling window计算，与catalog_loader保持一致
-    """
-    def __init__(self, n=9, k_period=3, d_period=3):
-        super().__init__([n, k_period, d_period])
-        self.n = n
-        self.k_period = k_period
-        self.d_period = d_period
-        
-        # 存储历史数据
-        self.highs = deque(maxlen=n)
-        self.lows = deque(maxlen=n)
-        self.closes = deque(maxlen=n)
-        
-        # 当前KDJ值
-        self.value_k = 50.0
-        self.value_d = 50.0
-        self.value_j = 50.0
-    
-    def update_raw(self, high: float, low: float, close: float):
-        """
-        更新KDJ指标值
-        
-        Parameters
-        ----------
-        high : float
-            最高价
-        low : float
-            最低价
-        close : float
-            收盘价
-        """
-        # 添加新数据
-        self.highs.append(high)
-        self.lows.append(low)
-        self.closes.append(close)
-        
-        # 检查是否足够数据计算KDJ
-        if len(self.closes) >= self.n:
-            # 转换为pandas Series进行计算
-            close_series = pd.Series(list(self.closes))
-            high_series = pd.Series(list(self.highs))
-            low_series = pd.Series(list(self.lows))
-            
-            # 计算N周期内的最低价和最高价
-            low_list = close_series.rolling(window=self.n, min_periods=1).min()
-            high_list = close_series.rolling(window=self.n, min_periods=1).max()
-            
-            # 计算RSV：RSV = (CLOSE - LLV(LOW, N)) / (HHV(HIGH, N) - LLV(LOW, N)) * 100
-            rsv = (close_series - low_list) / (high_list - low_list) * 100
-            
-            # 计算K值：K = MA(RSV, k_period)
-            k = rsv.rolling(window=self.k_period, min_periods=1).mean()
-            
-            # 计算D值：D = MA(K, d_period)
-            d = k.rolling(window=self.d_period, min_periods=1).mean()
-            
-            # 计算J值：J = 3*K - 2*D
-            j = 3 * k - 2 * d
-            
-            # 获取最新值
-            self.value_k = k.iloc[-1]
-            self.value_d = d.iloc[-1]
-            self.value_j = j.iloc[-1]
-            
-            # 标记已初始化
-            if not self.initialized:
-                self._set_initialized(True)
-    
-    def handle_bar(self, bar: Bar):
-        """
-        处理K线数据
-        
-        Parameters
-        ----------
-        bar : Bar
-            K线数据
-        """
-        self.update_raw(
-            bar.high.as_double(),
-            bar.low.as_double(),
-            bar.close.as_double(),
-        )
-    
-    def reset(self):
-        """重置指标状态"""
-        super().reset()
-        self.highs.clear()
-        self.lows.clear()
-        self.closes.clear()
-        
-        self.value_k = 50.0
-        self.value_d = 50.0
-        self.value_j = 50.0
-    
-    def _reset(self):
-        """内部重置方法，由基类调用"""
-        self.highs.clear()
-        self.lows.clear()
-        self.closes.clear()
-        
-        self.value_k = 50.0
-        self.value_d = 50.0
-        self.value_j = 50.0
-    
-    def __str__(self) -> str:
-        return f"CatalogKDJIndicator({self.n}, {self.k_period}, {self.d_period})"
-    
-    def __repr__(self) -> str:
-        return f"CatalogKDJIndicator({self.n}, {self.k_period}, {self.d_period})"
-
+from etf_159506_strategy import CatalogKDJIndicator, CatalogRSIIndicator
 
 class ETF159506Strategy(Strategy):
     """
@@ -335,15 +137,43 @@ class ETF159506Strategy(Strategy):
     def on_start(self):
         """策略启动时调用"""
         bar_type = self.config.bar_type
+        
+        # 请求历史数据用于初始化指标
+        self._log.info(f"正在请求历史数据: {bar_type}")
+        
+        # Register the indicators for updating
+        self.register_indicator_for_bars(bar_type, self.macd)
+        self.register_indicator_for_bars(bar_type, self.kdj)
+        self.register_indicator_for_bars(bar_type, self.rsi)
+
+        
+        
+   
+        
+        # 请求历史数据 - 将通过on_historical_data()方法处理
+        self._log.info(f"开始请求历史数据，bar_type: {bar_type}")
+        
+        # 使用正确的参数调用request_bars
+        self._log.info(f"bar_type类型: {type(bar_type)}, 值: {bar_type}")
+        # 测试用：请求9月30日的数据
+        start_time = pd.Timestamp("2025-09-30 00:00:00", tz="UTC")
+        end_time = pd.Timestamp("2025-09-30 23:59:59", tz="UTC")
+        self._log.info(f"请求历史数据时间范围（测试用9月30日）: {start_time} 到 {end_time}")
+        
+        try:
+            request_id = self.request_bars(bar_type, start=start_time, end=end_time)
+            self._log.info(f"历史数据请求已发送，request_id: {request_id}")
+        except Exception as e:
+            self._log.error(f"请求历史数据时发生错误: {e}")
+            import traceback
+            self._log.error(f"错误详情: {traceback.format_exc()}")
+       
+
+        # Subscribe to real-time data - will be processed by on_bar() handler
+        # 订阅实时数据
         self.subscribe_bars(bar_type)
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
-        # # 检查初始持仓状态
-        # initial_position = self.get_current_position()
-        # if initial_position:
-        #     self._log.info(f"检测到初始持仓: {initial_position.quantity.as_double()} 股")
-        # else:
-        #     self._log.info("确认初始状态：无持仓")
 
     def on_stop(self):
         """策略停止时调用"""
@@ -394,6 +224,61 @@ class ETF159506Strategy(Strategy):
         
         # 打印每分钟成交量汇总
         self.print_minute_volume_data()
+    
+    def on_historical_data(self, data):
+        """处理历史数据"""
+        from nautilus_trader.model.data import Bar
+        
+        self._log.info(f"🎯 on_historical_data被调用！数据类型: {type(data)}")
+            # 处理单条历史K线数据
+        self._log.info(f"📈 接收到历史K线数据: {data.ts_event}, 价格: {data.close}")
+        self._process_historical_bar(data)
+        
+    
+    def _process_historical_bar(self, bar: Bar):
+        """处理单条历史K线数据"""
+        # 更新MACD指标
+        self.macd.handle_bar(bar)
+        
+        # 更新KDJ指标
+        self.kdj.handle_bar(bar)
+        
+        # 更新RSI指标
+        self.rsi.handle_bar(bar)
+        
+        # 记录每分钟成交量
+        self.record_minute_volume(bar)
+        
+        # 计算图表MACD值
+        chart_macd = self.calculate_chart_macd(bar)
+        
+        # 根据MACD初始化状态选择数据源
+        if not self.macd.initialized:
+            # 使用图表MACD值
+            self.macd_history.append(chart_macd['macd'])
+            self.signal_history.append(chart_macd['signal'])
+            self.histogram_history.append(chart_macd['histogram'])
+            
+            # 更新价格历史数据
+            self.price_history.append(bar.close.as_double())
+            self.timestamps.append(bar.ts_event)
+        else:
+            # 使用官方MACD值更新历史数据
+            self.update_history_data(bar)
+        
+        # 检测极值点（背离检测会在deque增加时自动执行）
+        self.detect_and_record_extremes(bar)
+        self.check_time_diff_minutes_MACD(bar)
+        
+        # 转换为北京时间用于日志
+        utc_time = pd.to_datetime(bar.ts_event, unit='ns')
+        beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        beijing_time_str = beijing_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        
+        self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={bar.close.as_double():.4f}, "
+                       f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
+        
+        # 在历史数据处理中不执行交易逻辑，只初始化指标
     
     def record_minute_volume(self, bar: Bar):
         """记录每分钟成交量数据"""

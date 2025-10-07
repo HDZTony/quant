@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+import os
 import threading
 import time
 import zlib
@@ -22,8 +23,271 @@ import json
 # NautilusTrader imports
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.model.data import QuoteTick, TradeTick, Bar
+from nautilus_trader.model.enums import BarAggregation, PriceType, AggressorSide, OmsType, AccountType, OrderStatus
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.execution.messages import GenerateOrderStatusReports
+from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.core.datetime import dt_to_unix_nanos
+from nautilus_trader.serialization.arrow.serializer import register_arrow
+from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.execution_client import LiveExecutionClient
+from nautilus_trader.live.factories import LiveExecClientFactory
+from nautilus_trader.common.component import MessageBus, LiveClock
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.model.identifiers import ClientId
+import pyarrow as pa
 
 logger = logging.getLogger(__name__)
+
+
+class ETF159506DataSaver:
+    """159506 ETF数据保存管理器 - 支持流式保存到磁盘"""
+    
+    def __init__(self, catalog_path: str = "./data_catalog"):
+        """初始化数据保存器"""
+        self.catalog_path = catalog_path
+        self.catalog = None
+        self.instrument_id = InstrumentId.from_str("159506.SZSE")
+        # 分离缓冲区，避免混合存储导致的数据保存问题
+        self.quote_buffer = []  # QuoteTick专用缓冲区
+        self.trade_buffer = []  # TradeTick专用缓冲区
+        self.last_save_time = time.time()
+       
+        
+        # 初始化数据目录
+        self._init_catalog()
+        
+    def _init_catalog(self):
+        """初始化Parquet数据目录"""
+        try:
+            # 检查现有文件
+            self._check_existing_files()
+            
+            self.catalog = ParquetDataCatalog(self.catalog_path)
+            logger.info(f"✅ 数据目录初始化成功: {self.catalog_path}")
+        except Exception as e:
+            logger.error(f"❌ 数据目录初始化失败: {e}")
+            self.catalog = None
+    
+    def _check_existing_files(self):
+        """检查现有文件，找出可能的重叠"""
+        try:
+            quote_tick_path = os.path.join(self.catalog_path, "data", "quote_tick", "159506.SZSE")
+            if os.path.exists(quote_tick_path):
+                files = os.listdir(quote_tick_path)
+                logger.debug(f"🔍 现有QuoteTick文件数量: {len(files)}")
+                if files:
+                    # 显示最近几个文件
+                    files.sort()
+                    recent_files = files[-3:] if len(files) >= 3 else files
+                    logger.debug(f"🔍 最近的QuoteTick文件: {recent_files}")
+                    
+                    # 检查文件名中的时间戳
+                    for file in recent_files:
+                        if file.endswith('.parquet'):
+                            logger.debug(f"🔍 文件: {file}")
+        except Exception as e:
+            logger.debug(f"检查现有文件失败: {e}")
+    
+    def add_trade_tick(self, trade_tick: TradeTick):
+        """添加TradeTick到专用缓冲区"""
+        if not self.catalog:
+            return
+            
+        try:
+            # 添加到TradeTick专用缓冲区
+            self.trade_buffer.append(trade_tick)
+            
+            # 检查TradeTick是否需要保存
+            self._check_trade_save()
+            
+        except Exception as e:
+            logger.error(f"❌ 添加TradeTick失败: {e}")
+    
+    def add_quote_tick(self, quote_tick: QuoteTick):
+        """添加QuoteTick到专用缓冲区"""
+        if not self.catalog:
+            return
+            
+        try:
+            # 添加到QuoteTick专用缓冲区
+            self.quote_buffer.append(quote_tick)
+            
+            # 检查QuoteTick是否需要保存
+            self._check_quote_save()
+            
+        except Exception as e:
+            logger.error(f"❌ 添加QuoteTick失败: {e}")
+    
+    def _check_quote_save(self):
+        """检查QuoteTick是否需要保存"""
+        current_time = time.time()
+        
+        # 按数量保存 - QuoteTick至少20条数据才保存
+        if len(self.quote_buffer) >= 20:
+            self._flush_quote_buffer()
+    
+    def _check_trade_save(self):
+        """检查TradeTick是否需要保存"""
+        current_time = time.time()
+        
+        # 按数量保存 - TradeTick至少20条数据才保存
+        if len(self.trade_buffer) >= 20:
+            self._flush_trade_buffer()
+    
+    def _flush_quote_buffer(self):
+        """独立保存QuoteTick缓冲区"""
+        if not self.quote_buffer or not self.catalog:
+            return
+            
+        try:
+            logger.debug(f"🔍 准备保存QuoteTick数据: {len(self.quote_buffer)} 条")
+            
+            # 显示时间戳范围
+            ts_events = [tick.ts_event for tick in self.quote_buffer]
+            ts_inits = [tick.ts_init for tick in self.quote_buffer]
+            logger.debug(f"   - QuoteTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
+            logger.debug(f"   - QuoteTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
+            
+            # 保存QuoteTick数据
+            self.catalog.write_data(self.quote_buffer)
+            saved_count = len(self.quote_buffer)
+            logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
+            logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
+            
+            # 清空QuoteTick缓冲区
+            self.quote_buffer.clear()
+            
+        except Exception as e:
+            logger.error(f"❌ QuoteTick保存失败: {e}")
+            logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
+            # 即使保存失败，也清空缓冲区避免重复保存
+            self.quote_buffer.clear()
+    
+    def _flush_trade_buffer(self):
+        """独立保存TradeTick缓冲区"""
+        if not self.trade_buffer or not self.catalog:
+            return
+            
+        try:
+            logger.debug(f"🔍 准备保存TradeTick数据: {len(self.trade_buffer)} 条")
+            
+            # 显示时间戳范围
+            ts_events = [tick.ts_event for tick in self.trade_buffer]
+            ts_inits = [tick.ts_init for tick in self.trade_buffer]
+            logger.debug(f"   - TradeTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
+            logger.debug(f"   - TradeTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
+            
+            # 保存TradeTick数据
+            self.catalog.write_data(self.trade_buffer)
+            saved_count = len(self.trade_buffer)
+            logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
+            logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
+            
+            # 清空TradeTick缓冲区
+            self.trade_buffer.clear()
+            
+        except Exception as e:
+            logger.error(f"❌ TradeTick保存失败: {e}")
+            logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
+            # 即使保存失败，也清空缓冲区避免重复保存
+            self.trade_buffer.clear()
+    
+    def force_save(self):
+        """强制保存所有缓冲数据"""
+        self._flush_quote_buffer()
+        self._flush_trade_buffer()
+    
+    def get_saved_data_count(self) -> int:
+        """获取已保存的数据条数"""
+        try:
+            if not self.catalog:
+                return 0
+                
+            # 查询QuoteTick数据
+            quote_data = self.catalog.quote_ticks(
+                instrument_ids=[self.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            # 查询TradeTick数据
+            trade_data = self.catalog.trade_ticks(
+                instrument_ids=[self.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            return len(quote_data) + len(trade_data)
+            
+        except Exception as e:
+            logger.error(f"❌ 获取保存数据统计失败: {e}")
+            return 0
+
+    def get_data_save_stats(self) -> dict:
+        """获取数据保存统计信息 - 分别统计QuoteTick和TradeTick"""
+        try:
+            if not self.catalog:
+                return {
+                    'quote_ticks': 0,
+                    'trade_ticks': 0,
+                    'total_saved': 0,
+                    'buffer_size': len(self.quote_buffer) + len(self.trade_buffer),
+                    'quote_buffer_size': len(self.quote_buffer),
+                    'trade_buffer_size': len(self.trade_buffer),
+                    'catalog_path': self.catalog_path,
+                    'last_save_time': self.last_save_time
+                }
+            
+            # 查询QuoteTick数据
+            quote_data = self.catalog.quote_ticks(
+                instrument_ids=[self.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            # 查询TradeTick数据
+            trade_data = self.catalog.trade_ticks(
+                instrument_ids=[self.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            quote_count = len(list(quote_data)) if quote_data else 0
+            trade_count = len(list(trade_data)) if trade_data else 0
+            
+            return {
+                'quote_ticks': quote_count,
+                'trade_ticks': trade_count,
+                'total_saved': quote_count + trade_count,
+                'buffer_size': len(self.quote_buffer) + len(self.trade_buffer),
+                'quote_buffer_size': len(self.quote_buffer),
+                'trade_buffer_size': len(self.trade_buffer),
+                'catalog_path': self.catalog_path,
+                'last_save_time': self.last_save_time
+            }
+            
+        except Exception as e:
+            logger.error(f"获取数据保存统计信息失败: {e}")
+            return {
+                'quote_ticks': 0,
+                'trade_ticks': 0,
+                'total_saved': 0,
+                'buffer_size': 0,
+                'quote_buffer_size': 0,
+                'trade_buffer_size': 0,
+                'catalog_path': self.catalog_path,
+                'last_save_time': None,
+                'error': str(e)
+            }
 
 
 class ETF159506ServerManager:
@@ -37,8 +301,14 @@ class ETF159506ServerManager:
         """获取分配的服务器地址"""
         url = f"{self.base_url}?market={market}&type={type}&token={self.token}"
         
+        # 配置代理
+        proxies = {
+            'http': 'http://127.0.0.1:10809',
+            'https': 'http://127.0.0.1:10809'
+        }
+        
         try:
-            response = requests.get(url, timeout=10, proxies=None)
+            response = requests.get(url, timeout=30, proxies=proxies)
             data = response.json()
             
             if data.get("code") == "0":
@@ -135,7 +405,12 @@ class ETF159506HttpClient:
             # 发送请求 - 使用requests作为备选方案
             try:
                 import requests
-                response = requests.get(url, params=params, timeout=10)
+                # 配置代理
+                proxies = {
+                    'http': 'http://127.0.0.1:10809',
+                    'https': 'http://127.0.0.1:10809'
+                }
+                response = requests.get(url, params=params, timeout=30, proxies=proxies)
                 if response.status_code == 200:
                     data = response.json()
                     
@@ -149,8 +424,11 @@ class ETF159506HttpClient:
                     return []
             except ImportError:
                 # 如果没有requests，使用aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params) as response:
+                # 配置代理
+                connector = aiohttp.TCPConnector()
+                proxy = 'http://127.0.0.1:10809'
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(url, params=params, proxy=proxy) as response:
                         if response.status == 200:
                             data = await response.json()
                             
@@ -223,8 +501,9 @@ class ETF159506HttpClient:
 class ETF159506DataProcessor:
     """159506 ETF数据处理器"""
     
-    def __init__(self, stock_code: str = "159506"):
+    def __init__(self, stock_code: str = "159506", data_saver=None):
         self.stock_code = stock_code
+        self.data_saver = data_saver
         self.logger = logging.getLogger("ETF159506DataProcessor")
         self.total_processed = 0
         self.start_time = datetime.now()
@@ -273,20 +552,22 @@ class ETF159506DataProcessor:
                 'turnover': turnover,
                 'volume': volume,
                 'bid_asks': bid_asks,
-                'collect_time': datetime.now().isoformat()
+                'collect_time': datetime.now().isoformat(),
+                'raw_websocket_data': data  # 添加原始WebSocket数据
             }
             
             self.total_processed += 1
             
             # 尝试保存数据到数据保存器
-            try:
-                from etf_159506_data_saver import get_global_data_saver
-                data_saver = get_global_data_saver()
-                if data_saver:
+            if self.data_saver:
+                try:
                     # 转换为NautilusTrader格式并保存
-                    self._save_to_data_saver(data_saver, quote_data)
-            except Exception as save_error:
-                self.logger.debug(f"保存数据到数据保存器失败: {save_error}")
+                    self.logger.debug(f"🔍 准备保存数据: {quote_data.get('timestamp')}, price={quote_data.get('price')}")
+                    self._save_to_data_saver(self.data_saver, quote_data)
+                except Exception as save_error:
+                    self.logger.error(f"❌ 保存数据到数据保存器失败: {save_error}")
+            else:
+                self.logger.error("❌ 数据保存器未初始化")
             
             return quote_data
             
@@ -295,23 +576,25 @@ class ETF159506DataProcessor:
             return None
     
     def _parse_bid_ask_data(self, fields: List[str]) -> Dict:
-        """解析买卖五档数据"""
+        """解析买卖五档数据94300,1.620,72600,1.619,148300,1.618,53100,1.617,50500,1.616,387600,1.621,35500,1.622,549100,1.623,303800,1.624,560700,1.625
+        数据格式：数量,价格,数量,价格...（前10个字段是买五档，后10个字段是卖五档）
+        """
         try:
             bid_asks = {'bids': [], 'asks': []}
             
-            # 买五档
+            # 买五档（前10个字段：数量,价格,数量,价格...）
             for i in range(0, 10, 2):
                 if i + 1 < len(fields):
-                    price = float(fields[i]) if fields[i] else 0
-                    volume = float(fields[i + 1]) if fields[i + 1] else 0
+                    volume = float(fields[i])     # 偶数索引：数量
+                    price = float(fields[i + 1])   # 奇数索引：价格
                     if price > 0 and volume > 0:
                         bid_asks['bids'].append({'price': price, 'volume': volume})
             
-            # 卖五档
+            # 卖五档（后10个字段：数量,价格,数量,价格...）
             for i in range(10, 20, 2):
                 if i + 1 < len(fields):
-                    price = float(fields[i]) if fields[i] else 0
-                    volume = float(fields[i + 1]) if fields[i + 1] else 0
+                    volume = float(fields[i])     # 偶数索引：数量
+                    price = float(fields[i + 1])  # 奇数索引：价格
                     if price > 0 and volume > 0:
                         bid_asks['asks'].append({'price': price, 'volume': volume})
             
@@ -322,11 +605,12 @@ class ETF159506DataProcessor:
             return {'bids': [], 'asks': []}
     
     def _save_to_data_saver(self, data_saver, quote_data: Dict):
-        """保存数据到数据保存器"""
+        """保存数据到数据保存器 - 同时保存QuoteTick和TradeTick"""
         try:
-            from nautilus_trader.model.data import QuoteTick
-            from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+            from nautilus_trader.model.data import QuoteTick, TradeTick
+            from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue, TradeId
             from nautilus_trader.model.objects import Price, Quantity
+            from nautilus_trader.model.enums import AggressorSide
             import time
             
             # 创建InstrumentId
@@ -335,24 +619,47 @@ class ETF159506DataProcessor:
             # 获取买卖价格和数量
             bid_asks = quote_data.get('bid_asks', {'bids': [], 'asks': []})
             
-            # 使用最优买卖价格，确保精度一致
-            if bid_asks['bids'] and bid_asks['asks']:
-                bid_price = Price.from_str(str(bid_asks['bids'][0]['price']))
-                ask_price = Price.from_str(str(bid_asks['asks'][0]['price']))
-                bid_size = Quantity.from_int(int(bid_asks['bids'][0]['volume']))
-                ask_size = Quantity.from_int(int(bid_asks['asks'][0]['volume']))
-            else:
-                # 如果没有买卖盘数据，使用最新价格
-                latest_price = quote_data.get('price', 0)
-                bid_price = Price.from_str(str(latest_price))
-                ask_price = Price.from_str(str(latest_price))
-                bid_size = Quantity.from_int(0)
-                ask_size = Quantity.from_int(0)
+            # 检查是否有有效的买卖数据
+            if not bid_asks['bids'] or not bid_asks['asks']:
+                self.logger.debug(f"⚠️ 买卖数据为空，跳过保存: bids={len(bid_asks['bids'])}, asks={len(bid_asks['asks'])}")
+                return
             
-            # 创建时间戳
-            current_time_ns = int(time.time() * 1e9)
+            # 确保价格精度一致（都使用3位小数）
+            bid_price_value = round(float(bid_asks['bids'][0]['price']), 3)
+            ask_price_value = round(float(bid_asks['asks'][0]['price']), 3)
             
-            # 创建QuoteTick
+            bid_price = Price.from_str(f"{bid_price_value:.3f}")
+            ask_price = Price.from_str(f"{ask_price_value:.3f}")
+            bid_size = Quantity.from_int(int(bid_asks['bids'][0]['volume']))
+            ask_size = Quantity.from_int(int(bid_asks['asks'][0]['volume']))
+        
+            
+            # 使用服务器返回的时间戳（jvquant格式: HH:MM:SS）
+            server_timestamp = quote_data.get('timestamp', '')
+            try:
+                if ':' in server_timestamp and len(server_timestamp.split(':')) == 3:
+                    # jvquant标准格式: HH:MM:SS
+                    time_parts = server_timestamp.split(':')
+                    hours, minutes, seconds = map(int, time_parts)
+                    
+                    # 使用当前日期 + 服务器时间
+                    today = datetime.now().date()
+                    server_datetime = datetime.combine(today, datetime.min.time().replace(
+                        hour=hours, minute=minutes, second=seconds
+                    ))
+                    current_time_ns = int(server_datetime.timestamp() * 1e9)
+                    
+                    self.logger.debug(f"✅ 使用服务器时间戳: {server_timestamp} -> {server_datetime}")
+                else:
+                    # 无法解析，使用本地时间
+                    current_time_ns = int(time.time() * 1e9)
+                    self.logger.debug(f"⚠️ 无法解析时间戳格式: {server_timestamp}, 使用本地时间")
+            except Exception as e:
+                # 解析失败，使用本地时间
+                self.logger.debug(f"❌ 解析服务器时间戳失败: {e}, 使用本地时间")
+                current_time_ns = int(time.time() * 1e9)
+            
+            # 1. 创建并保存QuoteTick
             quote_tick = QuoteTick(
                 instrument_id=instrument_id,
                 bid_price=bid_price,
@@ -362,24 +669,49 @@ class ETF159506DataProcessor:
                 ts_event=current_time_ns,
                 ts_init=current_time_ns
             )
-            
-            # 保存到数据保存器
             data_saver.add_quote_tick(quote_tick)
+            self.logger.debug(f"✅ 已添加QuoteTick到缓冲区: bid={bid_price}, ask={ask_price}")
+            
+            # 2. 创建并保存TradeTick（只有当成交量有变化时才保存）
+            latest_price = quote_data.get('price', 0)
+            volume = quote_data.get('volume', 0)
+            
+            # 只有当有成交量和价格变化时才创建TradeTick
+            if volume > 0 and latest_price > 0:
+                # 计算成交量变化（增量）
+                volume_change = volume - self.last_volume
+                
+                # 只有当成交量有增量变化时才创建TradeTick
+                if volume_change > 0:
+                    # 创建TradeTick
+                    trade_tick = TradeTick(
+                        instrument_id=instrument_id,
+                        price=Price.from_str(f"{latest_price:.3f}"),
+                        size=Quantity.from_int(int(volume_change)),
+                        aggressor_side=AggressorSide.NO_AGGRESSOR,  # Level1数据无法确定主动方
+                        trade_id=TradeId(f"{self.stock_code}_{current_time_ns}"),
+                        ts_event=current_time_ns,
+                        ts_init=current_time_ns
+                    )
+                    data_saver.add_trade_tick(trade_tick)
+                    
+                    # 更新最后成交量
+                    self.last_volume = volume
             
         except Exception as e:
-            self.logger.debug(f"转换并保存QuoteTick失败: {e}")
+            self.logger.debug(f"转换并保存数据失败: {e}")
 
 
 class ETF159506WebSocketClient:
     """159506 ETF WebSocket客户端 - 基于jvquant平台"""
     
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, data_saver=None):
         self.config = config
         self.logger = logging.getLogger("ETF159506WebSocketClient")
         self.token = config.get('token')
         self.stock_code = config.get('stock_code', '159506')
         self.server_manager = ETF159506ServerManager(self.token) if self.token else None
-        self.data_processor = ETF159506DataProcessor(self.stock_code)
+        self.data_processor = ETF159506DataProcessor(self.stock_code, data_saver)
         
         # WebSocket相关
         self.ws = None
@@ -606,19 +938,30 @@ class ETF159506InstrumentProvider(InstrumentProvider):
             self.logger.info(f"已加载{self.count}个工具")
             self.logger.info(f"工具ID: {etf_instrument.id}")
             self.logger.info(f"工具类型: {type(etf_instrument)}")
+            self.logger.info(f"工具价格精度: {etf_instrument.price_precision}")
+            self.logger.info(f"工具最小价格变动: {etf_instrument.price_increment}")
+            
+            # 验证工具是否正确添加
+            found_instrument = self.find(etf_instrument.id)
+            if found_instrument:
+                self.logger.info(f"✅ 工具验证成功: {found_instrument.id}")
+            else:
+                self.logger.error(f"❌ 工具验证失败: {etf_instrument.id}")
             
         except Exception as e:
             self.logger.error(f"加载工具失败: {e}")
+            import traceback
+            self.logger.error(f"错误详情: {traceback.format_exc()}")
     
     def find(self, instrument_id) -> Optional['Instrument']:
         """查找工具"""
         # 使用基类的find方法
         return super().find(instrument_id)
     
-    def get_all(self) -> List['Instrument']:
+    def get_all(self) -> dict[InstrumentId, Instrument]:
         """获取所有工具"""
-        # 使用基类的list_all方法
-        return self.list_all()
+        # 返回基类的_instruments字典
+        return super().get_all()
 
 
 class ETF159506Instrument:
@@ -641,42 +984,627 @@ class ETF159506Instrument:
         return self.__str__()
 
 
-class ETF159506DataClient:
-    """159506 ETF数据客户端"""
+class ETF159506Adapter:
+    """159506 ETF适配器主类"""
     
-    def __init__(self, config: Dict, instrument_provider: ETF159506InstrumentProvider):
+    def __init__(self, config: Dict):
         self.config = config
-        self.instrument_provider = instrument_provider
-        self.logger = logging.getLogger("ETF159506DataClient")
+        self.logger = logging.getLogger("ETF159506Adapter")
+        
+        # 初始化组件
         self.http_client = ETF159506HttpClient(config)
-        self.ws_client = ETF159506WebSocketClient(config)
+        
+        # 初始化数据保存器
+        catalog_path = config.get('catalog_path', './data_catalog')
+        self.data_saver = ETF159506DataSaver(catalog_path)
+        
+        # 创建WebSocket客户端，传入数据保存器
+        self.ws_client = ETF159506WebSocketClient(config, self.data_saver)
+        self.instrument_provider = ETF159506InstrumentProvider(self.http_client)
+        # 注意：数据客户端和执行客户端现在都由NautilusTrader管理，不再在这里初始化
+        
         self.is_connected = False
+        self.connection_attempts = 0
+        self.max_connection_attempts = 1
         
     async def connect(self) -> bool:
-        """连接数据客户端"""
+        """连接适配器"""
         try:
-            # 连接HTTP和WebSocket客户端
+            # 检查连接次数
+            if self.connection_attempts >= self.max_connection_attempts:
+                self.logger.error(f"连接尝试次数已达上限({self.max_connection_attempts})，请检查网络或等待一段时间后重试")
+                return False
+            
+            self.connection_attempts += 1
+            self.logger.info(f"第{self.connection_attempts}次尝试连接适配器...")
+            
+            # 连接基础组件（数据客户端和执行客户端现在都由NautilusTrader管理）
+            # 连接HTTP客户端和WebSocket客户端
             http_connected = await self.http_client.connect()
             ws_connected = await self.ws_client.connect()
             
             if http_connected and ws_connected:
+                # 加载工具信息
+                await self.instrument_provider.load_all_async()
+                
                 self.is_connected = True
-                self.logger.info("数据客户端连接成功")
+                self.connection_attempts = 0  # 重置连接计数
+                self.logger.info("159506 ETF适配器连接成功（基础组件）")
                 return True
             else:
-                self.logger.error("数据客户端连接失败")
+                self.logger.error("159506 ETF适配器连接失败")
                 return False
                 
         except Exception as e:
-            self.logger.error(f"数据客户端连接失败: {e}")
+            self.logger.error(f"159506 ETF适配器连接失败: {e}")
             return False
     
     async def disconnect(self) -> None:
-        """断开数据客户端"""
+        """断开适配器"""
         await self.http_client.disconnect()
         await self.ws_client.disconnect()
+        # 注意：数据客户端和执行客户端现在都由NautilusTrader管理，不需要在这里断开
         self.is_connected = False
-        self.logger.info("数据客户端已断开")
+        self.logger.info("159506 ETF适配器已断开（基础组件）")
+    
+    def get_instrument_provider(self) -> ETF159506InstrumentProvider:
+        """获取工具提供者"""
+        return self.instrument_provider
+    
+    # 注意：get_data_client和get_execution_client方法已移除，数据客户端和执行客户端现在都由NautilusTrader管理
+    
+    async def get_status(self) -> Dict:
+        """获取适配器状态"""
+        return {
+            'adapter_name': 'ETF159506Adapter',
+            'is_connected': self.is_connected,
+            'connection_attempts': self.connection_attempts,
+            'max_connection_attempts': self.max_connection_attempts,
+            'instruments_count': self.instrument_provider.count,
+            'http_client_connected': self.http_client.is_connected,
+            # 注意：数据客户端和执行客户端状态现在都由NautilusTrader管理
+        }
+    
+    async def reset_connection_attempts(self) -> None:
+        """重置连接尝试次数"""
+        self.connection_attempts = 0
+        self.logger.info("连接尝试次数已重置")
+    
+    async def check_connection_health(self) -> Dict:
+        """检查连接健康状态"""
+        health_status = {
+            'adapter_connected': self.is_connected,
+            'http_client_connected': self.http_client.is_connected,
+            'ws_client_connected': self.ws_client.is_connected,
+            'connection_attempts': self.connection_attempts,
+            'can_retry': self.connection_attempts < self.max_connection_attempts
+        }
+        
+        if not health_status['can_retry']:
+            health_status['suggestion'] = "连接尝试次数已达上限，建议等待一段时间后重试"
+        
+        return health_status
+
+
+# 使用示例
+async def main():
+    """适配器使用示例 - 基于jvquant平台"""
+    config = {
+        'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 使用collector中的实际token
+        'stock_code': '159506'
+    }
+    
+    adapter = ETF159506Adapter(config)
+    
+    # 连接适配器
+    if await adapter.connect():
+        print("✅ 适配器连接成功")
+        
+        # 获取工具信息
+        instruments = adapter.get_instrument_provider().get_all()
+        print(f"📋 可用工具: {instruments}")
+        
+        # 获取历史数据 - 现在通过HTTP客户端直接获取
+        print("\n📈 获取历史数据...")
+        historical_data = await adapter.http_client.get_historical_data(
+            symbol='159506',
+            start_date='2024-01-01',
+            end_date='2024-01-31',
+            kline_type='day',
+            fq='前复权',
+            limit=5
+        )
+        
+        if historical_data:
+            print(f"✅ 历史数据获取成功: {len(historical_data)}条记录")
+            latest_data = historical_data[0]
+            print(f"   最新数据: {latest_data.get('timestamp')} 收盘价: {latest_data.get('close')}")
+        else:
+            print("❌ 历史数据获取失败")
+        
+        # 订阅实时数据
+        print("\n📡 订阅实时数据...")
+        
+        # 数据统计
+        data_count = 0
+        last_price = None
+        start_time = datetime.now()
+        
+        def quote_callback(data):
+            nonlocal data_count, last_price
+            data_count += 1
+            current_price = data.get('price')
+            volume = data.get('volume')
+            timestamp = data.get('timestamp', 'N/A')
+            raw_data = data.get('raw_websocket_data', 'N/A')
+            
+            # 计算价格变化
+            price_change = ""
+            if last_price is not None and current_price is not None:
+                change = current_price - last_price
+                change_pct = (change / last_price) * 100 if last_price > 0 else 0
+                price_change = f" ({change:+.3f}, {change_pct:+.2f}%)"
+            
+            # 显示实时数据和原始WebSocket内容
+            print(f"📊 [{data_count:04d}] {timestamp} | 价格: {current_price}{price_change} | 成交量: {volume}")
+            print(f"🔗 WebSocket原始数据: {raw_data}")
+            
+            last_price = current_price
+            
+            # 每100条数据显示一次统计和数据保存状态
+            if data_count % 100 == 0:
+                runtime = datetime.now() - start_time
+                # 现在通过WebSocket客户端的数据处理器获取统计信息
+                save_stats = adapter.ws_client.data_processor.data_saver.get_data_save_stats()
+                print(f"📈 统计: 已接收{data_count}条数据, 运行时间: {runtime}")
+                print(f"💾 数据保存: QuoteTick {save_stats['quote_ticks']}条, TradeTick {save_stats['trade_ticks']}条")
+                print(f"📊 总计: {save_stats['total_saved']}条, 缓冲区{save_stats['buffer_size']}条")
+        
+        # 订阅实时数据 - 现在通过WebSocket客户端直接订阅
+        adapter.ws_client.subscribe_quotes('159506', quote_callback)
+        
+        
+        # 获取状态
+        status = await adapter.get_status()
+        print(f"\n📊 适配器状态: {status}")
+        
+        # 生产环境：持续运行
+        print("\n🚀 进入生产模式 - 持续获取实时数据...")
+        print("💡 按 Ctrl+C 停止程序")
+        
+        try:
+            # 持续运行，每30秒显示一次状态
+            while True:
+                await asyncio.sleep(30)
+                
+                # 显示状态信息
+                current_status = await adapter.get_status()
+                runtime = datetime.now() - start_time
+                save_stats = adapter.ws_client.data_processor.data_saver.get_data_save_stats()
+                
+                print(f"\n📊 状态更新 [{runtime}] - 已接收数据: {data_count}条")
+                print(f"   连接状态: {'✅ 正常' if current_status['is_connected'] else '❌ 断开'}")
+                print(f"   HTTP客户端: {'✅ 正常' if current_status['http_client_connected'] else '❌ 断开'}")
+                print(f"   数据保存: QuoteTick {save_stats['quote_ticks']}条, TradeTick {save_stats['trade_ticks']}条")
+                print(f"   总计: {save_stats['total_saved']}条, 缓冲区{save_stats['buffer_size']}条")
+                print(f"   保存路径: {save_stats['catalog_path']}")
+                
+                # 检查连接健康状态
+                health = await adapter.check_connection_health()
+                if not health['adapter_connected']:
+                    print("⚠️  检测到连接问题，尝试重连...")
+                    if await adapter.connect():
+                        print("✅ 重连成功")
+                    else:
+                        print("❌ 重连失败")
+                
+        except KeyboardInterrupt:
+            print("\n\n🛑 收到停止信号，正在关闭...")
+        except Exception as e:
+            print(f"\n❌ 运行时错误: {e}")
+        finally:
+            # 强制保存所有缓冲数据 - 现在通过WebSocket客户端的数据处理器
+            print("\n💾 正在保存所有缓冲数据...")
+            adapter.ws_client.data_processor.data_saver.force_save()
+            
+            # 断开连接
+            await adapter.disconnect()
+            print("✅ 适配器已断开连接")
+            
+            # 最终统计
+            final_save_stats = adapter.ws_client.data_processor.data_saver.get_data_save_stats()
+            print(f"📊 最终统计:")
+            print(f"   总共接收: {data_count} 条数据")
+            print(f"   已保存到磁盘: {final_save_stats['total_saved']} 条数据")
+            print(f"   保存路径: {final_save_stats['catalog_path']}")
+            print(f"   数据格式: Parquet (支持NautilusTrader)")
+    else:
+        print("❌ 适配器连接失败")
+
+
+# =============================================================================
+# NautilusTrader适配器集成
+# =============================================================================
+
+from nautilus_trader.live.data_client import LiveMarketDataClient
+from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
+from nautilus_trader.model.identifiers import InstrumentId, Venue, ClientId
+from nautilus_trader.model.instruments import Instrument
+from nautilus_trader.model.enums import BarAggregation, PriceType
+from nautilus_trader.core.data import Data
+from nautilus_trader.core.message import Event
+from nautilus_trader.common.component import MessageBus, LiveClock
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.data.messages import SubscribeBars
+
+# 全局变量存储适配器实例
+_global_adapter_instance = None
+
+def set_global_adapter(adapter):
+    """设置全局适配器实例"""
+    global _global_adapter_instance
+    _global_adapter_instance = adapter
+
+def get_global_adapter():
+    """获取全局适配器实例"""
+    return _global_adapter_instance
+
+
+class ETF159506NautilusDataClient(LiveMarketDataClient):
+    """159506 ETF NautilusTrader数据客户端包装器"""
+    
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        client_id,
+        venue,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+        instrument_provider: InstrumentProvider,
+        config=None,
+    ):
+        super().__init__(
+            loop=loop,
+            client_id=client_id,
+            venue=venue,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=instrument_provider,
+            config=config,
+        )
+        
+        # 强制使用全局适配器实例
+        global_adapter = get_global_adapter()
+        logger.info(f"全局适配器状态: {global_adapter is not None}")
+        if global_adapter is not None:
+            self.adapter = global_adapter
+            logger.info(f"使用全局ETF159506适配器实例，连接状态: {self.adapter.is_connected}")
+        else:
+            logger.error("全局适配器未设置！这不应该发生。")
+            raise RuntimeError("全局适配器未设置，请确保在创建TradingNode之前设置全局适配器")
+        
+        # 初始化instrument_id - 参考etf_159506_cache_collector.py
+        from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+        self.instrument_id = InstrumentId(
+            symbol=Symbol("159506"),
+            venue=Venue("SZSE")
+        )
+        
+        # 配置catalog路径用于读取历史数据
+        # 默认使用项目根目录下的data_catalog文件夹
+        import os
+        # 当前文件在quant目录下，所以只需要一层dirname
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        self._catalog_path = os.path.join(project_root, "data_catalog")
+        
+        logger.info(f"配置catalog路径: {self._catalog_path}")
+        
+        # 初始化jvquant API相关组件（从ETF159506DataClient集成）
+        self.config = global_adapter.config
+        self.logger = logging.getLogger("ETF159506NautilusDataClient")
+        self.http_client = ETF159506HttpClient(self.config)
+        
+        # 初始化数据保存器
+        catalog_path = self.config.get('catalog_path', './data_catalog')
+        self.data_saver = ETF159506DataSaver(catalog_path)
+        
+        # 创建WebSocket客户端，传入数据保存器
+        self.ws_client = ETF159506WebSocketClient(self.config, self.data_saver)
+        
+        self._set_connected(False)
+        
+    async def _connect(self) -> None:
+        """连接到数据源 - 使用集成的jvquant连接方法"""
+        try:
+            logger.info("连接ETF159506合并数据客户端...")
+            
+            # 连接HTTP和WebSocket客户端（从ETF159506DataClient集成）
+            http_connected = await self.http_client.connect()
+            ws_connected = await self.ws_client.connect()
+            
+            if http_connected and ws_connected:
+                self._set_connected(True)
+                logger.info("ETF159506合并数据客户端连接成功")
+            else:
+                logger.error("ETF159506合并数据客户端连接失败")
+            
+        except Exception as e:
+            logger.error(f"连接ETF159506合并数据客户端失败: {e}")
+            raise
+    
+    async def _disconnect(self) -> None:
+        """断开数据源连接 - 使用集成的jvquant断开方法"""
+        try:
+            logger.info("断开ETF159506合并数据客户端...")
+            
+            # 断开HTTP和WebSocket客户端（从ETF159506DataClient集成）
+            await self.http_client.disconnect()
+            await self.ws_client.disconnect()
+            
+            self._set_connected(False)
+            logger.info("ETF159506合并数据客户端已断开")
+            
+        except Exception as e:
+            logger.error(f"断开ETF159506合并数据客户端失败: {e}")
+    
+    async def _subscribe_bars(self, command: SubscribeBars) -> None:
+        """订阅K线数据"""
+        try:
+            logger.info(f"订阅K线数据: {command.bar_type}")
+            
+            # 设置数据回调
+            def bar_callback(data: Dict[str, Any]):
+                try:
+                    # 将适配器数据转换为NautilusTrader Bar对象
+                    bar = self._convert_to_bar(data, command.bar_type)
+                    if bar:
+                        # 发送到消息总线
+                        self._handle_bar(bar)
+                except Exception as e:
+                    logger.error(f"处理K线数据失败: {e}")
+            
+            # 订阅实时数据 - 使用我们初始化的instrument_id
+            instrument_id = self.instrument_id
+            symbol = instrument_id.symbol.value
+            
+            # 使用WebSocket客户端订阅数据
+            self.ws_client.subscribe_quotes(symbol, bar_callback)
+            
+            logger.info(f"K线数据订阅成功: {command.bar_type}")
+            
+        except Exception as e:
+            logger.error(f"订阅K线数据失败: {e}")
+            raise
+    
+    async def _subscribe_quotes(self, instrument_id: InstrumentId) -> None:
+        """订阅报价数据"""
+        try:
+            logger.info(f"订阅报价数据: {instrument_id}")
+            
+            def quote_callback(data: Dict[str, Any]):
+                try:
+                    # 将适配器数据转换为NautilusTrader QuoteTick对象
+                    quote = self._convert_to_quote_tick(data, instrument_id)
+                    if quote:
+                        # 发送到消息总线
+                        self._handle_quote_tick(quote)
+                except Exception as e:
+                    logger.error(f"处理报价数据失败: {e}")
+            
+            # 订阅实时数据
+            symbol = instrument_id.symbol.value
+            self.ws_client.subscribe_quotes(symbol, quote_callback)
+            
+            logger.info(f"报价数据订阅成功: {instrument_id}")
+            
+        except Exception as e:
+            logger.error(f"订阅报价数据失败: {e}")
+            raise
+    
+    def _convert_to_bar(self, data: Dict[str, Any], bar_type: BarType) -> Optional[Bar]:
+        """将适配器数据转换为NautilusTrader Bar对象"""
+        try:
+            # 这里需要根据实际的数据格式进行转换
+            # Level1数据包含: price, volume, timestamp等字段
+            
+            from nautilus_trader.model.objects import Price, Quantity
+            from decimal import Decimal
+            
+            # 获取价格和成交量
+            price = data.get('price', 0)
+            volume = data.get('volume', 0)
+            
+            # 调试：打印原始数据
+            logger.info(f"原始数据: {data}")
+            logger.info(f"数据类型 - price: {type(price)}, volume: {type(volume)}")
+            logger.info(f"数据值 - price: {price}, volume: {volume}")
+            
+            # 确保价格和成交量是数字类型
+            if isinstance(price, str):
+                price = float(price)
+            if isinstance(volume, str):
+                volume = float(volume)
+            
+            # 确保volume是整数，参考etf_159506_catalog_loader.py的处理方式
+            volume_int = int(volume) if volume > 0 else 0            
+            # 调试：打印转换后的值
+            logger.info(f"转换后 - volume_int: {volume_int}, type: {type(volume_int)}")
+            
+            # 使用NautilusTrader官方方法获取instrument
+            instrument = self._instrument_provider.find(bar_type.instrument_id)
+            logger.info(f"从instrument_provider获取instrument: {instrument}")
+            
+            # 如果从instrument_provider找不到，尝试从缓存获取
+            if not instrument:
+                logger.warning(f"从instrument_provider未找到instrument: {bar_type.instrument_id}")
+                instrument = self.cache.instrument(bar_type.instrument_id)
+                logger.info(f"从cache获取instrument: {instrument}")
+            
+            # 如果仍然找不到，抛出错误
+            if not instrument:
+                raise RuntimeError(f"无法找到instrument: {bar_type.instrument_id}")
+            
+            
+            # 使用推荐的方法创建Price和Quantity - 通过instrument.make_price()和make_qty()
+            price_obj = instrument.make_price(price)
+            volume_quantity = instrument.make_qty(volume_int)
+            logger.info(f"使用instrument创建 - price: {price_obj}, volume: {volume_quantity}")
+           
+            
+            # 使用NautilusTrader官方方法获取时间戳
+            from nautilus_trader.core.datetime import dt_to_unix_nanos
+            import pandas as pd
+            
+            current_time = pd.Timestamp.now(tz='UTC')
+            ts_event = dt_to_unix_nanos(current_time)
+            ts_init = ts_event  # 使用相同的时间戳
+            
+            bar = Bar(
+                bar_type=bar_type,
+                open=price_obj,
+                high=price_obj,
+                low=price_obj,
+                close=price_obj,
+                volume=volume_quantity,
+                ts_event=ts_event,
+                ts_init=ts_init,
+            )
+            
+            return bar
+            
+        except Exception as e:
+            logger.error(f"转换Bar数据失败: {e}")
+            return None
+    
+    def _convert_to_quote_tick(self, data: Dict[str, Any], instrument_id: InstrumentId) -> Optional[QuoteTick]:
+        """将适配器数据转换为NautilusTrader QuoteTick对象"""
+        try:
+            # 这里需要根据实际的数据格式进行转换
+            # 假设data包含: bid_price, ask_price, bid_size, ask_size, timestamp
+            
+            from nautilus_trader.model.objects import Price, Quantity
+            
+            quote = QuoteTick(
+                instrument_id=instrument_id,
+                bid_price=Price.from_str(str(data.get('bid_price', 0))),
+                ask_price=Price.from_str(str(data.get('ask_price', 0))),
+                bid_size=Quantity.from_str(str(data.get('bid_size', 0))),
+                ask_size=Quantity.from_str(str(data.get('ask_size', 0))),
+                ts_event=datetime.now(),
+                ts_init=datetime.now(),
+            )
+            
+            return quote
+            
+        except Exception as e:
+            logger.error(f"转换QuoteTick数据失败: {e}")
+            return None
+    
+    def _handle_bar(self, bar: Bar) -> None:
+        """处理Bar数据"""
+        try:
+            # 使用NautilusTrader官方方法发送数据
+            self._handle_data(bar)
+        except Exception as e:
+            logger.error(f"处理Bar数据失败: {e}")
+    
+    def _handle_quote_tick(self, quote: QuoteTick) -> None:
+        """处理QuoteTick数据"""
+        try:
+            # 使用NautilusTrader官方方法发送数据
+            self._handle_data(quote)
+        except Exception as e:
+            logger.error(f"处理QuoteTick数据失败: {e}")
+    
+    async def _request_bars(self, request) -> None:
+        """请求历史K线数据"""
+        try:
+            logger.info(f"请求历史K线数据: {request.bar_type}")
+            
+            # 打印request所有属性
+            logger.info(f"Request对象类型: {type(request)}")
+            
+            # 使用dir()获取所有属性，然后过滤掉私有属性
+            all_attrs = [attr for attr in dir(request) if not attr.startswith('_')]
+            logger.info(f"Request所有公共属性: {all_attrs}")
+            
+            
+            
+            # 获取请求参数
+            bar_type = request.bar_type
+            start = request.start
+            end = request.end
+            limit = request.limit if hasattr(request, 'limit') else 0
+            
+            logger.info(f"请求参数 - bar_type: {bar_type}, start: {start}, end: {end}, limit: {limit}")
+            
+            # 检查价格类型
+            if bar_type.spec.price_type != PriceType.LAST:
+                logger.error(
+                    f"Cannot request {bar_type} bars: "
+                    f"only historical bars for LAST price type available from ETF159506 adapter",
+                )
+                return
+            
+            # 尝试从本地parquet文件读取历史数据
+            bars = await self._load_bars_from_catalog(bar_type, start, end, limit)
+            
+            if bars:
+                logger.info(f"从本地catalog加载了 {len(bars)} 条历史K线数据")
+            else:
+                logger.info(f"未找到历史K线数据，返回空数据")
+            
+            # 使用NautilusTrader官方方法处理数据
+            self._handle_bars(
+                bar_type=bar_type,
+                bars=bars,  # 历史数据或空列表
+                partial=None,  # 没有部分数据
+                correlation_id=request.id,
+                start=start,
+                end=end,
+                params=request.params if hasattr(request, 'params') else None,
+            )
+            
+            logger.info(f"✅ _handle_bars调用完成，发送了 {len(bars)} 条历史数据")
+                
+        except Exception as e:
+            logger.error(f"请求历史K线数据失败: {e}")
+            raise
+    
+    async def _load_bars_from_catalog(self, bar_type, start, end, limit):
+        """从本地parquet catalog加载历史K线数据 - 支持动态聚合"""
+        try:
+            # 检查是否有catalog路径配置
+            catalog_path = getattr(self, '_catalog_path', None)
+            if not catalog_path:
+                logger.debug("未配置catalog路径，跳过本地数据加载")
+                return []
+            
+            # 导入ParquetDataCatalog
+            from nautilus_trader.persistence.catalog import ParquetDataCatalog
+            
+            # 创建catalog实例
+            catalog = ParquetDataCatalog(catalog_path)
+            
+            # 2. 如果没找到bar数据，尝试从trade_tick聚合生成
+            bars_list = await self._generate_bars_from_ticks(catalog, bar_type, start, end, limit)
+            
+            if bars_list:
+                logger.info(f"🔄 从trade_tick聚合生成了 {len(bars_list)} 条K线数据")
+                return bars_list
+            else:
+                logger.info(f"⚠️ 未找到历史K线数据，返回空数据")
+                return []
+            
+        except Exception as e:
+            logger.warning(f"从catalog加载历史数据失败: {e}")
+            return []
+    
+    # ========== 从ETF159506DataClient集成的方法 ==========
     
     async def request_instrument(self, request) -> None:
         """请求工具信息"""
@@ -692,28 +1620,294 @@ class ETF159506DataClient:
             self.logger.error(f"请求工具信息失败: {e}")
     
     def subscribe_quotes(self, symbol: str, callback) -> None:
-        """订阅报价数据"""
-        self.ws_client.subscribe_quotes(symbol, callback)
+        """订阅报价数据 - 同时保存QuoteTick和TradeTick"""
+        def enhanced_callback(data):
+            if callback:
+                callback(data)
+        
+        self.ws_client.subscribe_quotes(symbol, enhanced_callback)
     
     def subscribe_trades(self, symbol: str, callback) -> None:
         """订阅成交数据"""
-        self.ws_client.subscribe_trades(symbol, callback)
+        def enhanced_callback(data):
+            if callback:
+                callback(data)
+        
+        self.ws_client.subscribe_trades(symbol, enhanced_callback)
     
     async def get_historical_data(self, symbol: str, start_date: str, end_date: str, 
                                  kline_type: str = "day", fq: str = "前复权", limit: int = 240) -> List[Dict]:
         """获取历史数据"""
         return await self.http_client.get_historical_data(symbol, start_date, end_date, kline_type, fq, limit)
-
-
-class ETF159506ExecutionClient:
-    """159506 ETF执行客户端 - 基于jvquant平台"""
     
-    def __init__(self, config: Dict):
-        self.config = config
-        self.logger = logging.getLogger("ETF159506ExecutionClient")
-        self.token = config.get('token')
-        self.http_client = ETF159506HttpClient(config)
-        self.is_connected = False
+    async def _generate_bars_from_ticks(self, catalog, bar_type, start, end, limit=0):
+        """从tick数据生成K线数据 - 手动聚合trade tick为分钟bar"""
+        try:
+            from nautilus_trader.model.data import TradeTick, Bar
+            from nautilus_trader.model.objects import Price, Quantity
+            import pandas as pd
+            from datetime import datetime
+            
+            logger.info(f"🔄 开始从tick数据生成K线: {bar_type}")
+            
+            # 获取instrument_id
+            instrument_id = bar_type.instrument_id
+            
+            # 查询trade_tick数据
+            try:
+                logger.info(f"🔍 查询参数: instrument_id={instrument_id} (类型: {type(instrument_id)})")
+                logger.info(f"🔍 时间范围: start={start}, end={end}")
+                logger.info(f"🔍 catalog路径: {catalog.path}")
+                
+                # 检查catalog中是否有trade_tick数据
+                try:
+                    # 先查询所有trade_tick文件，不限制时间
+                    all_files_query = catalog.query(
+                        data_cls=TradeTick,
+                        identifiers=[str(instrument_id)],
+                    )
+                    all_files = list(all_files_query) if all_files_query else []
+                    logger.info(f"🔍 catalog中总共有 {len(all_files)} 条trade_tick记录")
+                    
+                    if all_files:
+                        # 显示第一条记录的时间
+                        first_tick = all_files[0]
+                        logger.info(f"🔍 第一条trade_tick时间: {first_tick.ts_event}")
+                except Exception as e:
+                    logger.warning(f"⚠️ 查询所有trade_tick失败: {e}")
+                
+                # 使用catalog.query()查询trade_tick数据
+                trade_ticks = catalog.query(
+                    data_cls=TradeTick,
+                    identifiers=[str(instrument_id)],  # 添加identifiers参数
+                    start=start,
+                    end=end,
+                )
+                
+                ticks_list = list(trade_ticks) if trade_ticks else []
+                logger.info(f"📊 查询到 {len(ticks_list)} 条trade_tick数据")
+                
+                
+                    
+            except Exception as e:
+                logger.error(f"❌ 查询trade_tick数据失败: {e}")
+                import traceback
+                logger.error(f"详细错误: {traceback.format_exc()}")
+                return []
+            
+            # 手动从trade tick合成分钟bar数据
+            logger.info(f"🔄 开始手动合成分钟K线数据，共 {len(ticks_list)} 条tick")
+            
+            # 将tick数据转换为DataFrame进行聚合
+            tick_data = []
+            for tick in ticks_list:
+                tick_data.append({
+                    'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+                    'price': float(tick.price),
+                    'volume': int(tick.size),
+                    'ts_event': tick.ts_event
+                })
+            
+            df = pd.DataFrame(tick_data)
+            df.set_index('timestamp', inplace=True)
+            
+            # 按1分钟时间窗口聚合数据
+            resampled = df.resample('1T').agg({
+                'price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'
+            }).dropna()
+            
+            # 重命名列
+            resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+            
+            # 创建Bar对象列表
+            bars = []
+            for timestamp, row in resampled.iterrows():
+                try:
+                    # 创建Bar对象
+                    bar = Bar(
+                        bar_type=bar_type,
+                        open=Price.from_str(f"{row['open']:.3f}"),
+                        high=Price.from_str(f"{row['high']:.3f}"),
+                        low=Price.from_str(f"{row['low']:.3f}"),
+                        close=Price.from_str(f"{row['close']:.3f}"),
+                        volume=Quantity.from_int(int(row['volume'])),
+                        ts_event=int(timestamp.timestamp() * 1_000_000_000),  # 纳秒
+                        ts_init=int(timestamp.timestamp() * 1_000_000_000),
+                    )
+                    bars.append(bar)
+                    
+                except Exception as e:
+                    logger.warning(f"转换K线数据失败: {e}, 数据: {row}")
+                    continue
+            
+            logger.info(f"✅ 成功从tick数据生成 {len(bars)} 条分钟Bar对象")
+            return bars
+            
+        except Exception as e:
+            logger.error(f"❌ 从tick数据生成K线失败: {e}")
+            import traceback
+            logger.error(f"错误详情: {traceback.format_exc()}")
+            return []
+    
+    def get_data_save_stats(self) -> dict:
+        """获取数据保存统计信息 - 分别统计QuoteTick和TradeTick"""
+        try:
+            if not self.data_saver.catalog:
+                return {
+                    'quote_ticks': 0,
+                    'trade_ticks': 0,
+                    'total_saved': 0,
+                    'buffer_size': len(self.data_saver.quote_buffer) + len(self.data_saver.trade_buffer),
+                    'quote_buffer_size': len(self.data_saver.quote_buffer),
+                    'trade_buffer_size': len(self.data_saver.trade_buffer),
+                    'catalog_path': self.data_saver.catalog_path,
+                    'last_save_time': self.data_saver.last_save_time
+                }
+            
+            # 查询QuoteTick数据
+            quote_data = self.data_saver.catalog.quote_ticks(
+                instrument_ids=[self.data_saver.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            # 查询TradeTick数据
+            trade_data = self.data_saver.catalog.trade_ticks(
+                instrument_ids=[self.data_saver.instrument_id],
+                start=None,
+                end=None
+            )
+            
+            quote_count = len(list(quote_data)) if quote_data else 0
+            trade_count = len(list(trade_data)) if trade_data else 0
+            
+            return {
+                'quote_ticks': quote_count,
+                'trade_ticks': trade_count,
+                'total_saved': quote_count + trade_count,
+                'buffer_size': len(self.data_saver.quote_buffer) + len(self.data_saver.trade_buffer),
+                'quote_buffer_size': len(self.data_saver.quote_buffer),
+                'trade_buffer_size': len(self.data_saver.trade_buffer),
+                'catalog_path': self.data_saver.catalog_path,
+                'last_save_time': self.data_saver.last_save_time
+            }
+            
+        except Exception as e:
+            self.logger.error(f"获取数据保存统计信息失败: {e}")
+            return {
+                'quote_ticks': 0,
+                'trade_ticks': 0,
+                'total_saved': 0,
+                'buffer_size': 0,
+                'quote_buffer_size': 0,
+                'trade_buffer_size': 0,
+                'catalog_path': self.data_saver.catalog_path,
+                'last_save_time': None,
+                'error': str(e)
+            }
+    
+    def force_save_data(self):
+        """强制保存所有缓冲数据"""
+        self.data_saver.force_save()
+
+
+
+
+class ETF159506LiveDataClientFactory(LiveDataClientFactory):
+    """159506 ETF数据客户端工厂"""
+    
+    @staticmethod
+    def create(
+        loop: asyncio.AbstractEventLoop,
+        name: str,
+        config,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+    ) -> ETF159506NautilusDataClient:
+        """
+        创建159506 ETF数据客户端
+        
+        Parameters
+        ----------
+        loop : asyncio.AbstractEventLoop
+            事件循环
+        name : str
+            客户端名称
+        config
+            客户端配置
+        msgbus : MessageBus
+            消息总线
+        cache : Cache
+            缓存
+        clock : LiveClock
+            时钟
+            
+        Returns
+        -------
+        ETF159506NautilusDataClient
+        """
+        # 使用全局适配器的instrument_provider
+        global_adapter = get_global_adapter()
+        instrument_provider = global_adapter.instrument_provider
+        logger.info(f"使用全局适配器的instrument_provider，已加载{instrument_provider.count}个工具")
+        
+        
+        return ETF159506NautilusDataClient(
+            loop=loop,
+            client_id=ClientId(name),
+            venue=config.venue if hasattr(config, 'venue') else None,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            instrument_provider=instrument_provider,
+            config=config,
+        )
+
+
+class ETF159506NautilusExecClient(LiveExecutionClient):
+    """159506 ETF 合并的执行客户端 - 集成jvquant API和NautilusTrader接口"""
+    
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        client_id,
+        venue,
+        msgbus: MessageBus,
+        cache: Cache,
+        clock: LiveClock,
+        instrument_provider: InstrumentProvider,
+        config=None,
+    ):
+        super().__init__(
+            loop=loop,
+            client_id=client_id,
+            venue=venue,
+            oms_type=OmsType.NETTING,  # 使用净额结算模式
+            account_type=AccountType.CASH,  # 使用现金账户类型
+            base_currency=None,  # 多币种账户，不指定基础货币
+            instrument_provider=instrument_provider,
+            msgbus=msgbus,
+            cache=cache,
+            clock=clock,
+            config=config,
+        )
+        
+        # 获取全局适配器配置
+        global_adapter = get_global_adapter()
+        if global_adapter is not None:
+            jvquant_config = global_adapter.config
+            logger.info(f"使用全局适配器配置初始化jvquant执行客户端")
+        else:
+            logger.error("全局适配器未设置！这不应该发生。")
+            raise RuntimeError("全局适配器未设置，请确保在创建TradingNode之前设置全局适配器")
+        
+        # 初始化jvquant API相关属性
+        self.config = jvquant_config
+        self.logger = logging.getLogger("ETF159506NautilusExecClient")
+        self.token = jvquant_config.get('token')
+        self.http_client = ETF159506HttpClient(jvquant_config)
         self.orders = {}
         
         # 交易相关
@@ -722,36 +1916,12 @@ class ETF159506ExecutionClient:
         self.ticket_expire = None
         self.is_logged_in = False
         
-    async def connect(self) -> bool:
-        """连接执行客户端"""
-        try:
-            if not self.token:
-                self.logger.error("缺少token配置")
-                return False
-                
-            # 获取交易服务器地址
-            if not await self._get_trade_server():
-                self.logger.error("无法获取交易服务器地址")
-                return False
-                
-            connected = await self.http_client.connect()
-            if connected:
-                self.is_connected = True
-                self.logger.info("执行客户端连接成功")
-                return True
-            else:
-                self.logger.error("执行客户端连接失败")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"执行客户端连接失败: {e}")
-            return False
+        self._set_connected(False)
+        
+        # 订单ID映射：NautilusTrader client_order_id -> jvquant order_id
+        self._order_id_mapping = {}
     
-    async def disconnect(self) -> None:
-        """断开执行客户端"""
-        await self.http_client.disconnect()
-        self.is_connected = False
-        self.logger.info("执行客户端已断开")
+    # ========== jvquant API 方法 ==========
     
     async def _get_trade_server(self) -> bool:
         """获取交易服务器地址"""
@@ -818,32 +1988,6 @@ class ETF159506ExecutionClient:
             return False
         
         return True
-    
-    async def submit_order(self, order: Dict) -> str:
-        """提交订单 - 基于jvquant交易接口"""
-        try:
-            if not self._check_login_status():
-                self.logger.error("未登录或登录已过期")
-                return None
-            
-            order_type = order.get('type', 'market')
-            side = order.get('side', 'buy')
-            code = order.get('code', '159506')
-            name = order.get('name', '华夏中证500ETF')
-            price = order.get('price', 0.0)
-            volume = order.get('quantity', 0)
-            
-            if side == 'buy':
-                return await self._buy_stock(code, name, price, volume)
-            elif side == 'sell':
-                return await self._sell_stock(code, name, price, volume)
-            else:
-                self.logger.error(f"不支持的订单方向: {side}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"订单提交失败: {e}")
-            return None
     
     async def _buy_stock(self, code: str, name: str, price: float, volume: int) -> Optional[str]:
         """买入股票"""
@@ -929,11 +2073,11 @@ class ETF159506ExecutionClient:
             self.logger.error(f"卖出委托异常: {e}")
             return None
     
-    async def cancel_order(self, order_id: str) -> bool:
-        """取消订单 - 基于jvquant交易接口"""
+    async def _cancel_jvquant_order(self, order_id: str) -> bool:
+        """取消jvquant订单"""
         try:
             if not self._check_login_status():
-                self.logger.error("未登录或登录已过期")
+                logger.error("未登录或登录已过期")
                 return False
             
             url = f"http://{self.trade_server}/cancel"
@@ -943,12 +2087,12 @@ class ETF159506ExecutionClient:
                 'order_id': order_id
             }
             
-            self.logger.info(f"正在撤销委托: {order_id}")
+            logger.info(f"正在撤销委托: {order_id}")
             response = requests.get(url, params=params, timeout=10)
             data = response.json()
             
             if data.get("code") == "0":
-                self.logger.info(f"撤单成功! {data.get('message', '')}")
+                logger.info(f"撤单成功! {data.get('message', '')}")
                 
                 # 更新订单状态
                 if order_id in self.orders:
@@ -956,552 +2100,298 @@ class ETF159506ExecutionClient:
                 
                 return True
             else:
-                self.logger.error(f"撤单失败: {data}")
+                logger.error(f"撤单失败: {data}")
                 return False
                 
         except Exception as e:
-            self.logger.error(f"撤单异常: {e}")
+            logger.error(f"撤单异常: {e}")
             return False
     
-    async def get_order_status(self, order_id: str) -> Optional[Dict]:
-        """获取订单状态"""
-        # 先检查本地订单
-        if order_id in self.orders:
-            return self.orders[order_id]
-        
-        # 如果本地没有，尝试从服务器查询
+    # ========== NautilusTrader 接口方法 ==========
+    
+    def _convert_nautilus_order_to_jvquant(self, order) -> Optional[Dict]:
+        """将NautilusTrader订单转换为jvquant格式"""
         try:
-            if not self._check_login_status():
+            # 获取订单基本信息
+            instrument_id = str(order.instrument_id)
+            side = str(order.side).lower()
+            quantity = int(order.quantity)
+            
+            # 解析股票代码（从159506.SZSE中提取159506）
+            if '.' in instrument_id:
+                code = instrument_id.split('.')[0]
+            else:
+                code = instrument_id
+            
+            # 确定订单类型
+            order_type = 'market'  # 默认市价单
+            price = 0.0  # 市价单价格为0
+            
+            if hasattr(order, 'price') and order.price is not None:
+                order_type = 'limit'  # 限价单
+                price = float(order.price)
+            
+            # 确定订单方向
+            if side == 'buy':
+                side = 'buy'
+            elif side == 'sell':
+                side = 'sell'
+            else:
+                logger.error(f"不支持的订单方向: {side}")
                 return None
             
-            url = f"http://{self.trade_server}/check_order"
-            params = {
-                'token': self.token,
-                'ticket': self.ticket
+            # 构建jvquant订单格式
+            jvquant_order = {
+                'type': order_type,
+                'side': side,
+                'code': code,
+                'name': '华夏中证500ETF',  # 固定名称
+                'price': price,
+                'quantity': quantity
             }
             
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
+            logger.info(f"订单转换: {order} -> {jvquant_order}")
+            return jvquant_order
             
-            if data.get("code") == "0":
-                orders = data.get("list", [])
-                for order in orders:
-                    if order.get("order_id") == order_id:
-                        return order
-            
+        except Exception as e:
+            logger.error(f"订单转换失败: {e}")
             return None
-            
-        except Exception as e:
-            self.logger.error(f"查询订单状态异常: {e}")
-            return None
-    
-    async def get_positions(self) -> List[Dict]:
-        """获取持仓信息 - 基于jvquant交易接口"""
-        try:
-            if not self._check_login_status():
-                self.logger.error("未登录或登录已过期")
-                return []
-            
-            url = f"http://{self.trade_server}/check_position"
-            params = {
-                'token': self.token,
-                'ticket': self.ticket
-            }
-            
-            self.logger.info("正在查询持仓...")
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            
-            if data.get("code") == "0":
-                positions = data.get("list", [])
-                self.logger.info(f"查询成功! 共{len(positions)}个持仓")
-                return positions
-            else:
-                self.logger.error(f"查询持仓失败: {data}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"查询持仓异常: {e}")
-            return []
-    
-    async def get_orders(self) -> List[Dict]:
-        """获取交易记录"""
-        try:
-            if not self._check_login_status():
-                self.logger.error("未登录或登录已过期")
-                return []
-            
-            url = f"http://{self.trade_server}/check_order"
-            params = {
-                'token': self.token,
-                'ticket': self.ticket
-            }
-            
-            self.logger.info("正在查询交易记录...")
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            
-            if data.get("code") == "0":
-                orders = data.get("list", [])
-                self.logger.info(f"查询成功! 共{len(orders)}条交易记录")
-                return orders
-            else:
-                self.logger.error(f"查询交易记录失败: {data}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"查询交易记录异常: {e}")
-            return []
-    
-    async def logout(self):
-        """登出"""
-        self.is_logged_in = False
-        self.ticket = None
-        self.ticket_expire = None
-        self.logger.info("已登出交易系统")
-
-
-class ETF159506Adapter:
-    """159506 ETF适配器主类"""
-    
-    def __init__(self, config: Dict):
-        self.config = config
-        self.logger = logging.getLogger("ETF159506Adapter")
-        
-        # 初始化组件
-        self.http_client = ETF159506HttpClient(config)
-        self.ws_client = ETF159506WebSocketClient(config)
-        self.instrument_provider = ETF159506InstrumentProvider(self.http_client)
-        self.data_client = ETF159506DataClient(config, self.instrument_provider)
-        self.execution_client = ETF159506ExecutionClient(config)
-        
-        self.is_connected = False
-        self.connection_attempts = 0
-        self.max_connection_attempts = 1
-        
-    async def connect(self) -> bool:
-        """连接适配器"""
-        try:
-            # 检查连接次数
-            if self.connection_attempts >= self.max_connection_attempts:
-                self.logger.error(f"连接尝试次数已达上限({self.max_connection_attempts})，请检查网络或等待一段时间后重试")
-                return False
-            
-            self.connection_attempts += 1
-            self.logger.info(f"第{self.connection_attempts}次尝试连接适配器...")
-            
-            # 连接所有组件
-            data_connected = await self.data_client.connect()
-            execution_connected = await self.execution_client.connect()
-            
-            if data_connected and execution_connected:
-                # 加载工具信息
-                await self.instrument_provider.load_all_async()
-                
-                self.is_connected = True
-                self.connection_attempts = 0  # 重置连接计数
-                self.logger.info("159506 ETF适配器连接成功")
-                return True
-            else:
-                self.logger.error("159506 ETF适配器连接失败")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"159506 ETF适配器连接失败: {e}")
-            return False
-    
-    async def disconnect(self) -> None:
-        """断开适配器"""
-        await self.data_client.disconnect()
-        await self.execution_client.disconnect()
-        self.is_connected = False
-        self.logger.info("159506 ETF适配器已断开")
-    
-    def get_instrument_provider(self) -> ETF159506InstrumentProvider:
-        """获取工具提供者"""
-        return self.instrument_provider
-    
-    def get_data_client(self) -> ETF159506DataClient:
-        """获取数据客户端"""
-        return self.data_client
-    
-    def get_execution_client(self) -> ETF159506ExecutionClient:
-        """获取执行客户端"""
-        return self.execution_client
-    
-    async def get_status(self) -> Dict:
-        """获取适配器状态"""
-        return {
-            'adapter_name': 'ETF159506Adapter',
-            'is_connected': self.is_connected,
-            'connection_attempts': self.connection_attempts,
-            'max_connection_attempts': self.max_connection_attempts,
-            'instruments_count': self.instrument_provider.count,
-            'data_client_connected': self.data_client.is_connected,
-            'execution_client_connected': self.execution_client.is_connected,
-            'orders_count': len(self.execution_client.orders)
-        }
-    
-    async def reset_connection_attempts(self) -> None:
-        """重置连接尝试次数"""
-        self.connection_attempts = 0
-        self.logger.info("连接尝试次数已重置")
-    
-    async def check_connection_health(self) -> Dict:
-        """检查连接健康状态"""
-        health_status = {
-            'adapter_connected': self.is_connected,
-            'data_client_connected': self.data_client.is_connected,
-            'execution_client_connected': self.execution_client.is_connected,
-            'connection_attempts': self.connection_attempts,
-            'can_retry': self.connection_attempts < self.max_connection_attempts
-        }
-        
-        if not health_status['can_retry']:
-            health_status['suggestion'] = "连接尝试次数已达上限，建议等待一段时间后重试"
-        
-        return health_status
-
-
-# 使用示例
-async def main():
-    """适配器使用示例 - 基于jvquant平台"""
-    config = {
-        'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 使用collector中的实际token
-        'stock_code': '159506'
-    }
-    
-    adapter = ETF159506Adapter(config)
-    
-    # 连接适配器
-    if await adapter.connect():
-        print("✅ 适配器连接成功")
-        
-        # 获取工具信息
-        instruments = adapter.get_instrument_provider().get_all()
-        print(f"📋 可用工具: {instruments}")
-        
-        # 获取历史数据
-        print("\n📈 获取历史数据...")
-        historical_data = await adapter.get_data_client().get_historical_data(
-            symbol='159506',
-            start_date='2024-01-01',
-            end_date='2024-01-31',
-            kline_type='day',
-            fq='前复权',
-            limit=5
-        )
-        
-        if historical_data:
-            print(f"✅ 历史数据获取成功: {len(historical_data)}条记录")
-            latest_data = historical_data[0]
-            print(f"   最新数据: {latest_data.get('timestamp')} 收盘价: {latest_data.get('close')}")
-        else:
-            print("❌ 历史数据获取失败")
-        
-        # 订阅实时数据
-        print("\n📡 订阅实时数据...")
-        async def quote_callback(data):
-            print(f"📊 实时数据: 价格={data.get('price')}, 成交量={data.get('volume')}")
-        
-        adapter.get_data_client().subscribe_quotes('159506', quote_callback)
-        
-        # 交易功能演示
-        print("\n🏦 交易功能演示...")
-        execution_client = adapter.get_execution_client()
-        
-        if execution_client.trade_server:
-            print(f"✅ 交易服务器: {execution_client.trade_server}")
-            print("💡 交易功能已集成，需要登录后使用:")
-            print("   - execution_client.login(account, password)")
-            print("   - execution_client.submit_order(order)")
-            print("   - execution_client.get_positions()")
-            print("   - execution_client.get_orders()")
-        else:
-            print("❌ 交易服务器连接失败")
-        
-        # 获取状态
-        status = await adapter.get_status()
-        print(f"\n📊 适配器状态: {status}")
-        
-        # 保持连接一段时间
-        print("\n⏳ 保持连接10秒...")
-        await asyncio.sleep(10)
-        
-        # 断开连接
-        await adapter.disconnect()
-        print("✅ 适配器已断开连接")
-    else:
-        print("❌ 适配器连接失败")
-
-
-# =============================================================================
-# NautilusTrader适配器集成
-# =============================================================================
-
-from nautilus_trader.live.data_client import LiveMarketDataClient
-from nautilus_trader.live.factories import LiveDataClientFactory
-from nautilus_trader.common.providers import InstrumentProvider
-from nautilus_trader.model.data import Bar, BarType, QuoteTick, TradeTick
-from nautilus_trader.model.identifiers import InstrumentId, Venue, ClientId
-from nautilus_trader.model.instruments import Instrument
-from nautilus_trader.model.enums import BarAggregation, PriceType
-from nautilus_trader.core.data import Data
-from nautilus_trader.core.message import Event
-from nautilus_trader.common.component import MessageBus, LiveClock
-from nautilus_trader.cache.cache import Cache
-from nautilus_trader.data.messages import SubscribeBars
-
-# 全局变量存储适配器实例
-_global_adapter_instance = None
-
-def set_global_adapter(adapter):
-    """设置全局适配器实例"""
-    global _global_adapter_instance
-    _global_adapter_instance = adapter
-
-def get_global_adapter():
-    """获取全局适配器实例"""
-    return _global_adapter_instance
-
-
-class ETF159506NautilusDataClient(LiveMarketDataClient):
-    """159506 ETF NautilusTrader数据客户端包装器"""
-    
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        client_id,
-        venue,
-        msgbus: MessageBus,
-        cache: Cache,
-        clock: LiveClock,
-        instrument_provider: InstrumentProvider,
-        config=None,
-    ):
-        super().__init__(
-            loop=loop,
-            client_id=client_id,
-            venue=venue,
-            msgbus=msgbus,
-            cache=cache,
-            clock=clock,
-            instrument_provider=instrument_provider,
-            config=config,
-        )
-        
-        # 强制使用全局适配器实例
-        global_adapter = get_global_adapter()
-        logger.info(f"全局适配器状态: {global_adapter is not None}")
-        if global_adapter is not None:
-            self.adapter = global_adapter
-            logger.info(f"使用全局ETF159506适配器实例，连接状态: {self.adapter.is_connected}")
-        else:
-            logger.error("全局适配器未设置！这不应该发生。")
-            raise RuntimeError("全局适配器未设置，请确保在创建TradingNode之前设置全局适配器")
-        
-        # 初始化instrument_id - 参考etf_159506_cache_collector.py
-        from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
-        self.instrument_id = InstrumentId(
-            symbol=Symbol("159506"),
-            venue=Venue("SZSE")
-        )
-        
-        self._set_connected(False)
         
     async def _connect(self) -> None:
-        """连接到数据源"""
+        """连接到执行源 - 使用集成的jvquant连接方法"""
         try:
-            logger.info("连接ETF159506数据客户端...")
+            logger.info("连接ETF159506合并执行客户端...")
             
-            # 检查适配器是否已连接
-            if self.adapter.is_connected:
-                logger.info("适配器已连接，直接设置数据客户端状态")
-                self._set_connected(True)
+            if not self.token:
+                logger.error("缺少token配置")
                 return
-            
-            # 如果适配器未连接，说明全局适配器没有正确设置
-            logger.error("适配器未连接，无法启动数据客户端")
-            raise RuntimeError("适配器未连接，请确保全局适配器已正确设置")
+                
+            # 获取交易服务器地址
+            if not await self._get_trade_server():
+                logger.error("无法获取交易服务器地址")
+                return
+                
+            connected = await self.http_client.connect()
+            if connected:
+                self._set_connected(True)
+                logger.info("ETF159506合并执行客户端连接成功")
+            else:
+                logger.error("ETF159506合并执行客户端连接失败")
             
         except Exception as e:
-            logger.error(f"连接ETF159506数据客户端失败: {e}")
+            logger.error(f"连接ETF159506合并执行客户端失败: {e}")
             raise
     
     async def _disconnect(self) -> None:
-        """断开数据源连接"""
+        """断开执行客户端连接 - 使用集成的jvquant断开方法"""
         try:
-            if self.is_connected:
-                await self.adapter.disconnect()
-                self._set_connected(False)
-                logger.info("ETF159506数据客户端已断开")
+            logger.info("断开ETF159506合并执行客户端...")
+            
+            # 使用集成的jvquant断开方法
+            await self.http_client.disconnect()
+            self._set_connected(False)
+            logger.info("ETF159506合并执行客户端已断开")
         except Exception as e:
-            logger.error(f"断开ETF159506数据客户端失败: {e}")
+            logger.error(f"断开ETF159506合并执行客户端失败: {e}")
     
-    async def _subscribe_bars(self, command: SubscribeBars) -> None:
-        """订阅K线数据"""
+    async def generate_order_status_reports(
+        self,
+        command: GenerateOrderStatusReports,
+    ) -> list[OrderStatusReport]:
+        """
+        生成订单状态报告列表
+        
+        Parameters
+        ----------
+        command : GenerateOrderStatusReports
+            生成订单状态报告的命令
+            
+        Returns
+        -------
+        list[OrderStatusReport]
+            订单状态报告列表
+        """
+        reports = []
+        
+        # 遍历所有订单，生成状态报告
+        for client_order_id, order_info in self.orders.items():
+            try:
+                # 创建订单状态报告
+                report = OrderStatusReport(
+                    account_id=command.account_id,
+                    instrument_id=order_info.get('instrument_id'),
+                    client_order_id=client_order_id,
+                    venue_order_id=order_info.get('venue_order_id'),
+                    order_side=order_info.get('order_side'),
+                    order_type=order_info.get('order_type'),
+                    time_in_force=order_info.get('time_in_force'),
+                    order_status=order_info.get('order_status', OrderStatus.INITIALIZED),
+                    quantity=order_info.get('quantity'),
+                    filled_qty=order_info.get('filled_qty', Quantity.zero()),
+                    avg_px=order_info.get('avg_px'),
+                    last_px=order_info.get('last_px'),
+                    currency=order_info.get('currency'),
+                    report_id=UUID4(),
+                    ts_accepted=order_info.get('ts_accepted'),
+                    ts_triggered=order_info.get('ts_triggered'),
+                    ts_last=order_info.get('ts_last'),
+                    ts_init=self._clock.timestamp_ns(),
+                )
+                reports.append(report)
+            except Exception as e:
+                logger.error(f"生成订单状态报告失败 {client_order_id}: {e}")
+                
+        return reports
+    
+    async def _submit_order(self, command) -> None:
+        """提交订单 - 使用集成的jvquant API"""
         try:
-            logger.info(f"订阅K线数据: {command.bar_type}")
+            logger.info(f"提交订单: {command.order}")
             
-            # 设置数据回调
-            def bar_callback(data: Dict[str, Any]):
-                try:
-                    # 将适配器数据转换为NautilusTrader Bar对象
-                    bar = self._convert_to_bar(data, command.bar_type)
-                    if bar:
-                        # 发送到消息总线
-                        self._handle_bar(bar)
-                except Exception as e:
-                    logger.error(f"处理K线数据失败: {e}")
+            # 检查执行客户端连接状态
+            if not self.is_connected:
+                logger.error("执行客户端未连接，无法提交订单")
+                return
             
-            # 订阅实时数据 - 使用我们初始化的instrument_id
-            instrument_id = self.instrument_id
-            symbol = instrument_id.symbol.value
+            # 将NautilusTrader订单转换为jvquant格式
+            jvquant_order = self._convert_nautilus_order_to_jvquant(command.order)
+            if not jvquant_order:
+                logger.error("订单转换失败")
+                return
             
-            # 使用适配器订阅数据
-            data_client = self.adapter.get_data_client()
-            data_client.subscribe_quotes(symbol, bar_callback)
+            logger.info(f"转换后的jvquant订单: {jvquant_order}")
             
-            logger.info(f"K线数据订阅成功: {command.bar_type}")
+            # 调用集成的jvquant API提交订单
+            order_type = jvquant_order.get('type', 'market')
+            side = jvquant_order.get('side', 'buy')
+            code = jvquant_order.get('code', '159506')
+            name = jvquant_order.get('name', '华夏中证500ETF')
+            price = jvquant_order.get('price', 0.0)
+            volume = jvquant_order.get('quantity', 0)
+            
+            jvquant_order_id = None
+            if side == 'buy':
+                jvquant_order_id = await self._buy_stock(code, name, price, volume)
+            elif side == 'sell':
+                jvquant_order_id = await self._sell_stock(code, name, price, volume)
+            else:
+                logger.error(f"不支持的订单方向: {side}")
+                return
+            
+            if jvquant_order_id:
+                logger.info(f"订单提交成功! jvquant订单ID: {jvquant_order_id}")
+                
+                # 建立订单ID映射
+                nautilus_order_id = str(command.order.client_order_id)
+                self._order_id_mapping[nautilus_order_id] = jvquant_order_id
+                logger.info(f"订单ID映射: {nautilus_order_id} -> {jvquant_order_id}")
+                
+            else:
+                logger.error("订单提交失败")
             
         except Exception as e:
-            logger.error(f"订阅K线数据失败: {e}")
+            logger.error(f"提交订单失败: {e}")
             raise
     
-    async def _subscribe_quotes(self, instrument_id: InstrumentId) -> None:
-        """订阅报价数据"""
+    async def _submit_order_list(self, command) -> None:
+        """提交订单列表"""
         try:
-            logger.info(f"订阅报价数据: {instrument_id}")
-            
-            def quote_callback(data: Dict[str, Any]):
-                try:
-                    # 将适配器数据转换为NautilusTrader QuoteTick对象
-                    quote = self._convert_to_quote_tick(data, instrument_id)
-                    if quote:
-                        # 发送到消息总线
-                        self._handle_quote_tick(quote)
-                except Exception as e:
-                    logger.error(f"处理报价数据失败: {e}")
-            
-            # 订阅实时数据
-            symbol = instrument_id.symbol.value
-            data_client = self.adapter.get_data_client()
-            data_client.subscribe_quotes(symbol, quote_callback)
-            
-            logger.info(f"报价数据订阅成功: {instrument_id}")
-            
+            logger.info(f"提交订单列表: {command.order_list}")
+            # TODO: 实现订单列表提交逻辑
+            logger.info("订单列表提交成功（模拟）")
         except Exception as e:
-            logger.error(f"订阅报价数据失败: {e}")
+            logger.error(f"提交订单列表失败: {e}")
             raise
     
-    def _convert_to_bar(self, data: Dict[str, Any], bar_type: BarType) -> Optional[Bar]:
-        """将适配器数据转换为NautilusTrader Bar对象"""
+    async def _modify_order(self, command) -> None:
+        """修改订单"""
         try:
-            # 这里需要根据实际的数据格式进行转换
-            # Level1数据包含: price, volume, timestamp等字段
-            
-            from nautilus_trader.model.objects import Price, Quantity
-            from decimal import Decimal
-            
-            # 获取价格和成交量
-            price = data.get('price', 0)
-            volume = data.get('volume', 0)
-            
-            # 调试：打印原始数据
-            logger.info(f"原始数据: {data}")
-            logger.info(f"数据类型 - price: {type(price)}, volume: {type(volume)}")
-            logger.info(f"数据值 - price: {price}, volume: {volume}")
-            
-            # 确保价格和成交量是数字类型
-            if isinstance(price, str):
-                price = float(price)
-            if isinstance(volume, str):
-                volume = float(volume)
-            
-            # 确保volume是整数，参考etf_159506_catalog_loader.py的处理方式
-            volume_int = int(volume) if volume > 0 else 0            
-            # 调试：打印转换后的值
-            logger.info(f"转换后 - volume_int: {volume_int}, type: {type(volume_int)}")
-            
-            # 使用NautilusTrader官方方法获取instrument
-            instrument = self._instrument_provider.find(bar_type.instrument_id)
-            logger.info(f"从instrument_provider获取instrument: {instrument}")
-            
-            
-            # 使用推荐的方法创建Price和Quantity - 通过instrument.make_price()和make_qty()
-            price_obj = instrument.make_price(price)
-            volume_quantity = instrument.make_qty(volume_int)
-            logger.info(f"使用instrument创建 - price: {price_obj}, volume: {volume_quantity}")
-           
-            
-            # 使用NautilusTrader官方方法获取时间戳
-            from nautilus_trader.core.datetime import dt_to_unix_nanos
-            import pandas as pd
-            
-            current_time = pd.Timestamp.now(tz='UTC')
-            ts_event = dt_to_unix_nanos(current_time)
-            ts_init = ts_event  # 使用相同的时间戳
-            
-            bar = Bar(
-                bar_type=bar_type,
-                open=price_obj,
-                high=price_obj,
-                low=price_obj,
-                close=price_obj,
-                volume=volume_quantity,
-                ts_event=ts_event,
-                ts_init=ts_init,
-            )
-            
-            return bar
-            
+            logger.info(f"修改订单: {command.order}")
+            # TODO: 实现订单修改逻辑
+            logger.info("订单修改成功（模拟）")
         except Exception as e:
-            logger.error(f"转换Bar数据失败: {e}")
-            return None
+            logger.error(f"修改订单失败: {e}")
+            raise
     
-    def _convert_to_quote_tick(self, data: Dict[str, Any], instrument_id: InstrumentId) -> Optional[QuoteTick]:
-        """将适配器数据转换为NautilusTrader QuoteTick对象"""
+    async def _cancel_order(self, command) -> None:
+        """取消订单 - 使用集成的jvquant API"""
         try:
-            # 这里需要根据实际的数据格式进行转换
-            # 假设data包含: bid_price, ask_price, bid_size, ask_size, timestamp
+            logger.info(f"取消订单: {command.order}")
             
-            from nautilus_trader.model.objects import Price, Quantity
+            # 检查执行客户端连接状态
+            if not self.is_connected:
+                logger.error("执行客户端未连接，无法取消订单")
+                return
             
-            quote = QuoteTick(
-                instrument_id=instrument_id,
-                bid_price=Price.from_str(str(data.get('bid_price', 0))),
-                ask_price=Price.from_str(str(data.get('ask_price', 0))),
-                bid_size=Quantity.from_str(str(data.get('bid_size', 0))),
-                ask_size=Quantity.from_str(str(data.get('ask_size', 0))),
-                ts_event=datetime.now(),
-                ts_init=datetime.now(),
-            )
+            # 获取订单ID映射
+            nautilus_order_id = str(command.order.client_order_id)
+            jvquant_order_id = self._order_id_mapping.get(nautilus_order_id)
             
-            return quote
+            if not jvquant_order_id:
+                logger.error(f"未找到订单ID映射: {nautilus_order_id}")
+                return
+            
+            logger.info(f"取消订单: NautilusTrader ID: {nautilus_order_id} -> jvquant ID: {jvquant_order_id}")
+            
+            # 调用集成的jvquant API取消订单
+            success = await self._cancel_jvquant_order(jvquant_order_id)
+            
+            if success:
+                logger.info(f"订单取消成功! jvquant订单ID: {jvquant_order_id}")
+                # 从映射中移除已取消的订单
+                self._order_id_mapping.pop(nautilus_order_id, None)
+            else:
+                logger.error(f"订单取消失败! jvquant订单ID: {jvquant_order_id}")
             
         except Exception as e:
-            logger.error(f"转换QuoteTick数据失败: {e}")
-            return None
+            logger.error(f"取消订单失败: {e}")
+            raise
     
-    def _handle_bar(self, bar: Bar) -> None:
-        """处理Bar数据"""
+    async def _cancel_all_orders(self, command) -> None:
+        """取消所有订单"""
         try:
-            # 使用NautilusTrader官方方法发送数据
-            self._handle_data(bar)
+            logger.info(f"取消所有订单: {command.instrument_id}")
+            # TODO: 实现取消所有订单逻辑
+            logger.info("所有订单取消成功（模拟）")
         except Exception as e:
-            logger.error(f"处理Bar数据失败: {e}")
+            logger.error(f"取消所有订单失败: {e}")
+            raise
     
-    def _handle_quote_tick(self, quote: QuoteTick) -> None:
-        """处理QuoteTick数据"""
+    async def generate_fill_reports(self, command) -> list:
+        """
+        生成成交报告列表
+        
+        这个方法是为了满足 NautilusTrader LiveExecutionClient 基类的要求
+        在我们的实现中，由于 jvquant API 的限制，我们返回空列表
+        """
         try:
-            # 使用NautilusTrader官方方法发送数据
-            self._handle_data(quote)
+            logger.info(f"生成成交报告: {command}")
+            # 由于 jvquant API 的限制，我们无法获取详细的成交报告
+            # 返回空列表表示没有成交报告
+            return []
         except Exception as e:
-            logger.error(f"处理QuoteTick数据失败: {e}")
+            logger.error(f"生成成交报告失败: {e}")
+            return []
+    
+    async def generate_position_status_reports(self, command) -> list:
+        """
+        生成持仓状态报告列表
+        
+        这个方法是为了满足 NautilusTrader LiveExecutionClient 基类的要求
+        在我们的实现中，由于 jvquant API 的限制，我们返回空列表
+        """
+        try:
+            logger.info(f"生成持仓状态报告: {command}")
+            # 由于 jvquant API 的限制，我们无法获取详细的持仓状态报告
+            # 返回空列表表示没有持仓状态报告
+            return []
+        except Exception as e:
+            logger.error(f"生成持仓状态报告失败: {e}")
+            return []
 
 
-class ETF159506LiveDataClientFactory(LiveDataClientFactory):
-    """159506 ETF数据客户端工厂"""
+class ETF159506LiveExecClientFactory(LiveExecClientFactory):
+    """159506 ETF执行客户端工厂"""
     
     @staticmethod
     def create(
@@ -1511,9 +2401,9 @@ class ETF159506LiveDataClientFactory(LiveDataClientFactory):
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
-    ) -> ETF159506NautilusDataClient:
+    ) -> ETF159506NautilusExecClient:
         """
-        创建159506 ETF数据客户端
+        创建159506 ETF执行客户端
         
         Parameters
         ----------
@@ -1532,15 +2422,14 @@ class ETF159506LiveDataClientFactory(LiveDataClientFactory):
             
         Returns
         -------
-        ETF159506NautilusDataClient
+        ETF159506NautilusExecClient
         """
         # 使用全局适配器的instrument_provider
         global_adapter = get_global_adapter()
         instrument_provider = global_adapter.instrument_provider
         logger.info(f"使用全局适配器的instrument_provider，已加载{instrument_provider.count}个工具")
         
-        
-        return ETF159506NautilusDataClient(
+        return ETF159506NautilusExecClient(
             loop=loop,
             client_id=ClientId(name),
             venue=config.venue if hasattr(config, 'venue') else None,

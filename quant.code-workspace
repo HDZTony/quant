@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../../../Downloads/nautilus_trader-develop"
+		},
+		{
+			"path": "../../../Downloads/Redis-8.0.3-Windows-x64-msys2-with-Service"
 		}
 	],
 	"settings": {}

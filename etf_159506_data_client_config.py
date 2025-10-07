@@ -5,7 +5,7 @@
 符合NautilusTrader架构的自定义数据客户端配置
 """
 
-from nautilus_trader.live.config import LiveDataClientConfig
+from nautilus_trader.live.config import LiveDataClientConfig, LiveExecClientConfig
 from nautilus_trader.config import InstrumentProviderConfig, RoutingConfig
 from nautilus_trader.model.identifiers import Venue
 from typing import Optional
@@ -22,10 +22,27 @@ class ETF159506DataClientConfig(LiveDataClientConfig, frozen=True):
     instrument_provider: InstrumentProviderConfig = InstrumentProviderConfig()
     routing: RoutingConfig = RoutingConfig()
 
+class ETF159506ExecClientConfig(LiveExecClientConfig, frozen=True):
+    """159506 ETF数据客户端配置"""
+    
+    venue: Venue = Venue("SZSE")
+    handle_revised_bars: bool = False
+    instrument_provider: InstrumentProviderConfig = InstrumentProviderConfig()
+    routing: RoutingConfig = RoutingConfig()
+
 
 def create_etf_159506_data_client_config() -> ETF159506DataClientConfig:
     """创建159506 ETF数据客户端配置"""
     return ETF159506DataClientConfig(
+        venue=Venue("SZSE"),
+        handle_revised_bars=False,
+        instrument_provider=InstrumentProviderConfig(),
+        routing=RoutingConfig(),
+    )
+
+def create_etf_159506_exec_client_config() -> ETF159506ExecClientConfig:
+    """创建159506 ETF执行客户端配置"""
+    return ETF159506ExecClientConfig(
         venue=Venue("SZSE"),
         handle_revised_bars=False,
         instrument_provider=InstrumentProviderConfig(),

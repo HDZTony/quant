@@ -553,51 +553,51 @@ class ETF159506CacheManager:
             logger.error(f"详细错误信息: {traceback.format_exc()}")
             return {}
     
-    def save_to_parquet(self, filepath: str):
-        """将Cache数据保存为Parquet格式"""
-        try:
-            # 获取所有数据
-            quote_ticks = self.cache.quote_ticks(self.instrument_id)
-            trade_ticks = self.cache.trade_ticks(self.instrument_id)
+    # def save_to_parquet(self, filepath: str):
+    #     """将Cache数据保存为Parquet格式"""
+    #     try:
+    #         # 获取所有数据
+    #         quote_ticks = self.cache.quote_ticks(self.instrument_id)
+    #         trade_ticks = self.cache.trade_ticks(self.instrument_id)
             
-            # 转换为DataFrame
-            quote_data = []
-            for tick in quote_ticks:
-                quote_data.append({
-                    'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
-                    'bid_price': float(tick.bid_price),
-                    'ask_price': float(tick.ask_price),
-                    'bid_size': int(tick.bid_size),
-                    'ask_size': int(tick.ask_size),
-                    'type': 'quote'
-                })
+    #         # 转换为DataFrame
+    #         quote_data = []
+    #         for tick in quote_ticks:
+    #             quote_data.append({
+    #                 'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+    #                 'bid_price': float(tick.bid_price),
+    #                 'ask_price': float(tick.ask_price),
+    #                 'bid_size': int(tick.bid_size),
+    #                 'ask_size': int(tick.ask_size),
+    #                 'type': 'quote'
+    #             })
             
-            trade_data = []
-            for tick in trade_ticks:
-                trade_data.append({
-                    'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
-                    'price': float(tick.price),
-                    'size': int(tick.size),
-                    'trade_id': str(tick.trade_id),  # 转换为字符串避免序列化问题
-                    'type': 'trade'
-                })
+    #         trade_data = []
+    #         for tick in trade_ticks:
+    #             trade_data.append({
+    #                 'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
+    #                 'price': float(tick.price),
+    #                 'size': int(tick.size),
+    #                 'trade_id': str(tick.trade_id),  # 转换为字符串避免序列化问题
+    #                 'type': 'trade'
+    #             })
             
-            # 合并数据
-            all_data = quote_data + trade_data
-            df = pd.DataFrame(all_data)
+    #         # 合并数据
+    #         all_data = quote_data + trade_data
+    #         df = pd.DataFrame(all_data)
             
-            if not df.empty:
-                df = df.sort_values('timestamp')
-                df.to_parquet(filepath, index=False)
-                logger.info(f"数据已保存到: {filepath} ({len(df)} 条记录)")
-                return filepath
-            else:
-                logger.warning("没有数据可保存")
-                return None
+    #         if not df.empty:
+    #             df = df.sort_values('timestamp')
+    #             df.to_parquet(filepath, index=False)
+    #             logger.info(f"数据已保存到: {filepath} ({len(df)} 条记录)")
+    #             return filepath
+    #         else:
+    #             logger.warning("没有数据可保存")
+    #             return None
                 
-        except Exception as e:
-            logger.error(f"保存Parquet文件失败: {e}")
-            return None
+    #     except Exception as e:
+    #         logger.error(f"保存Parquet文件失败: {e}")
+    #         return None
     
     def clear_old_data(self, keep_hours: int = 24):
         """清理旧数据 - 优化版本，真正释放内存"""

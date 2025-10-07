@@ -20,14 +20,13 @@ from nautilus_trader.config import ImportableStrategyConfig
 
 # 导入配置和适配器
 from etf_159506_live_config import ETF159506LiveConfig, create_default_live_config
-from etf_159506_adapter import ETF159506Adapter, ETF159506DataClient, ETF159506ExecutionClient
+from etf_159506_adapter import ETF159506Adapter
 
 # 导入策略
-from etf_159506_strategy import ETF159506Strategy
+from etf_159506_realtime_strategy import ETF159506Strategy
 from etf_159506_strategy_config import ETF159506Config
 
 # 导入数据保存器
-from etf_159506_data_saver import LiveDataSaver, set_global_data_saver, get_global_data_saver
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import Bar
@@ -87,26 +86,13 @@ class ETF159506LiveTradingSystem:
         # 交易节点
         self.trading_node: Optional[TradingNode] = None
         
-        # 数据保存器
-        self.data_saver: Optional[LiveDataSaver] = None
-        self._initialize_data_saver()
+     
         
         # 运行状态
         self.is_running = False
         self.shutdown_event = asyncio.Event()
         
         logger.info(f"ETF159506实时交易系统初始化: trader_id={self.config.trader_id}")
-    
-    def _initialize_data_saver(self) -> None:
-        """初始化数据保存器"""
-        try:
-            from etf_159506_instrument import create_etf_159506_default
-            instrument = create_etf_159506_default()
-            self.data_saver = LiveDataSaver(instrument.id)
-            logger.info("数据保存器初始化完成")
-        except Exception as e:
-            logger.error(f"初始化数据保存器失败: {e}")
-            self.data_saver = None
     
     def _create_trading_node_config(self) -> TradingNodeConfig:
         """创建TradingNode配置 - 参考官方回测配置"""
@@ -118,15 +104,15 @@ class ETF159506LiveTradingSystem:
             # 创建工具和BarType（与回测保持一致）
             instrument = create_etf_159506_default()
             bar_type_str = create_etf_159506_bar_type()
-            bar_type = BarType.from_str(bar_type_str)
+            self.bar_type = BarType.from_str(bar_type_str)
             
             # 创建策略配置（与回测保持相同的参数）
             strategy_config = ImportableStrategyConfig(
-                strategy_path="etf_159506_strategy:ETF159506Strategy",
+                strategy_path="etf_159506_realtime_strategy:ETF159506Strategy",
                 config_path="etf_159506_strategy_config:ETF159506Config",
                 config={
                     "instrument_id": str(instrument.id),
-                    "bar_type": str(bar_type),
+                    "bar_type": str(self.bar_type),
                     "venue": "SZSE",
                     "trade_size": 10000,  # 每次交易10000股
                     "fast_ema_period": 12,
@@ -147,16 +133,37 @@ class ETF159506LiveTradingSystem:
             )
             
             # 创建数据客户端配置
-            from etf_159506_data_client_config import create_etf_159506_data_client_config
-            from etf_159506_adapter import ETF159506NautilusDataClient, ETF159506LiveDataClientFactory
+            from etf_159506_data_client_config import create_etf_159506_data_client_config, create_etf_159506_exec_client_config
+            from nautilus_trader.persistence.config import DataCatalogConfig
+            from nautilus_trader.config import CacheConfig, DatabaseConfig
+            from nautilus_trader.config import DatabaseConfig
+
+            cache_config = CacheConfig(
+                database=DatabaseConfig(
+                type="redis", # Database type
+                host="localhost", # Database host
+                port=6379, # Database port
+                timeout=2, # Connection timeout (seconds)
+                )
+            )
+             
+            # Configure catalog for live system
+            catalog_config = DataCatalogConfig(
+                path="data_catalog",
+                fs_protocol="file",
+                name="historical_data"
+            )
             
             data_client_config = create_etf_159506_data_client_config()
-            
+            exec_client_config = create_etf_159506_exec_client_config()
             # 创建TradingNode配置
             config = TradingNodeConfig(
                 trader_id=TraderId("ETF159506-LIVE-001"),
+                cache=cache_config,
                 strategies=[strategy_config],
                 data_clients={"ETF159506": data_client_config},
+                exec_clients={"ETF159506": exec_client_config},
+                catalogs=[catalog_config],
                 logging=LoggingConfig(
                     log_level="INFO",
                     log_file_name="etf_159506_live_trading.log",
@@ -204,14 +211,6 @@ class ETF159506LiveTradingSystem:
             test_adapter = get_global_adapter()
             logger.info(f"全局适配器设置完成，验证: {test_adapter is not None}, 连接状态: {test_adapter.is_connected if test_adapter else 'N/A'}")
             
-            # 设置全局数据保存器实例
-            if self.data_saver:
-                logger.info("设置全局数据保存器实例...")
-                set_global_data_saver(self.data_saver)
-                logger.info("全局数据保存器实例设置完成")
-            else:
-                logger.warning("数据保存器未初始化，跳过全局设置")
-            
             # 创建TradingNode
             logger.info("创建TradingNode...")
             self.trading_node = TradingNode(config=self.trading_node_config)
@@ -220,6 +219,11 @@ class ETF159506LiveTradingSystem:
             logger.info("注册数据客户端工厂...")
             from etf_159506_adapter import ETF159506LiveDataClientFactory
             self.trading_node.add_data_client_factory("ETF159506", ETF159506LiveDataClientFactory)
+            
+            # 注册执行客户端工厂
+            logger.info("注册执行客户端工厂...")
+            from etf_159506_adapter import ETF159506LiveExecClientFactory
+            self.trading_node.add_exec_client_factory("ETF159506", ETF159506LiveExecClientFactory)
             
             # 构建TradingNode（必须先调用build()）
             logger.info("构建TradingNode...")
@@ -232,12 +236,6 @@ class ETF159506LiveTradingSystem:
             import threading
             self.trading_node_thread = threading.Thread(target=self.trading_node.run)
             self.trading_node_thread.start()
-            
-            # 启动数据保存器
-            logger.info("启动数据保存器...")
-            if self.data_saver:
-                self.data_saver.start_auto_save()
-                logger.info("数据保存器启动成功")
             
             self.is_running = True
             logger.info("ETF159506实时交易系统启动成功")
@@ -266,12 +264,6 @@ class ETF159506LiveTradingSystem:
                 # 等待线程结束
                 if hasattr(self, 'trading_node_thread'):
                     self.trading_node_thread.join(timeout=10)
-            
-            # 停止数据保存器
-            if self.data_saver:
-                logger.info("停止数据保存器...")
-                self.data_saver.disconnect()
-                logger.info("数据保存器已停止")
             
             # 断开适配器连接
             if self.adapter:
@@ -306,11 +298,6 @@ class ETF159506LiveTradingSystem:
             # 添加TradingNode状态
             if self.trading_node:
                 status['trading_node_running'] = True
-            
-            # 添加数据保存器状态
-            if self.data_saver:
-                data_saver_stats = self.data_saver.get_statistics()
-                status['data_saver'] = data_saver_stats
             
             return status
             
@@ -350,31 +337,6 @@ class ETF159506LiveTradingSystem:
             
         except Exception as e:
             logger.error(f"打印系统信息失败: {e}")
-    
-    def get_data_saving_statistics(self) -> Dict[str, Any]:
-        """获取数据保存统计信息"""
-        try:
-            if self.data_saver:
-                return self.data_saver.get_statistics()
-            else:
-                return {"error": "数据保存器未初始化"}
-        except Exception as e:
-            logger.error(f"获取数据保存统计信息失败: {e}")
-            return {"error": str(e)}
-    
-    def force_save_data(self) -> bool:
-        """强制保存所有数据"""
-        try:
-            if self.data_saver:
-                self.data_saver.force_save_all_data()
-                logger.info("强制保存数据完成")
-                return True
-            else:
-                logger.warning("数据保存器未初始化，无法保存数据")
-                return False
-        except Exception as e:
-            logger.error(f"强制保存数据失败: {e}")
-            return False
 
 
 class LiveTradingManager:

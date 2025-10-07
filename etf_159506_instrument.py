@@ -105,7 +105,7 @@ def create_etf_159506_bar_type(
         聚合周期
     price_type : str, default "LAST"
         价格类型
-    source : str, default "EXTERNAL"
+    source : str, default INTERNAL "EXTERNAL"
         数据源
     
     Returns
