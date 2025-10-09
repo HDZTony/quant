@@ -7,6 +7,7 @@
 
 from nautilus_trader.core.message import Event
 from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
+from nautilus_trader.indicators.momentum import RelativeStrengthIndex
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
@@ -22,7 +23,7 @@ import pandas as pd
 from datetime import datetime, time
 
 from nautilus_trader.indicators.base import Indicator
-from nautilus_trader.model.data import Bar
+
 from etf_159506_strategy_config import ETF159506Config
 
 
@@ -244,14 +245,13 @@ class ETF159506Strategy(Strategy):
         self.macd = MovingAverageConvergenceDivergence(
             fast_period=config.fast_ema_period,
             slow_period=config.slow_ema_period,
-            price_type=PriceType.MID
         )
         
         # KDJ指标 - 使用自定义实现
         self.kdj = CatalogKDJIndicator(n=9, k_period=3, d_period=3)
         
-        # RSI指标 - 使用自定义实现
-        self.rsi = CatalogRSIIndicator(period=6)
+        # RSI指标 - 使用官方实现 (注意：官方RSI返回0-1，需要*100转为0-100)
+        self.rsi = RelativeStrengthIndex(period=6)
         
         # 交易数量设置
         if config.trade_size == 0:
@@ -335,6 +335,9 @@ class ETF159506Strategy(Strategy):
     def on_start(self):
         """策略启动时调用"""
         bar_type = self.config.bar_type
+        self.register_indicator_for_bars(bar_type, self.macd)
+        self.register_indicator_for_bars(bar_type, self.kdj)
+        self.register_indicator_for_bars(bar_type, self.rsi)
         self.subscribe_bars(bar_type)
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
@@ -524,14 +527,14 @@ class ETF159506Strategy(Strategy):
         # 记录每分钟成交量
         self.record_minute_volume(bar)
         
-        # 更新MACD指标
-        self.macd.handle_bar(bar)
+        # # 更新MACD指标
+        # self.macd.handle_bar(bar)
         
-        # 更新KDJ指标
-        self.kdj.handle_bar(bar)
+        # # 更新KDJ指标
+        # self.kdj.handle_bar(bar)
         
-        # 更新RSI指标
-        self.rsi.handle_bar(bar)
+        # # 更新RSI指标
+        # self.rsi.handle_bar(bar)
         
         # 添加调试信息
         # 转换为北京时间格式
@@ -542,7 +545,7 @@ class ETF159506Strategy(Strategy):
         if self.kdj.initialized:
             self._log.info(f"KDJ状态: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
         if self.rsi.initialized:
-            self._log.info(f"RSI状态: RSI={self.rsi.value:.2f}")
+            self._log.info(f"RSI状态: RSI={self.rsi.value * 100:.2f}")
         
         # 检查定时买入信号
         self.check_scheduled_buy(bar)
@@ -818,7 +821,7 @@ class ETF159506Strategy(Strategy):
                             'signal_value': self.technical_signal,
                             'min_trough_value': min_trough_value,
                             'min_trough_time': min_trough_time_str,
-                            'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                            'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                             'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                             'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                             'kdj_j': self.kdj.value_j if self.kdj.initialized else None,
@@ -961,8 +964,9 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
-                    self.technical_signal -= self.rsi.value - 60
-                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    rsi_value = self.rsi.value * 100
+                    self.technical_signal -= rsi_value - 60
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
                 # 检查KDJ条件
@@ -1022,8 +1026,9 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
-                    self.technical_signal += 80 - self.rsi.value 
-                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    rsi_value = self.rsi.value * 100
+                    self.technical_signal += 80 - rsi_value
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
                 # 检查KDJ条件
@@ -1163,10 +1168,11 @@ class ETF159506Strategy(Strategy):
 
             # 检查RSI条件
             if self.rsi.initialized:
-                self.technical_signal += 50-self.rsi.value
-                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                rsi_value = self.rsi.value * 100
+                self.technical_signal += 50 - rsi_value
+                self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
             else:
-                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
+                rsi_status = f"{self.rsi.value * 100:.2f}" if self.rsi.initialized else "未初始化"
                 self._log.info(f"RSI条件不满足：RSI={rsi_status}")
 
             # 检查KDJ条件
@@ -1196,7 +1202,7 @@ class ETF159506Strategy(Strategy):
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
-                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                 'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                 'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                 'kdj_j': self.kdj.value_j if self.kdj.initialized else None
@@ -1228,12 +1234,15 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
-            if self.rsi.initialized and self.rsi.value < 50:
-                self.technical_signal -= self.rsi.value
-                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强卖出信号")
+            if self.rsi.initialized:
+                rsi_value = self.rsi.value * 100
+                if rsi_value < 50:
+                    self.technical_signal -= rsi_value
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强卖出信号")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI={rsi_value:.2f}")
             else:
-                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
-                self._log.info(f"RSI条件不满足：RSI={rsi_status}")
+                self._log.info(f"RSI条件不满足：RSI=未初始化")
             # 检查KDJ条件
             # 计算KDJ三个值的最大差值
             kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
@@ -1260,7 +1269,7 @@ class ETF159506Strategy(Strategy):
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
-                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                 'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                 'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                 'kdj_j': self.kdj.value_j if self.kdj.initialized else None

@@ -7,6 +7,7 @@
 
 from nautilus_trader.core.message import Event
 from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
+from nautilus_trader.indicators.momentum import RelativeStrengthIndex
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
@@ -23,7 +24,7 @@ from datetime import datetime, time, date, timedelta
 import pytz
 
 from etf_159506_strategy_config import ETF159506Config
-from etf_159506_strategy import CatalogKDJIndicator, CatalogRSIIndicator
+from etf_159506_strategy import CatalogKDJIndicator
 
 class ETF159506Strategy(Strategy):
     """
@@ -46,14 +47,13 @@ class ETF159506Strategy(Strategy):
         self.macd = MovingAverageConvergenceDivergence(
             fast_period=config.fast_ema_period,
             slow_period=config.slow_ema_period,
-            price_type=PriceType.MID
         )
         
         # KDJ指标 - 使用自定义实现
         self.kdj = CatalogKDJIndicator(n=9, k_period=3, d_period=3)
         
-        # RSI指标 - 使用自定义实现
-        self.rsi = CatalogRSIIndicator(period=6)
+        # RSI指标 - 使用官方实现 (注意：官方RSI返回0-1，需要*100转为0-100)
+        self.rsi = RelativeStrengthIndex(period=6)
         
         # 交易数量设置
         if config.trade_size == 0:
@@ -155,13 +155,13 @@ class ETF159506Strategy(Strategy):
         
         # 使用正确的参数调用request_bars
         self._log.info(f"bar_type类型: {type(bar_type)}, 值: {bar_type}")
-        # 测试用：请求9月30日的数据
-        start_time = pd.Timestamp("2025-09-30 00:00:00", tz="UTC")
-        end_time = pd.Timestamp("2025-09-30 23:59:59", tz="UTC")
-        self._log.info(f"请求历史数据时间范围（测试用9月30日）: {start_time} 到 {end_time}")
+        # 获取当天的时间范围
+        now = pd.Timestamp.now(tz="UTC")
+        start_time = now.normalize()  # 当天 00:00:00
+        self._log.info(f"请求历史数据时间范围（当天）: {start_time} ")
         
         try:
-            request_id = self.request_bars(bar_type, start=start_time, end=end_time)
+            request_id = self.request_bars(bar_type, start=start_time)
             self._log.info(f"历史数据请求已发送，request_id: {request_id}")
         except Exception as e:
             self._log.error(f"请求历史数据时发生错误: {e}")
@@ -228,23 +228,21 @@ class ETF159506Strategy(Strategy):
     def on_historical_data(self, data):
         """处理历史数据"""
         from nautilus_trader.model.data import Bar
-        
-        self._log.info(f"🎯 on_historical_data被调用！数据类型: {type(data)}")
-            # 处理单条历史K线数据
-        self._log.info(f"📈 接收到历史K线数据: {data.ts_event}, 价格: {data.close}")
-        self._process_historical_bar(data)
-        
+        if type(data) is Bar:
+            self._log.info(f"🎯 on_historical_data被调用！数据类型: {type(data)}")
+                # 处理单条历史K线数据
+            self._log.info(f"📈 接收到历史K线数据: {data.ts_event}, 价格: {data.close}")
+            self._process_bar(data)
+            # 转换为北京时间用于日志
+            utc_time = pd.to_datetime(data.ts_event, unit='ns')
+            beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+            beijing_time_str = beijing_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            
+            self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
+                        f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
     
-    def _process_historical_bar(self, bar: Bar):
+    def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""
-        # 更新MACD指标
-        self.macd.handle_bar(bar)
-        
-        # 更新KDJ指标
-        self.kdj.handle_bar(bar)
-        
-        # 更新RSI指标
-        self.rsi.handle_bar(bar)
         
         # 记录每分钟成交量
         self.record_minute_volume(bar)
@@ -270,13 +268,7 @@ class ETF159506Strategy(Strategy):
         self.detect_and_record_extremes(bar)
         self.check_time_diff_minutes_MACD(bar)
         
-        # 转换为北京时间用于日志
-        utc_time = pd.to_datetime(bar.ts_event, unit='ns')
-        beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
-        beijing_time_str = beijing_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
         
-        self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={bar.close.as_double():.4f}, "
-                       f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
         
         # 在历史数据处理中不执行交易逻辑，只初始化指标
     
@@ -407,16 +399,7 @@ class ETF159506Strategy(Strategy):
     def on_bar(self, bar: Bar):
         """处理K线数据"""
         # 记录每分钟成交量
-        self.record_minute_volume(bar)
-        
-        # 更新MACD指标
-        self.macd.handle_bar(bar)
-        
-        # 更新KDJ指标
-        self.kdj.handle_bar(bar)
-        
-        # 更新RSI指标
-        self.rsi.handle_bar(bar)
+        self._process_bar(bar)
         
         # 添加调试信息
         # 转换为北京时间格式
@@ -427,36 +410,10 @@ class ETF159506Strategy(Strategy):
         if self.kdj.initialized:
             self._log.info(f"KDJ状态: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
         if self.rsi.initialized:
-            self._log.info(f"RSI状态: RSI={self.rsi.value:.2f}")
+            self._log.info(f"RSI状态: RSI={self.rsi.value * 100:.2f}")
         
         # 检查定时买入信号
         self.check_scheduled_buy(bar)
-        
-        # 无论MACD是否初始化，都计算图表MACD值
-        chart_macd = self.calculate_chart_macd(bar)
-        
-        # 根据MACD初始化状态选择数据源
-        if not self.macd.initialized:
-            self._log.info(f"MACD指标未初始化，当前数据点: {len(self.macd_history)}")
-            self._log.info(f"使用图表MACD: DIF={chart_macd['macd']:.6f}, DEA={chart_macd['signal']:.6f}, Histogram={chart_macd['histogram']:.6f}")
-            
-            # 使用图表MACD值
-            self.macd_history.append(chart_macd['macd'])
-            self.signal_history.append(chart_macd['signal'])
-            self.histogram_history.append(chart_macd['histogram'])
-            
-            # 更新价格历史数据
-            self.price_history.append(bar.close.as_double())
-            self.timestamps.append(bar.ts_event)
-        else:
-            self._log.info(f"MACD指标已初始化，使用官方指标值")
-            
-            # 使用官方MACD值更新历史数据
-            self.update_history_data(bar)
-        
-        # 统一的极值点检测（背离检测会在deque增加时自动执行）
-        self.detect_and_record_extremes(bar)
-        self.check_time_diff_minutes_MACD(bar)
         # 统一的交易信号检测和风险管理
         self.check_macd_signals(bar)
         self.check_macd_top_signals(bar)
@@ -703,7 +660,7 @@ class ETF159506Strategy(Strategy):
                             'signal_value': self.technical_signal,
                             'min_trough_value': min_trough_value,
                             'min_trough_time': min_trough_time_str,
-                            'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                            'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                             'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                             'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                             'kdj_j': self.kdj.value_j if self.kdj.initialized else None,
@@ -846,8 +803,9 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
-                    self.technical_signal -= self.rsi.value - 60
-                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    rsi_value = self.rsi.value * 100
+                    self.technical_signal -= rsi_value - 60
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
                 # 检查KDJ条件
@@ -907,8 +865,9 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
-                    self.technical_signal += 80 - self.rsi.value 
-                    self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                    rsi_value = self.rsi.value * 100
+                    self.technical_signal += 80 - rsi_value
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
                 # 检查KDJ条件
@@ -1048,10 +1007,11 @@ class ETF159506Strategy(Strategy):
 
             # 检查RSI条件
             if self.rsi.initialized:
-                self.technical_signal += 50-self.rsi.value
-                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强买入信号")
+                rsi_value = self.rsi.value * 100
+                self.technical_signal += 50 - rsi_value
+                self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
             else:
-                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
+                rsi_status = f"{self.rsi.value * 100:.2f}" if self.rsi.initialized else "未初始化"
                 self._log.info(f"RSI条件不满足：RSI={rsi_status}")
 
             # 检查KDJ条件
@@ -1081,7 +1041,7 @@ class ETF159506Strategy(Strategy):
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
-                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                 'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                 'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                 'kdj_j': self.kdj.value_j if self.kdj.initialized else None
@@ -1113,12 +1073,15 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
-            if self.rsi.initialized and self.rsi.value < 50:
-                self.technical_signal -= self.rsi.value
-                self._log.info(f"RSI条件满足：RSI={self.rsi.value:.2f} < 50，增强卖出信号")
+            if self.rsi.initialized:
+                rsi_value = self.rsi.value * 100
+                if rsi_value < 50:
+                    self.technical_signal -= rsi_value
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强卖出信号")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI={rsi_value:.2f}")
             else:
-                rsi_status = f"{self.rsi.value:.2f}" if self.rsi.initialized else "未初始化"
-                self._log.info(f"RSI条件不满足：RSI={rsi_status}")
+                self._log.info(f"RSI条件不满足：RSI=未初始化")
             # 检查KDJ条件
             # 计算KDJ三个值的最大差值
             kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
@@ -1145,7 +1108,7 @@ class ETF159506Strategy(Strategy):
                 'macd_value': current_macd,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
-                'rsi_value': self.rsi.value if self.rsi.initialized else None,
+                'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
                 'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
                 'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
                 'kdj_j': self.kdj.value_j if self.kdj.initialized else None
