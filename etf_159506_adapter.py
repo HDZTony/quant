@@ -508,6 +508,47 @@ class ETF159506DataProcessor:
         self.total_processed = 0
         self.start_time = datetime.now()
         self.last_volume = 0
+        self.last_date = None  # 用于检测交易日变化
+        self.is_initialized = False  # 用于处理程序启动时的第一条数据
+        
+        # 尝试从catalog恢复last_volume（如果可能）
+        self._load_last_volume_from_catalog()
+    
+    def _load_last_volume_from_catalog(self):
+        """从catalog恢复最后的累计成交量（用于程序重启后继续）"""
+        try:
+            if not self.data_saver or not hasattr(self.data_saver, 'catalog') or not self.data_saver.catalog:
+                self.logger.info("📊 数据保存器未初始化，last_volume使用默认值0")
+                return
+            
+            from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+            
+            # 查询今天的TradeTick数据
+            instrument_id = InstrumentId(Symbol(self.stock_code), Venue("SZSE"))
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            try:
+                # 查询今天的trade_ticks
+                trade_ticks = self.data_saver.catalog.trade_ticks(
+                    instrument_ids=[instrument_id],
+                    start=int(today_start.timestamp() * 1e9),
+                    end=None
+                )
+                
+                if trade_ticks and len(trade_ticks) > 0:
+                    # 计算今天已保存的所有TradeTick的成交量总和
+                    total_volume = sum(tick.size.as_double() for tick in trade_ticks)
+                    self.last_volume = total_volume
+                    self.is_initialized = True
+                    self.logger.info(f"✅ 从catalog恢复last_volume: {self.last_volume:,.0f} (基于{len(trade_ticks)}条TradeTick)")
+                else:
+                    self.logger.info("📊 catalog中无今日数据，last_volume使用默认值0")
+                    
+            except Exception as e:
+                self.logger.debug(f"查询catalog数据失败: {e}")
+                
+        except Exception as e:
+            self.logger.error(f"从catalog恢复last_volume失败: {e}")
         
     def process_level1_data(self, data: str) -> Optional[Dict]:
         """处理Level1数据"""
@@ -678,25 +719,57 @@ class ETF159506DataProcessor:
             
             # 只有当有成交量和价格变化时才创建TradeTick
             if volume > 0 and latest_price > 0:
-                # 计算成交量变化（增量）
-                volume_change = volume - self.last_volume
+                # 【改进1】检测交易日变化 - 新的一天重置last_volume
+                current_date = datetime.now().date()
+                if self.last_date is None:
+                    self.last_date = current_date
+                    self.logger.info(f"📅 初始化交易日: {current_date}")
+                elif current_date != self.last_date:
+                    self.logger.info(f"📅 检测到新交易日: {self.last_date} -> {current_date}")
+                    self.logger.info(f"   重置last_volume: {self.last_volume:,.0f} -> 0")
+                    self.last_volume = 0
+                    self.last_date = current_date
+                    self.is_initialized = False
                 
-                # 只有当成交量有增量变化时才创建TradeTick
-                if volume_change > 0:
-                    # 创建TradeTick
-                    trade_tick = TradeTick(
-                        instrument_id=instrument_id,
-                        price=Price.from_str(f"{latest_price:.3f}"),
-                        size=Quantity.from_int(int(volume_change)),
-                        aggressor_side=AggressorSide.NO_AGGRESSOR,  # Level1数据无法确定主动方
-                        trade_id=TradeId(f"{self.stock_code}_{current_time_ns}"),
-                        ts_event=current_time_ns,
-                        ts_init=current_time_ns
-                    )
-                    data_saver.add_trade_tick(trade_tick)
-                    
-                    # 更新最后成交量
+                # 【改进2】检测成交量回退 - 可能是新交易日或程序重启
+                if volume < self.last_volume:
+                    self.logger.warning(f"⚠️  检测到成交量回退: {self.last_volume:,.0f} -> {volume:,.0f}")
+                    self.logger.warning(f"   可能原因: 新交易日开始或数据源重置")
+                    self.logger.warning(f"   重置last_volume为0")
+                    self.last_volume = 0
+                    self.is_initialized = False
+                
+                # 【改进3】处理程序启动时的第一条数据
+                if not self.is_initialized:
+                    # 第一条数据：直接设置last_volume，不创建TradeTick
                     self.last_volume = volume
+                    self.is_initialized = True
+                    self.logger.info(f"🔧 初始化成交量基准: {volume:,.0f} (跳过第一条TradeTick)")
+                else:
+                    # 计算成交量变化（增量）
+                    volume_change = volume - self.last_volume
+                    
+                    # 只有当成交量有增量变化时才创建TradeTick
+                    if volume_change > 0:
+                        # 创建TradeTick
+                        trade_tick = TradeTick(
+                            instrument_id=instrument_id,
+                            price=Price.from_str(f"{latest_price:.3f}"),
+                            size=Quantity.from_int(int(volume_change)),
+                            aggressor_side=AggressorSide.NO_AGGRESSOR,  # Level1数据无法确定主动方
+                            trade_id=TradeId(f"{self.stock_code}_{current_time_ns}"),
+                            ts_event=current_time_ns,
+                            ts_init=current_time_ns
+                        )
+                        data_saver.add_trade_tick(trade_tick)
+                        self.logger.debug(f"✅ 已添加TradeTick: price={latest_price}, size={volume_change:,.0f} (累计={volume:,.0f})")
+                        
+                        # 更新最后成交量
+                        self.last_volume = volume
+                    elif volume_change < 0:
+                        # 理论上不应该出现，因为前面已经检测过回退
+                        self.logger.warning(f"⚠️  成交量异常减少: {self.last_volume:,.0f} -> {volume:,.0f}, 跳过")
+                    # volume_change == 0 时不做任何操作（成交量未变化）
             
         except Exception as e:
             self.logger.debug(f"转换并保存数据失败: {e}")
@@ -1686,13 +1759,16 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                 
                 ticks_list = list(trade_ticks) if trade_ticks else []
                 logger.info(f"📊 查询到 {len(ticks_list)} 条trade_tick数据")
-                
-                
                     
             except Exception as e:
                 logger.error(f"❌ 查询trade_tick数据失败: {e}")
                 import traceback
                 logger.error(f"详细错误: {traceback.format_exc()}")
+                return []
+            
+            # 改进1: 添加空检查
+            if not ticks_list:
+                logger.warning("⚠️  没有查询到trade_tick数据，无法生成Bar")
                 return []
             
             # 手动从trade tick合成分钟bar数据
@@ -1704,18 +1780,24 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                 tick_data.append({
                     'timestamp': pd.to_datetime(tick.ts_event, unit='ns'),
                     'price': float(tick.price),
-                    'volume': int(tick.size),
+                    'volume': int(tick.size),  # TradeTick.size是增量成交量
                     'ts_event': tick.ts_event
                 })
             
             df = pd.DataFrame(tick_data)
             df.set_index('timestamp', inplace=True)
             
+            # 改进2: 修复FutureWarning - 使用'1min'而不是'1T'
             # 按1分钟时间窗口聚合数据
-            resampled = df.resample('1T').agg({
+            resampled = df.resample('1min').agg({
                 'price': ['first', 'max', 'min', 'last'],
-                'volume': 'sum'
+                'volume': 'sum'  # 将增量累加得到该分钟的总成交量
             }).dropna()
+            
+            # 改进3: 检查聚合结果
+            if resampled.empty:
+                logger.warning("⚠️  聚合后没有数据，无法生成Bar")
+                return []
             
             # 重命名列
             resampled.columns = ['open', 'high', 'low', 'close', 'volume']
@@ -1731,7 +1813,7 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                         high=Price.from_str(f"{row['high']:.3f}"),
                         low=Price.from_str(f"{row['low']:.3f}"),
                         close=Price.from_str(f"{row['close']:.3f}"),
-                        volume=Quantity.from_int(int(row['volume'])),
+                        volume=Quantity.from_int(int(row['volume'])),  # 该分钟总成交量
                         ts_event=int(timestamp.timestamp() * 1_000_000_000),  # 纳秒
                         ts_init=int(timestamp.timestamp() * 1_000_000_000),
                     )
