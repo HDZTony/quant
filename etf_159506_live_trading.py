@@ -183,8 +183,23 @@ class ETF159506LiveTradingSystem:
             logger.error(f"创建TradingNode配置失败: {e}")
             raise
     
-    async def start(self) -> None:
-        """启动实时交易系统"""
+    async def _connect_adapter_async(self) -> None:
+        """异步连接适配器（在 TradingNode 的事件循环中运行）"""
+        logger.info("连接ETF159506适配器...")
+        if not await self.adapter.connect():
+            raise RuntimeError("适配器连接失败")
+        logger.info("适配器连接成功")
+        
+        # 获取适配器状态
+        status = await self.adapter.get_status()
+        logger.info(f"适配器状态: {status}")
+    
+    def start_sync(self) -> None:
+        """
+        同步启动实时交易系统
+        
+        注意：此方法是阻塞的，会一直运行直到收到停止信号。
+        """
         try:
             logger.info("启动ETF159506实时交易系统...")
             
@@ -192,24 +207,13 @@ class ETF159506LiveTradingSystem:
             if not self.config.validate_config():
                 raise ValueError("配置验证失败")
             
-            # 连接适配器
-            logger.info("连接ETF159506适配器...")
-            if not await self.adapter.connect():
-                raise RuntimeError("适配器连接失败")
-            
-            logger.info("适配器连接成功")
-            
-            # 获取适配器状态
-            status = await self.adapter.get_status()
-            logger.info(f"适配器状态: {status}")
-            
             # 设置全局适配器实例（在创建TradingNode之前设置）
             logger.info("设置全局适配器实例...")
             from etf_159506_adapter import set_global_adapter, get_global_adapter
             set_global_adapter(self.adapter)
             # 验证全局适配器是否正确设置
             test_adapter = get_global_adapter()
-            logger.info(f"全局适配器设置完成，验证: {test_adapter is not None}, 连接状态: {test_adapter.is_connected if test_adapter else 'N/A'}")
+            logger.info(f"全局适配器设置完成，验证: {test_adapter is not None}")
             
             # 创建TradingNode
             logger.info("创建TradingNode...")
@@ -229,19 +233,18 @@ class ETF159506LiveTradingSystem:
             logger.info("构建TradingNode...")
             self.trading_node.build()
             
-            # 启动TradingNode（这会自动启动策略）
-            logger.info("启动TradingNode...")
-            # TradingNode使用run()方法启动，这是一个阻塞调用
-            # 我们需要在单独的线程中运行它
-            import threading
-            self.trading_node_thread = threading.Thread(target=self.trading_node.run)
-            self.trading_node_thread.start()
+            # 在 TradingNode 的事件循环中连接适配器
+            logger.info("在TradingNode事件循环中连接适配器...")
+            self.trading_node.kernel.loop.run_until_complete(self._connect_adapter_async())
             
             self.is_running = True
             logger.info("ETF159506实时交易系统启动成功")
             
-            # 等待关闭信号
-            await self.shutdown_event.wait()
+            # 启动TradingNode（这是一个阻塞调用，会一直运行直到停止）
+            logger.info("运行TradingNode（阻塞调用）...")
+            self.trading_node.run()
+            
+            logger.info("TradingNode已停止运行")
                     
         except Exception as e:
             logger.error(f"启动ETF159506实时交易系统失败: {e}")
@@ -250,32 +253,61 @@ class ETF159506LiveTradingSystem:
     # 注意：TradingNode会自动处理策略的启动、数据订阅和执行
     # 我们不需要手动处理这些，因为TradingNode会管理整个策略生命周期
     
-    async def stop(self) -> None:
-        """停止实时交易系统"""
+    async def _disconnect_adapter_async(self) -> None:
+        """异步断开适配器"""
+        logger.info("断开适配器连接...")
+        await self.adapter.disconnect()
+        logger.info("适配器已断开")
+    
+    def stop_sync(self) -> None:
+        """
+        同步停止实时交易系统
+        
+        此方法被信号处理器调用，必须是同步的。
+        """
         try:
             logger.info("停止ETF159506实时交易系统...")
             
+            # 立即标记为非运行状态
             self.is_running = False
             
-            # 停止TradingNode
+            # 停止TradingNode（这会触发优雅关闭）
             if self.trading_node:
                 logger.info("停止TradingNode...")
-                self.trading_node.stop()
-                # 等待线程结束
-                if hasattr(self, 'trading_node_thread'):
-                    self.trading_node_thread.join(timeout=10)
+                try:
+                    self.trading_node.stop()
+                    logger.info("TradingNode已停止")
+                except Exception as e:
+                    logger.error(f"停止TradingNode失败: {e}")
             
-            # 断开适配器连接
+            # 断开适配器
             if self.adapter:
-                await self.adapter.disconnect()
-            
-            # 设置关闭事件
-            self.shutdown_event.set()
+                try:
+                    # 使用 TradingNode 的事件循环（如果还可用）
+                    if self.trading_node and hasattr(self.trading_node, 'kernel'):
+                        loop = self.trading_node.kernel.loop
+                        if not loop.is_closed():
+                            loop.run_until_complete(self._disconnect_adapter_async())
+                        else:
+                            # 事件循环已关闭，直接同步断开
+                            logger.info("事件循环已关闭，尝试同步断开适配器...")
+                            import asyncio
+                            new_loop = asyncio.new_event_loop()
+                            try:
+                                new_loop.run_until_complete(self._disconnect_adapter_async())
+                            finally:
+                                new_loop.close()
+                    else:
+                        logger.info("TradingNode不可用，跳过适配器断开")
+                except Exception as e:
+                    logger.error(f"断开适配器失败: {e}")
             
             logger.info("ETF159506实时交易系统停止成功")
                 
         except Exception as e:
             logger.error(f"停止ETF159506实时交易系统失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     async def get_system_status(self) -> Dict[str, Any]:
         """获取系统状态"""
@@ -340,29 +372,79 @@ class ETF159506LiveTradingSystem:
 
 
 class LiveTradingManager:
-    """实时交易管理器"""
+    """
+    实时交易管理器
+    
+    按照官方 Windows 信号处理建议实现：
+    https://nautilustrader.io/docs/latest/concepts/live#windows-signal-handling
+    """
     
     def __init__(self):
         self.trading_system: Optional[ETF159506LiveTradingSystem] = None
-        self.shutdown_signals = [signal.SIGINT, signal.SIGTERM]
-        self._setup_signal_handlers()
+        self._signal_received = False
     
-    def _setup_signal_handlers(self) -> None:
-        """设置信号处理器"""
-        def signal_handler(signum, frame):
-            logger.info(f"收到信号 {signum}，开始关闭系统...")
-            if self.trading_system:
-                asyncio.create_task(self.trading_system.stop())
+    def _setup_signal_handler(self) -> None:
+        """
+        设置信号处理器
         
-        for sig in self.shutdown_signals:
-            signal.signal(sig, signal_handler)
+        关键：在事件循环中调度异步停止任务
+        """
+        def signal_handler(signum, frame):
+            if self._signal_received:
+                logger.warning(f"再次收到信号 {signum}，强制退出...")
+                sys.exit(1)
+            
+            self._signal_received = True
+            logger.info(f"收到信号 {signum}（Ctrl+C），开始优雅关闭...")
+            
+            if self.trading_system and self.trading_system.trading_node:
+                try:
+                    # 获取 TradingNode 的事件循环
+                    loop = self.trading_system.trading_node.kernel.loop
+                    
+                    # 创建停止任务并调度到事件循环
+                    async def stop_async():
+                        logger.info("在事件循环中停止 TradingNode...")
+                        await self.trading_system.trading_node.stop_async()
+                        logger.info("TradingNode 异步停止完成")
+                    
+                    # 在事件循环中调度停止任务
+                    if loop and not loop.is_closed():
+                        logger.info("调度 TradingNode 停止任务到事件循环...")
+                        asyncio.run_coroutine_threadsafe(stop_async(), loop)
+                    else:
+                        logger.error("事件循环不可用，无法优雅关闭")
+                        sys.exit(1)
+                        
+                except Exception as e:
+                    logger.error(f"停止 TradingNode 失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.exit(1)
+        
+        # Windows 只支持 SIGINT
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        # Unix-like 系统也支持 SIGTERM
+        if sys.platform != 'win32':
+            signal.signal(signal.SIGTERM, signal_handler)
+            logger.info("已设置信号处理器 (SIGINT, SIGTERM)")
+        else:
+            logger.info("已设置信号处理器 (SIGINT) - 按 Ctrl+C 停止")
     
-    async def run(
+    def run(
         self,
         config: Optional[ETF159506LiveConfig] = None,
         adapter_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """运行实时交易系统"""
+        """
+        运行实时交易系统（同步方法）
+        
+        使用信号处理器 + TradingNode.run() 的组合方式：
+        1. 注册信号处理器，在收到 SIGINT 时调用 node.stop()
+        2. TradingNode.run() 会阻塞直到 stop() 被调用
+        3. finally 块确保清理
+        """
         try:
             logger.info("启动实时交易管理器...")
             
@@ -375,17 +457,54 @@ class LiveTradingManager:
             # 打印系统信息
             self.trading_system.print_system_info()
             
-            # 启动系统
-            await self.trading_system.start()
+            # 设置信号处理器（在 TradingNode 创建后）
+            self._setup_signal_handler()
+            
+            # 启动系统（阻塞调用，直到收到停止信号）
+            logger.info("启动系统（按 Ctrl+C 停止）...")
+            self.trading_system.start_sync()
+            
+            logger.info("系统已停止运行")
             
         except KeyboardInterrupt:
-            logger.info("收到键盘中断信号，正在关闭系统...")
+            # 如果 KeyboardInterrupt 传播到这里（备用处理）
+            logger.info("收到键盘中断异常（KeyboardInterrupt）...")
         except Exception as e:
             logger.error(f"运行实时交易系统失败: {e}")
+            import traceback
+            traceback.print_exc()
             raise
         finally:
+            # 确保系统正确停止和清理
             if self.trading_system:
-                await self.trading_system.stop()
+                logger.info("执行最终清理...")
+                try:
+                    # 只有在信号处理器未被触发时才需要手动停止
+                    if not self._signal_received:
+                        logger.info("手动停止系统...")
+                        self.trading_system.stop_sync()
+                    else:
+                        logger.info("系统已通过信号停止，执行清理...")
+                        # 断开适配器
+                        if self.trading_system.adapter:
+                            try:
+                                import asyncio
+                                if self.trading_system.trading_node and hasattr(self.trading_system.trading_node, 'kernel'):
+                                    loop = self.trading_system.trading_node.kernel.loop
+                                    if not loop.is_closed():
+                                        loop.run_until_complete(self.trading_system._disconnect_adapter_async())
+                            except Exception as e:
+                                logger.error(f"清理适配器失败: {e}")
+                except Exception as e:
+                    logger.error(f"停止系统时出错: {e}")
+                finally:
+                    # 如果 TradingNode 有 dispose() 方法，在这里调用
+                    if self.trading_system.trading_node and hasattr(self.trading_system.trading_node, 'dispose'):
+                        try:
+                            self.trading_system.trading_node.dispose()
+                            logger.info("TradingNode已释放资源")
+                        except Exception as e:
+                            logger.error(f"释放TradingNode资源时出错: {e}")
 
 
 def create_testnet_system() -> ETF159506LiveTradingSystem:
@@ -420,8 +539,12 @@ def create_production_system() -> ETF159506LiveTradingSystem:
     )
 
 
-async def main():
-    """主函数"""
+def main():
+    """
+    主函数（同步版本）
+    
+    按照官方 Windows 信号处理建议实现
+    """
     try:
         logger.info("ETF159506 实时交易系统启动")
         logger.info("=" * 60)
@@ -456,8 +579,8 @@ async def main():
                 'stock_code': '159506'
             }
         
-        # 运行系统
-        await manager.run(
+        # 运行系统（同步调用）
+        manager.run(
             config=config,
             adapter_config=adapter_config,
         )
@@ -472,5 +595,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    # 运行主函数
-    asyncio.run(main())
+    # Windows 平台提示
+    if sys.platform == 'win32':
+        logger.info("Windows 平台：使用 Ctrl+C 停止系统")
+        logger.info("官方文档: https://nautilustrader.io/docs/latest/concepts/live#windows-signal-handling")
+    
+    # 运行主函数（同步方式，按照官方建议）
+    main()

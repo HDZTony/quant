@@ -5,6 +5,7 @@
 基于MACD金叉死叉的简单交易策略
 """
 
+from nautilus_trader.core import Data
 from nautilus_trader.core.message import Event
 from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
 from nautilus_trader.indicators.momentum import RelativeStrengthIndex
@@ -243,6 +244,7 @@ class ETF159506Strategy(Strategy):
             
             self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
                         f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
+            self.update_realtime_charts(data)
     
     def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""
@@ -279,26 +281,23 @@ class ETF159506Strategy(Strategy):
         """记录每分钟成交量数据（包含OHLC信息）
         
         注意：此方法接收1分钟Bar作为输入，Bar.volume已经是该分钟的总成交量，
-        直接记录即可，无需累加。同时记录OHLC数据以供图表使用。
+        直接记录即可，无需累加。数据格式直接匹配图表需求，无需二次转换。
         """
-        # 转换为北京时间
+        # 转换为北京时间并格式化为ISO8601格式（图表直接使用）
         utc_time = pd.to_datetime(bar.ts_event, unit='ns')
         beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
         
-        # 创建分钟标识（格式：YYYY-MM-DD HH:MM）
-        minute_key = beijing_time.strftime('%Y-%m-%d %H:%M')
-        
-        # 记录数据：时间、成交量、OHLC（供图表使用）
+        # 记录数据：格式直接匹配图表需求
         self.minute_volume_data.append({
-            'minute': minute_key,
-            'volume': bar.volume.as_double(),
+            'timestamp': beijing_time.isoformat(),  # ISO8601格式，带时区
+            'price': bar.close.as_double(),         # 收盘价（图表用'price'字段）
             'open': bar.open.as_double(),
             'high': bar.high.as_double(),
             'low': bar.low.as_double(),
-            'close': bar.close.as_double(),
+            'volume': bar.volume.as_double(),
         })
         
-        self._log.info(f"分钟数据记录: {minute_key} - 成交量: {bar.volume.as_double():,.0f}, 收盘价: {bar.close.as_double():.3f}")
+        self._log.info(f"分钟数据记录: {beijing_time.strftime('%H:%M')} - 成交量: {bar.volume.as_double():,.0f}, 收盘价: {bar.close.as_double():.3f}")
     
     def get_minute_volume_summary(self):
         """获取每分钟成交量汇总数据
@@ -307,8 +306,12 @@ class ETF159506Strategy(Strategy):
         """
         summary = []
         for data in self.minute_volume_data:
+            # 解析ISO8601时间戳格式为简单格式
+            timestamp = pd.to_datetime(data['timestamp'], format='ISO8601')
+            minute_time = timestamp.strftime('%Y-%m-%d %H:%M')
+            
             summary.append({
-                'minute_time': data['minute'],
+                'minute_time': minute_time,
                 'total_volume': data['volume']
             })
         
@@ -832,7 +835,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
         
                 
-                # 检查是否达到买入阈值
+                # 检查是否达到卖出阈值
                 if self.technical_signal <= self.sell_threshold:
                     self._log.info(f"卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
                     self.execute_sell_signal(bar, signal_type='macd_top_signals')
@@ -1562,32 +1565,60 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
     
     def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
-        """执行卖出信号"""
+        """执行卖出信号 - 显式创建SELL订单"""
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
             self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
             return
         
-        # 检查是否有持仓 - 使用可靠的持仓查询方法
-        # current_position = self.get_current_position()
-        # if current_position is None:
-        #     self._log.info("没有持仓，跳过卖出信号")
-        #     return
+        # 显式检查持仓（Explicit is better than implicit）
+        positions = self.cache.positions_open(
+            instrument_id=self.config.instrument_id,
+            strategy_id=self.id
+        )
+        
+        if not positions:
+            self._log.info("没有持仓，跳过卖出信号")
+            return
+        
+        # 获取当前持仓
+        position = positions[0]
+        
+        # 验证持仓方向（只处理多头持仓的卖出）
+        if position.side != PositionSide.LONG:
+            self._log.warning(f"持仓方向不是LONG而是{position.side}，跳过卖出")
+            return
+        
+        # 获取持仓数量
+        quantity = position.quantity
+        
+        self._log.info(f"准备卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
+        
+        # 显式创建市价SELL订单（Explicit is better than implicit）
+        order = self.order_factory.market(
+            instrument_id=self.config.instrument_id,
+            order_side=OrderSide.SELL,  # 显式指定SELL方向
+            quantity=quantity,
+            reduce_only=True,  # 只减仓，不开新仓
+            tags=["EXIT", signal_type]
+        )
+        
+        # 提交订单
+        self.submit_order(order, position_id=position.id)
         
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
             'price': bar.close.as_double(),
             'side': 'SELL',
-            'order_id': 'close_position',
+            'quantity': quantity.as_double(),
+            'order_id': str(order.client_order_id),
             'signal_type': signal_type,
             'signal_value': self.technical_signal
         }
         self.trade_signals.append(trade_signal)
         
-        # 执行全部平仓操作
-        self.close_all_positions(self.config.instrument_id, tags=["EXIT"])
-        self._log.info(f"执行全部卖出交易: 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行显式SELL订单: 数量={quantity}, 价格={bar.close.as_double():.4f}, 订单ID={order.client_order_id}")
     
     def execute_divergence_buy_signal(self, bar: Bar):
         """执行背离买入信号"""
@@ -1638,32 +1669,60 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"执行背离买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
     
     def execute_divergence_sell_signal(self, bar: Bar):
-        """执行背离卖出信号"""
+        """执行背离卖出信号 - 显式创建SELL订单"""
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
             self._log.info(f"当前时间已过2:50分，跳过背离卖出信号执行")
             return
         
-        # 检查是否有持仓
-        # current_position = self.get_current_position()
-        # if current_position is None:
-        #     self._log.info("没有持仓，跳过背离卖出信号")
-        #     return
+        # 显式检查持仓（Explicit is better than implicit）
+        positions = self.cache.positions_open(
+            instrument_id=self.config.instrument_id,
+            strategy_id=self.id
+        )
+        
+        if not positions:
+            self._log.info("没有持仓，跳过背离卖出信号")
+            return
+        
+        # 获取当前持仓
+        position = positions[0]
+        
+        # 验证持仓方向
+        if position.side != PositionSide.LONG:
+            self._log.warning(f"持仓方向不是LONG而是{position.side}，跳过背离卖出")
+            return
+        
+        # 获取持仓数量
+        quantity = position.quantity
+        
+        self._log.info(f"准备背离卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
+        
+        # 显式创建市价SELL订单
+        order = self.order_factory.market(
+            instrument_id=self.config.instrument_id,
+            order_side=OrderSide.SELL,  # 显式指定SELL方向
+            quantity=quantity,
+            reduce_only=True,
+            tags=["EXIT", "divergence_sell"]
+        )
+        
+        # 提交订单
+        self.submit_order(order, position_id=position.id)
         
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
             'price': bar.close.as_double(),
             'side': 'SELL',
-            'order_id': 'close_position',
+            'quantity': quantity.as_double(),
+            'order_id': str(order.client_order_id),
             'signal_type': 'executed_divergence_sell',
             'signal_value': self.technical_signal
         }
         self.trade_signals.append(trade_signal)
         
-        # 执行全部平仓操作
-        self.close_all_positions(self.config.instrument_id, tags=["EXIT"])
-        self._log.info(f"执行背离全部卖出交易: 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行背离显式SELL订单: 数量={quantity}, 价格={bar.close.as_double():.4f}, 订单ID={order.client_order_id}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
@@ -1958,44 +2017,39 @@ class ETF159506Strategy(Strategy):
             self._log.error(f"更新实时图表失败: {e}")
     
     def get_kline_data_from_cache(self, target_date=None):
-        """从cache获取K线数据（替代catalog_loader的get_today_kline_data）"""
+        """直接从minute_volume_data获取K线数据（零转换，直接返回）"""
         try:
-            # 获取cache中的所有bars
-            bars = self.cache.bars(self.config.bar_type)
-            if not bars:
-                self._log.warning("cache中没有Bar数据")
+            if not self.minute_volume_data:
+                self._log.warning("minute_volume_data中没有数据")
                 return []
             
-            # 转换为kline_data格式（与catalog_loader格式一致）
+            # 如果不需要过滤日期，直接返回全部数据
+            if not target_date:
+                return list(self.minute_volume_data)
+            
+            # 需要过滤日期时，只返回匹配的数据
             kline_data = []
-            for bar in bars:
-                utc_time = pd.to_datetime(bar.ts_event, unit='ns')
-                beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+            for data in self.minute_volume_data:
+                # 解析timestamp字段（ISO8601格式）
+                timestamp = pd.to_datetime(data['timestamp'], format='ISO8601')
                 
-                # 如果指定了target_date，只返回该日期的数据
-                if target_date and beijing_time.date() != target_date:
-                    continue
-                
-                kline_data.append({
-                    'timestamp': beijing_time.isoformat(),  # 转为字符串格式
-                    'price': bar.close.as_double(),
-                    'open': bar.open.as_double(),
-                    'high': bar.high.as_double(),
-                    'low': bar.low.as_double(),
-                    'volume': bar.volume.as_double(),
-                })
+                # 过滤指定日期
+                if timestamp.date() == target_date:
+                    kline_data.append(data)
             
             return kline_data
             
         except Exception as e:
-            self._log.error(f"从cache获取K线数据失败: {e}")
+            self._log.error(f"从minute_volume_data获取K线数据失败: {e}")
+            import traceback
+            self._log.error(f"详细错误: {traceback.format_exc()}")
             return []
     
     def create_extremes_chart(self, save_path: str = None, target_date: date = None, extremes_data: Dict = None):
         """创建专门的极值点图表"""
         try:
-            # 获取数据（从cache）
-            kline_data = self.get_kline_data_from_cache(target_date)
+            # 获取数据（从minute_volume_data，内存访问）
+            kline_data = self.get_kline_data_from_cache()
             
             if not kline_data:
                 self._log.warning("没有数据可绘制")
@@ -2180,7 +2234,7 @@ class ETF159506Strategy(Strategy):
             
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume()
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -2339,8 +2393,8 @@ class ETF159506Strategy(Strategy):
     def create_trade_points_chart(self, save_path: str = None, target_date: date = None, trade_signals: List[Dict] = None):
         """创建专门的买卖点图表"""
         try:
-            # 获取数据（从cache）
-            kline_data = self.get_kline_data_from_cache(target_date)
+            # 获取数据（从minute_volume_data，内存访问）
+            kline_data = self.get_kline_data_from_cache()
             
             if not kline_data:
                 self._log.warning("没有数据可绘制")
@@ -2686,7 +2740,7 @@ class ETF159506Strategy(Strategy):
             
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume()
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -2782,8 +2836,8 @@ class ETF159506Strategy(Strategy):
     def create_realtime_kline_chart(self, save_path: str = None, target_date: date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None):
         """绘制价格走势图"""
         try:
-            # 获取数据（从cache）
-            kline_data = self.get_kline_data_from_cache(target_date)
+            # 获取数据（从minute_volume_data，内存访问）
+            kline_data = self.get_kline_data_from_cache()
             
             if not kline_data:
                 self._log.warning("没有数据可绘制")
@@ -3246,7 +3300,27 @@ class ETF159506Strategy(Strategy):
            
             # ====== ax2成交量（按分钟聚合） ======
             # 计算每分钟成交量
-            minute_volume_stats, _ = self.calculate_minute_volume(target_date)
+            minute_volume_stats, _ = self.calculate_minute_volume()
+            
+            # ====== DEBUG: 打印成交量数据 ======
+            self._log.info(f"[DEBUG K线图] 成交量数据检查:")
+            if not minute_volume_stats.empty:
+                self._log.info(f"  ✓ 数据条数: {len(minute_volume_stats)}")
+                self._log.info(f"  ✓ 总成交量: {minute_volume_stats['总成交量'].sum():,.0f}")
+                self._log.info(f"  ✓ 平均成交量: {minute_volume_stats['总成交量'].mean():,.2f}")
+                self._log.info(f"  ✓ 最大成交量: {minute_volume_stats['总成交量'].max():,.0f}")
+                self._log.info(f"  ✓ 最小成交量: {minute_volume_stats['总成交量'].min():,.0f}")
+                self._log.info(f"  ✓ 成交量>0: {(minute_volume_stats['总成交量'] > 0).sum()}/{len(minute_volume_stats)}")
+                self._log.info(f"  ✓ 时间范围: {minute_volume_stats['minute_time'].min()} 到 {minute_volume_stats['minute_time'].max()}")
+                self._log.info(f"  ✓ 前3条:")
+                for idx, row in minute_volume_stats.head(3).iterrows():
+                    self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
+                self._log.info(f"  ✓ 后3条:")
+                for idx, row in minute_volume_stats.tail(3).iterrows():
+                    self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
+            else:
+                self._log.error(f"  ✗ minute_volume_stats 为空！")
+            # ====== END DEBUG ======
             
             if not minute_volume_stats.empty:
                 # 创建时间映射，与主图保持一致
@@ -3469,7 +3543,7 @@ class ETF159506Strategy(Strategy):
 
     def get_minute_volume_for_chart(self, target_date: date = None) -> pd.DataFrame:
         """
-        直接从已记录的minute_volume_data获取成交量数据供图表使用（高效版本）
+        直接从已记录的minute_volume_data获取成交量数据供图表使用（零转换版本）
         无需访问cache，直接使用内存中已记录的OHLC+Volume数据
         
         Args:
@@ -3483,26 +3557,24 @@ class ETF159506Strategy(Strategy):
                 self._log.warning("没有已记录的分钟成交量数据")
                 return pd.DataFrame()
             
-            # 直接从minute_volume_data转换为DataFrame（已包含OHLC信息）
+            # 直接从minute_volume_data转换为DataFrame（字段已匹配）
             volume_list = []
             for data in self.minute_volume_data:
-                minute_str = data['minute']  # 'YYYY-MM-DD HH:MM'
-                
-                # 解析时间
-                minute_time = pd.to_datetime(minute_str, format='%Y-%m-%d %H:%M')
+                # 解析ISO8601时间戳
+                timestamp = pd.to_datetime(data['timestamp'], format='ISO8601')
                 
                 # 如果指定了目标日期，进行过滤
-                if target_date and minute_time.date() != target_date:
+                if target_date and timestamp.date() != target_date:
                     continue
                 
-                # 构建记录（所有数据都已在record_minute_volume中记录）
+                # 构建记录（字段名直接匹配）
                 volume_list.append({
-                    'minute_time': minute_time,
+                    'minute_time': timestamp,
                     '总成交量': data['volume'],
-                    '开盘价': data.get('open', 0),
-                    '收盘价': data.get('close', 0),
-                    '最低价': data.get('low', 0),
-                    '最高价': data.get('high', 0),
+                    '开盘价': data['open'],
+                    '收盘价': data['price'],  # 已改为'price'字段
+                    '最低价': data['low'],
+                    '最高价': data['high'],
                 })
             
             if not volume_list:
