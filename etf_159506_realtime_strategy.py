@@ -244,7 +244,6 @@ class ETF159506Strategy(Strategy):
             
             self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
                         f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
-            self.update_realtime_charts(data)
     
     def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""

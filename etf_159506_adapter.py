@@ -1388,6 +1388,15 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         # 创建WebSocket客户端，传入数据保存器
         self.ws_client = ETF159506WebSocketClient(self.config, self.data_saver)
         
+        # 实时Bar成交量增量计算（匹配历史数据格式）
+        self.last_minute_cumulative_volume = {}  # {bar_type: 上一分钟结束时的累计成交量}
+        self.current_minute_start_volume = {}    # {bar_type: 当前分钟开始时的累计成交量}
+        self.current_minute_key = {}             # {bar_type: 当前分钟标识"HH:MM"}
+        
+        # 1分钟Bar聚合器：从tick数据聚合成分钟Bar
+        self.current_minute_bar_data = {}        # {bar_type: {open, high, low, close, volume, ts_start}}
+        self.completed_minute_bar = {}           # {bar_type: Bar对象} 存储上一分钟完成的Bar
+        
         self._set_connected(False)
         
     async def _connect(self) -> None:
@@ -1479,78 +1488,153 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
             raise
     
     def _convert_to_bar(self, data: Dict[str, Any], bar_type: BarType) -> Optional[Bar]:
-        """将适配器数据转换为NautilusTrader Bar对象"""
+        """将tick级别的实时数据聚合为1分钟Bar
+        
+        核心逻辑：
+        1. 同一分钟内：聚合多个tick数据（更新OHLC和volume），返回None（不触发on_bar）
+        2. 分钟切换时：返回上一分钟的完整Bar（触发on_bar），开始聚合新分钟
+        3. 结果：on_bar每分钟只被调用1次
+        
+        注意：实时数据的volume是累计成交量，需要计算增量以匹配历史数据格式
+        """
         try:
-            # 这里需要根据实际的数据格式进行转换
-            # Level1数据包含: price, volume, timestamp等字段
-            
             from nautilus_trader.model.objects import Price, Quantity
-            from decimal import Decimal
-            
-            # 获取价格和成交量
-            price = data.get('price', 0)
-            volume = data.get('volume', 0)
-            
-            # 调试：打印原始数据
-            logger.info(f"原始数据: {data}")
-            logger.info(f"数据类型 - price: {type(price)}, volume: {type(volume)}")
-            logger.info(f"数据值 - price: {price}, volume: {volume}")
-            
-            # 确保价格和成交量是数字类型
-            if isinstance(price, str):
-                price = float(price)
-            if isinstance(volume, str):
-                volume = float(volume)
-            
-            # 确保volume是整数，参考etf_159506_catalog_loader.py的处理方式
-            volume_int = int(volume) if volume > 0 else 0            
-            # 调试：打印转换后的值
-            logger.info(f"转换后 - volume_int: {volume_int}, type: {type(volume_int)}")
-            
-            # 使用NautilusTrader官方方法获取instrument
-            instrument = self._instrument_provider.find(bar_type.instrument_id)
-            logger.info(f"从instrument_provider获取instrument: {instrument}")
-            
-            # 如果从instrument_provider找不到，尝试从缓存获取
-            if not instrument:
-                logger.warning(f"从instrument_provider未找到instrument: {bar_type.instrument_id}")
-                instrument = self.cache.instrument(bar_type.instrument_id)
-                logger.info(f"从cache获取instrument: {instrument}")
-            
-            # 如果仍然找不到，抛出错误
-            if not instrument:
-                raise RuntimeError(f"无法找到instrument: {bar_type.instrument_id}")
-            
-            
-            # 使用推荐的方法创建Price和Quantity - 通过instrument.make_price()和make_qty()
-            price_obj = instrument.make_price(price)
-            volume_quantity = instrument.make_qty(volume_int)
-            logger.info(f"使用instrument创建 - price: {price_obj}, volume: {volume_quantity}")
-           
-            
-            # 使用NautilusTrader官方方法获取时间戳
             from nautilus_trader.core.datetime import dt_to_unix_nanos
             import pandas as pd
             
+            # 获取价格和累计成交量
+            price = data.get('price', 0)
+            cumulative_volume = data.get('volume', 0)  # WebSocket原始数据是累计值
+            
+            # 确保是数字类型
+            if isinstance(price, str):
+                price = float(price)
+            if isinstance(cumulative_volume, str):
+                cumulative_volume = float(cumulative_volume)
+            
+            # 获取当前时间并提取分钟标识
             current_time = pd.Timestamp.now(tz='UTC')
-            ts_event = dt_to_unix_nanos(current_time)
-            ts_init = ts_event  # 使用相同的时间戳
+            beijing_time = current_time.tz_convert('Asia/Shanghai')
+            minute_key = beijing_time.strftime('%H:%M')  # "09:30"
             
-            bar = Bar(
-                bar_type=bar_type,
-                open=price_obj,
-                high=price_obj,
-                low=price_obj,
-                close=price_obj,
-                volume=volume_quantity,
-                ts_event=ts_event,
-                ts_init=ts_init,
-            )
+            # bar_type的字符串表示作为key
+            bar_type_key = str(bar_type)
             
-            return bar
+            # 获取instrument（用于创建Price和Quantity）
+            instrument = self._instrument_provider.find(bar_type.instrument_id)
+            if not instrument:
+                instrument = self.cache.instrument(bar_type.instrument_id)
+            if not instrument:
+                raise RuntimeError(f"无法找到instrument: {bar_type.instrument_id}")
+            
+            # 创建当前价格对象
+            price_obj = instrument.make_price(price)
+            
+            # 检测分钟变化
+            is_new_minute = False
+            old_minute = None  # 用于日志输出
+            
+            if bar_type_key not in self.current_minute_key:
+                # 第一次接收数据 - 初始化第一个分钟
+                is_new_minute = True
+                self.current_minute_key[bar_type_key] = minute_key
+                self.current_minute_start_volume[bar_type_key] = cumulative_volume
+                self.last_minute_cumulative_volume[bar_type_key] = cumulative_volume
+                
+                # 创建第一分钟的Bar数据结构（包含start_volume）
+                self.current_minute_bar_data[bar_type_key] = {
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'ts_start': dt_to_unix_nanos(current_time),
+                    'start_volume': cumulative_volume  # 保存起始累计量
+                }
+                logger.info(f"[Bar聚合] 首次初始化: {minute_key}, 起始累计量={cumulative_volume:,.0f}")
+                
+            elif self.current_minute_key[bar_type_key] != minute_key:
+                # 进入新的一分钟
+                old_minute = self.current_minute_key[bar_type_key]
+                is_new_minute = True
+                
+                # 关键修复：使用上一次的累计量作为新分钟的起始
+                # 这样可以避免丢失分钟边界的数据
+                last_volume = self.last_minute_cumulative_volume.get(bar_type_key, cumulative_volume)
+                
+                logger.info(f"[Bar聚合] 分钟切换: {old_minute} -> {minute_key}")
+                logger.info(f"  上次累计量: {last_volume:,.0f}")
+                logger.info(f"  当前累计量: {cumulative_volume:,.0f}")
+                logger.info(f"  边界增量: {cumulative_volume - last_volume:,.0f} (将计入新分钟)")
+                
+                # 更新分钟key和起始累计量
+                self.current_minute_key[bar_type_key] = minute_key
+                self.current_minute_start_volume[bar_type_key] = last_volume  # 使用上次累计量
+                
+            # 更新last_minute_cumulative_volume（每次tick都更新）
+            self.last_minute_cumulative_volume[bar_type_key] = cumulative_volume
+            
+            # 变量用于保存将要返回的Bar（如果有）
+            bar_to_return = None
+            
+            # 如果是新分钟，先完成上一分钟的Bar
+            if is_new_minute and old_minute is not None:
+                # 只有在非首次初始化时，才有上一分钟的Bar可以完成
+                old_bar_data = self.current_minute_bar_data.get(bar_type_key)
+                if old_bar_data:
+                    # 计算上一分钟的成交量
+                    # 在分钟切换前，last_volume还保存着上一分钟最后一个tick的累计量
+                    # old_minute_start_volume是上一分钟开始时的累计量
+                    # 注意：这里的last_volume在line 1552已经被获取了
+                    old_minute_start = old_bar_data.get('start_volume', 0)  # 上一分钟开始时的累计量
+                    old_minute_end = last_volume  # 上一分钟结束时的累计量（line 1552的last_volume）
+                    
+                    old_minute_volume = old_minute_end - old_minute_start
+                    if old_minute_volume < 0:
+                        old_minute_volume = 0
+                    
+                    # 创建上一分钟的完整Bar
+                    bar_to_return = Bar(
+                        bar_type=bar_type,
+                        open=instrument.make_price(old_bar_data['open']),
+                        high=instrument.make_price(old_bar_data['high']),
+                        low=instrument.make_price(old_bar_data['low']),
+                        close=instrument.make_price(old_bar_data['close']),
+                        volume=instrument.make_qty(int(old_minute_volume)),
+                        ts_event=old_bar_data.get('ts_start', dt_to_unix_nanos(current_time)),
+                        ts_init=dt_to_unix_nanos(current_time),
+                    )
+                    logger.info(f"[Bar完成] {old_minute}: O={old_bar_data['open']:.3f} H={old_bar_data['high']:.3f} L={old_bar_data['low']:.3f} C={old_bar_data['close']:.3f} V={int(old_minute_volume):,}")
+                    logger.info(f"  → 将在下一个tick触发on_bar")
+                
+                # 初始化新分钟的Bar数据
+                self.current_minute_bar_data[bar_type_key] = {
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'ts_start': dt_to_unix_nanos(current_time),
+                    'start_volume': last_volume  # 保存该分钟开始时的累计成交量
+                }
+                logger.debug(f"[Bar聚合] 开始新分钟: {minute_key}, 初始价格={price:.3f}")
+                
+            else:
+                # 同一分钟内，更新OHLC（不返回Bar）
+                bar_data = self.current_minute_bar_data.get(bar_type_key)
+                if bar_data:
+                    bar_data['high'] = max(bar_data['high'], price)
+                    bar_data['low'] = min(bar_data['low'], price)
+                    bar_data['close'] = price
+                    logger.debug(f"[Bar聚合] 更新 {minute_key}: H={bar_data['high']:.3f} L={bar_data['low']:.3f} C={price:.3f}")
+            
+            # 返回完成的Bar（如果有），否则返回None
+            # 同一分钟内返回None，不触发on_bar
+            # 只有新分钟才返回上一分钟的完整Bar，触发on_bar
+            return bar_to_return
             
         except Exception as e:
             logger.error(f"转换Bar数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
             return None
     
     def _convert_to_quote_tick(self, data: Dict[str, Any], instrument_id: InstrumentId) -> Optional[QuoteTick]:
