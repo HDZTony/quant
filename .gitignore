@@ -16,3 +16,8 @@ __pycache__/
 
 data_catalog/
 test_catalog/
+
+# 私密配置文件（包含交易账户密码）
+config_private.py
+config.json
+*.secret.py

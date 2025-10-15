@@ -2082,10 +2082,22 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         self.ticket_expire = None
         self.is_logged_in = False
         
+        # 交易账户信息（从config读取）
+        self.trade_account = '541460031518'
+        self.trade_password = '882200'
+        
         self._set_connected(False)
         
         # 订单ID映射：NautilusTrader client_order_id -> jvquant order_id
         self._order_id_mapping = {}
+        
+        # 股票代码到名称的映射（可从配置读取）
+        default_names = {
+            '159506': '恒生医疗',
+            # 可以添加更多股票映射
+        }
+        # 优先使用配置中的映射，否则使用默认映射
+        self._instrument_names = jvquant_config.get('instrument_names', default_names)
     
     # ========== jvquant API 方法 ==========
     
@@ -2156,16 +2168,28 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         return True
     
     async def _buy_stock(self, code: str, name: str, price: float, volume: int) -> Optional[str]:
-        """买入股票"""
+        """
+        买入股票
+        
+        API参数规范：
+        - type: 报单类别，买入为 'buy'
+        - token: 用户认证token
+        - ticket: 交易凭证
+        - code: 证券代码
+        - name: 证券名称
+        - price: 委托价格
+        - volume: 委托数量
+        """
         try:
             url = f"http://{self.trade_server}/buy"
             params = {
-                'token': self.token,
-                'ticket': self.ticket,
-                'code': code,
-                'name': name,
-                'price': str(price),
-                'volume': str(volume)
+                'type': 'buy',              # 报单类别：买入
+                'token': self.token,        # 用户认证token
+                'ticket': self.ticket,      # 交易凭证
+                'code': code,               # 证券代码
+                'name': name,               # 证券名称
+                'price': str(price),        # 委托价格
+                'volume': str(volume)       # 委托数量
             }
             
             self.logger.info(f"正在买入: {code} {name}, 价格: {price}, 数量: {volume}")
@@ -2198,16 +2222,28 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             return None
     
     async def _sell_stock(self, code: str, name: str, price: float, volume: int) -> Optional[str]:
-        """卖出股票"""
+        """
+        卖出股票
+        
+        API参数规范：
+        - type: 报单类别，卖出为 'sale'
+        - token: 用户认证token
+        - ticket: 交易凭证
+        - code: 证券代码
+        - name: 证券名称
+        - price: 委托价格
+        - volume: 委托数量
+        """
         try:
             url = f"http://{self.trade_server}/sale"
             params = {
-                'token': self.token,
-                'ticket': self.ticket,
-                'code': code,
-                'name': name,
-                'price': str(price),
-                'volume': str(volume)
+                'type': 'sale',             # 报单类别：卖出
+                'token': self.token,        # 用户认证token
+                'ticket': self.ticket,      # 交易凭证
+                'code': code,               # 证券代码
+                'name': name,               # 证券名称
+                'price': str(price),        # 委托价格
+                'volume': str(volume)       # 委托数量
             }
             
             self.logger.info(f"正在卖出: {code} {name}, 价格: {price}, 数量: {volume}")
@@ -2240,7 +2276,19 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             return None
     
     async def _cancel_jvquant_order(self, order_id: str) -> bool:
-        """取消jvquant订单"""
+        """
+        取消jvquant订单（撤销委托）
+        
+        API参数规范：
+        - token: 用户账户的认证token，用于验证请求权限
+        - ticket: 交易凭证
+        - order_id: 委托编号
+        
+        Returns
+        -------
+        bool
+            True if 撤单成功, False otherwise
+        """
         try:
             if not self._check_login_status():
                 logger.error("未登录或登录已过期")
@@ -2248,9 +2296,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             url = f"http://{self.trade_server}/cancel"
             params = {
-                'token': self.token,
-                'ticket': self.ticket,
-                'order_id': order_id
+                'token': self.token,        # 用户认证token
+                'ticket': self.ticket,      # 交易凭证
+                'order_id': order_id        # 委托编号
             }
             
             logger.info(f"正在撤销委托: {order_id}")
@@ -2273,6 +2321,159 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             logger.error(f"撤单异常: {e}")
             return False
     
+    async def _check_orders(self) -> Optional[List[Dict]]:
+        """
+        查询委托列表（查询交易）
+        
+        API参数规范：
+        - token: 用户账户的认证token，用于验证请求权限
+        - ticket: 交易凭证
+        
+        返回参数：
+        - list: 交易列表
+          - order_id: 委托编号
+          - day: 委托日期
+          - time: 委托时间
+          - code: 证券代码
+          - name: 证券名称
+          - type: 委托类型
+          - status: 委托状态
+          - order_price: 委托价格
+          - order_volume: 委托数量
+          - deal_price: 成交价格
+          - deal_volume: 成交数量
+        
+        Returns
+        -------
+        Optional[List[Dict]]
+            委托列表，如果查询失败返回 None
+        """
+        try:
+            if not self._check_login_status():
+                logger.error("未登录或登录已过期")
+                return None
+            
+            url = f"http://{self.trade_server}/check_order"
+            params = {
+                'token': self.token,        # 用户认证token
+                'ticket': self.ticket,      # 交易凭证
+            }
+            
+            logger.info("查询委托列表...")
+            response = requests.get(url, params=params, timeout=10)
+            data = response.json()
+            
+            if data.get("code") == "0":
+                order_list = data.get('list', [])
+                logger.info(f"查询到 {len(order_list)} 条委托记录")
+                
+                # 更新本地订单缓存
+                for order_info in order_list:
+                    order_id = order_info.get('order_id')
+                    if order_id:
+                        self.orders[order_id] = {
+                            'order_id': order_id,
+                            'day': order_info.get('day'),
+                            'time': order_info.get('time'),
+                            'code': order_info.get('code'),
+                            'name': order_info.get('name'),
+                            'type': order_info.get('type'),
+                            'status': order_info.get('status'),
+                            'order_price': float(order_info.get('order_price', 0)),
+                            'order_volume': int(order_info.get('order_volume', 0)),
+                            'deal_price': float(order_info.get('deal_price', 0)),
+                            'deal_volume': int(order_info.get('deal_volume', 0)),
+                        }
+                
+                return order_list
+            else:
+                logger.error(f"查询委托失败: {data.get('message', '')}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"查询委托异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    async def _check_positions(self) -> Optional[Dict]:
+        """
+        查询持仓信息（查询持仓）
+        
+        API参数规范：
+        - token: 用户账户的认证token，用于验证请求权限
+        - ticket: 交易凭证
+        
+        返回参数：
+        - total: 账户总资产
+        - usable: 账户可用资金
+        - day_earn: 账户当日盈亏
+        - hold_earn: 账户持仓盈亏
+        - hold_list: 账户持仓列表
+          - code: 证券代码
+          - name: 证券名称
+          - hold_vol: 持仓数量
+          - usable_vol: 可用数量
+          - day_earn: 当日盈亏
+          - hold_earn: 持仓盈亏
+        
+        Returns
+        -------
+        Optional[Dict]
+            持仓信息字典，如果查询失败返回 None
+        """
+        try:
+            if not self._check_login_status():
+                logger.error("未登录或登录已过期")
+                return None
+            
+            url = f"http://{self.trade_server}/check_hold"
+            params = {
+                'token': self.token,        # 用户认证token
+                'ticket': self.ticket,      # 交易凭证
+            }
+            
+            logger.info("查询持仓信息...")
+            response = requests.get(url, params=params, timeout=10)
+            data = response.json()
+            
+            if data.get("code") == "0":
+                # 提取账户信息
+                account_info = {
+                    'total': float(data.get('total', 0)),           # 账户总资产
+                    'usable': float(data.get('usable', 0)),         # 可用资金
+                    'day_earn': float(data.get('day_earn', 0)),     # 当日盈亏
+                    'hold_earn': float(data.get('hold_earn', 0)),   # 持仓盈亏
+                    'hold_list': []
+                }
+                
+                # 解析持仓列表
+                hold_list = data.get('hold_list', [])
+                for position in hold_list:
+                    account_info['hold_list'].append({
+                        'code': position.get('code'),
+                        'name': position.get('name'),
+                        'hold_vol': int(position.get('hold_vol', 0)),      # 持仓数量
+                        'usable_vol': int(position.get('usable_vol', 0)),  # 可用数量
+                        'day_earn': float(position.get('day_earn', 0)),    # 当日盈亏
+                        'hold_earn': float(position.get('hold_earn', 0)),  # 持仓盈亏
+                    })
+                
+                logger.info(f"查询持仓成功: 总资产={account_info['total']}, "
+                          f"可用资金={account_info['usable']}, "
+                          f"持仓数量={len(account_info['hold_list'])}")
+                
+                return account_info
+            else:
+                logger.error(f"查询持仓失败: {data.get('message', '')}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"查询持仓异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
     # ========== NautilusTrader 接口方法 ==========
     
     def _convert_nautilus_order_to_jvquant(self, order) -> Optional[Dict]:
@@ -2289,32 +2490,34 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             else:
                 code = instrument_id
             
-            # 确定订单类型
-            order_type = 'market'  # 默认市价单
-            price = 0.0  # 市价单价格为0
+            # 动态获取股票名称
+            name = self._get_instrument_name(code, order.instrument_id)
             
+            # 确定委托价格
+            price = 0.0  # 市价单价格为0
             if hasattr(order, 'price') and order.price is not None:
-                order_type = 'limit'  # 限价单
                 price = float(order.price)
             
-            # 确定订单方向
+            # 确定买卖方向（转换为 API 要求的格式）
+            # 官方 API: 买入用 'buy', 卖出用 'sale'
             if side == 'buy':
-                side = 'buy'
+                order_type = 'buy'
             elif side == 'sell':
-                side = 'sell'
+                order_type = 'sale'  # ← 注意：卖出是 'sale' 不是 'sell'
             else:
                 logger.error(f"不支持的订单方向: {side}")
                 return None
             
-            # 构建jvquant订单格式
+            # 构建jvquant订单格式（严格按照官方API参数规范）
+            # 官方规范：type, token, ticket, code, name, price, volume
             jvquant_order = {
-                'type': order_type,
-                'side': side,
-                'code': code,
-                'name': '华夏中证500ETF',  # 固定名称
-                'price': price,
-                'quantity': quantity
+                'type': order_type,     # 报单类别：'buy' 或 'sale'
+                'code': code,           # 证券代码
+                'name': name,           # 证券名称（动态获取）
+                'price': price,         # 委托价格
+                'volume': quantity      # 委托数量
             }
+            # 注意：token 和 ticket 在调用 API 时添加，不在这里
             
             logger.info(f"订单转换: {order} -> {jvquant_order}")
             return jvquant_order
@@ -2322,6 +2525,48 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         except Exception as e:
             logger.error(f"订单转换失败: {e}")
             return None
+    
+    def _get_instrument_name(self, code: str, instrument_id) -> str:
+        """
+        获取股票名称
+        
+        优先级：
+        1. 从cache中查询instrument对象获取
+        2. 从映射表获取
+        3. 使用代码作为默认名称
+        
+        Parameters
+        ----------
+        code : str
+            股票代码
+        instrument_id
+            NautilusTrader InstrumentId对象
+            
+        Returns
+        -------
+        str
+            股票名称
+        """
+        try:
+            # 方法1: 尝试从cache获取instrument
+            if hasattr(self, 'cache') and self.cache:
+                instrument = self.cache.instrument(instrument_id)
+                if instrument:
+                    # NautilusTrader的Equity可能没有name属性
+                    # 但我们可以尝试从raw_symbol或其他属性获取
+                    logger.debug(f"从cache获取到instrument: {instrument}")
+            
+            # 方法2: 从映射表获取
+            if code in self._instrument_names:
+                return self._instrument_names[code]
+            
+            # 方法3: 使用代码作为默认名称
+            logger.warning(f"未找到代码{code}的名称映射，使用代码作为名称")
+            return code
+            
+        except Exception as e:
+            logger.error(f"获取股票名称失败: {e}, 使用代码作为默认名称")
+            return code
         
     async def _connect(self) -> None:
         """连接到执行源 - 使用集成的jvquant连接方法"""
@@ -2338,11 +2583,24 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 return
                 
             connected = await self.http_client.connect()
-            if connected:
-                self._set_connected(True)
-                logger.info("ETF159506合并执行客户端连接成功")
-            else:
+            if not connected:
                 logger.error("ETF159506合并执行客户端连接失败")
+                return
+            
+            logger.info(f"尝试自动登录交易柜台: {self.trade_account}")
+            login_success = await self.login(self.trade_account, self.trade_password)
+            
+            if login_success:
+                self._set_connected(True)
+                logger.info(f"✅ ETF159506执行客户端连接并登录成功")
+                logger.info(f"   交易凭证: {self.ticket}")
+                logger.info(f"   凭证有效期: {self.ticket_expire}秒")
+            else:
+                logger.error("❌ 交易柜台登录失败，执行客户端无法使用")
+                logger.warning("提示: 请检查trade_account和trade_password配置是否正确")
+                # 不设置connected为True，因为没有ticket无法交易
+                return
+           
             
         except Exception as e:
             logger.error(f"连接ETF159506合并执行客户端失败: {e}")
@@ -2427,21 +2685,24 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             logger.info(f"转换后的jvquant订单: {jvquant_order}")
             
-            # 调用集成的jvquant API提交订单
-            order_type = jvquant_order.get('type', 'market')
-            side = jvquant_order.get('side', 'buy')
+            # 提取订单参数
+            order_type = jvquant_order.get('type')  # 'buy' 或 'sale'（报单类别）
             code = jvquant_order.get('code', '159506')
             name = jvquant_order.get('name', '华夏中证500ETF')
             price = jvquant_order.get('price', 0.0)
-            volume = jvquant_order.get('quantity', 0)
+            volume = jvquant_order.get('volume', 0)
             
+            # 根据 type 参数调用对应的 API
+            # type='buy' 调用买入接口，type='sale' 调用卖出接口
             jvquant_order_id = None
-            if side == 'buy':
+            if order_type == 'buy':
+                logger.info(f"调用买入接口: {code} {name}, 价格: {price}, 数量: {volume}")
                 jvquant_order_id = await self._buy_stock(code, name, price, volume)
-            elif side == 'sell':
+            elif order_type == 'sale':
+                logger.info(f"调用卖出接口: {code} {name}, 价格: {price}, 数量: {volume}")
                 jvquant_order_id = await self._sell_stock(code, name, price, volume)
             else:
-                logger.error(f"不支持的订单方向: {side}")
+                logger.error(f"不支持的报单类别: {order_type}")
                 return
             
             if jvquant_order_id:
