@@ -569,14 +569,30 @@ def main():
             config = None
             adapter_config = {
                 'token': 'd0c519adcd47d266f1c96750d4e80aa6',
-                'stock_code': '159506'
+                'stock_code': '159506',
+                
+                # 邮件通知配置
+                'email_notification': {
+                    'enabled': True,                               # 启用邮件通知
+                    'sender_email': '954504788@qq.com',            # ✅ 你的QQ邮箱（发件人）
+                    'sender_password': 'fopwaoxwqpqmbedg',         # ✅ 你的授权码
+                    'receiver_email': 'he.d.z@outlook.com',        # ✅ Outlook邮箱（收件人）
+                }
             }
         else:
             logger.info("创建生产环境交易系统...")
             config = None
             adapter_config = {
                 'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 生产环境token
-                'stock_code': '159506'
+                'stock_code': '159506',
+                
+                # 邮件通知配置
+                'email_notification': {
+                    'enabled': True,                               # 启用邮件通知
+                    'sender_email': '954504788@qq.com',            # ✅ 你的QQ邮箱（发件人）
+                    'sender_password': 'fopwaoxwqpqmbedg',         # ✅ 你的授权码
+                    'receiver_email': 'he.d.z@outlook.com',        # ✅ Outlook邮箱（收件人）
+                }
             }
         
         # 运行系统（同步调用）

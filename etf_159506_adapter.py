@@ -1076,6 +1076,20 @@ class ETF159506Adapter:
         self.instrument_provider = ETF159506InstrumentProvider(self.http_client)
         # 注意：数据客户端和执行客户端现在都由NautilusTrader管理，不再在这里初始化
         
+        # 初始化邮件通知器（可选）
+        email_config = config.get('email_notification', {})
+        if email_config and email_config.get('enabled', False):
+            try:
+                from email_notifier import EmailNotifier
+                self.email_notifier = EmailNotifier(email_config)
+                self.logger.info("邮件通知功能已启用")
+            except Exception as e:
+                self.logger.warning(f"邮件通知功能初始化失败: {e}")
+                self.email_notifier = None
+        else:
+            self.email_notifier = None
+            self.logger.info("邮件通知功能未启用")
+        
         self.is_connected = False
         self.connection_attempts = 0
         self.max_connection_attempts = 1
@@ -2098,6 +2112,14 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         }
         # 优先使用配置中的映射，否则使用默认映射
         self._instrument_names = jvquant_config.get('instrument_names', default_names)
+        
+        # 初始化邮件通知器（从全局适配器获取）
+        if global_adapter and hasattr(global_adapter, 'email_notifier'):
+            self.email_notifier = global_adapter.email_notifier
+            if self.email_notifier:
+                logger.info("执行客户端邮件通知功能已启用")
+        else:
+            self.email_notifier = None
     
     # ========== jvquant API 方法 ==========
     
@@ -2712,6 +2734,37 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 nautilus_order_id = str(command.order.client_order_id)
                 self._order_id_mapping[nautilus_order_id] = jvquant_order_id
                 logger.info(f"订单ID映射: {nautilus_order_id} -> {jvquant_order_id}")
+                
+                # 发送综合邮件通知（订单 + 账户信息）
+                if self.email_notifier:
+                    try:
+                        # 准备订单信息
+                        notification_info = {
+                            'code': code,
+                            'name': name,
+                            'type': order_type,  # 'buy' 或 'sale'
+                            'price': price,
+                            'volume': volume,
+                            'order_id': jvquant_order_id
+                        }
+                        
+                        # 查询账户信息（用于合并到邮件中）
+                        account_info = None
+                        try:
+                            account_info = await self._check_positions()
+                            if account_info:
+                                logger.info(f"查询账户信息成功: 总资产={account_info.get('total')}")
+                        except Exception as e:
+                            logger.warning(f"查询账户信息失败（邮件将只包含订单信息）: {e}")
+                        
+                        # 发送综合通知邮件
+                        self.email_notifier.send_order_with_account_notification(
+                            notification_info,
+                            account_info  # 传入账户信息（可能为None）
+                        )
+                        logger.info("📧 订单和账户综合邮件通知已发送")
+                    except Exception as e:
+                        logger.warning(f"发送邮件通知失败（不影响订单）: {e}")
                 
             else:
                 logger.error("订单提交失败")
