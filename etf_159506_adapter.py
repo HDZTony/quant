@@ -1514,7 +1514,46 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         try:
             from nautilus_trader.model.objects import Price, Quantity
             from nautilus_trader.core.datetime import dt_to_unix_nanos
+            from datetime import time, datetime
             import pandas as pd
+            
+            # ====== 使用数据时间而不是系统时间 ======
+            # 从data中获取时间戳（jvquant格式: "HH:MM:SS"）
+            data_timestamp = data.get('timestamp', '')
+            
+            if not data_timestamp or ':' not in data_timestamp:
+                # 如果没有数据时间戳，回退到系统时间（但记录警告）
+                logger.warning(f"数据中缺少timestamp字段，回退到系统时间: {data}")
+                current_time = pd.Timestamp.now(tz='UTC')
+                beijing_time = current_time.tz_convert('Asia/Shanghai')
+            else:
+                # 解析数据时间戳 "HH:MM:SS"
+                try:
+                    time_parts = data_timestamp.split(':')
+                    hours, minutes, seconds = map(int, time_parts)
+                    
+                    # 使用当前日期 + 数据时间构建完整时间戳
+                    today = datetime.now().date()
+                    data_datetime = datetime.combine(today, datetime.min.time().replace(
+                        hour=hours, minute=minutes, second=seconds
+                    ))
+                    
+                    # 转换为pandas Timestamp（假设数据时间是北京时间）
+                    beijing_time = pd.Timestamp(data_datetime, tz='Asia/Shanghai')
+                    current_time = beijing_time.tz_convert('UTC')
+                    
+                    logger.debug(f"使用数据时间: {data_timestamp} -> {beijing_time}")
+                except Exception as e:
+                    logger.warning(f"解析数据时间戳失败: {data_timestamp}, 错误: {e}, 回退到系统时间")
+                    current_time = pd.Timestamp.now(tz='UTC')
+                    beijing_time = current_time.tz_convert('Asia/Shanghai')
+            
+            current_time_only = beijing_time.time()
+            
+            # 午休时间：11:30-13:00，不处理数据
+            if time(11, 30) <= current_time_only < time(13, 0):
+                logger.debug(f"数据时间 {beijing_time.strftime('%H:%M:%S')} 在午休时间，跳过Bar聚合")
+                return None
             
             # 获取价格和累计成交量
             price = data.get('price', 0)
@@ -1526,9 +1565,7 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
             if isinstance(cumulative_volume, str):
                 cumulative_volume = float(cumulative_volume)
             
-            # 获取当前时间并提取分钟标识
-            current_time = pd.Timestamp.now(tz='UTC')
-            beijing_time = current_time.tz_convert('Asia/Shanghai')
+            # 使用数据时间提取分钟标识
             minute_key = beijing_time.strftime('%H:%M')  # "09:30"
             
             # bar_type的字符串表示作为key
@@ -1564,7 +1601,7 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                     'ts_start': dt_to_unix_nanos(current_time),
                     'start_volume': cumulative_volume  # 保存起始累计量
                 }
-                logger.info(f"[Bar聚合] 首次初始化: {minute_key}, 起始累计量={cumulative_volume:,.0f}")
+                logger.info(f"[Bar聚合] 首次初始化: {minute_key} (数据时间: {data_timestamp}), 起始累计量={cumulative_volume:,.0f}")
                 
             elif self.current_minute_key[bar_type_key] != minute_key:
                 # 进入新的一分钟
@@ -1575,7 +1612,7 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                 # 这样可以避免丢失分钟边界的数据
                 last_volume = self.last_minute_cumulative_volume.get(bar_type_key, cumulative_volume)
                 
-                logger.info(f"[Bar聚合] 分钟切换: {old_minute} -> {minute_key}")
+                logger.info(f"[Bar聚合] 分钟切换: {old_minute} -> {minute_key} (数据时间: {data_timestamp})")
                 logger.info(f"  上次累计量: {last_volume:,.0f}")
                 logger.info(f"  当前累计量: {cumulative_volume:,.0f}")
                 logger.info(f"  边界增量: {cumulative_volume - last_volume:,.0f} (将计入新分钟)")
@@ -2149,7 +2186,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             return False
         
         try:
-            url = f"http://{self.trade_server}/login"
+            # trade_server 已包含完整URL (如 http://121.43.57.182:21888)
+            url = f"{self.trade_server}/login"
             params = {
                 'token': self.token,
                 'acc': account,
@@ -2203,7 +2241,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         - volume: 委托数量
         """
         try:
-            url = f"http://{self.trade_server}/buy"
+            url = f"{self.trade_server}/buy"
             params = {
                 'type': 'buy',              # 报单类别：买入
                 'token': self.token,        # 用户认证token
@@ -2257,7 +2295,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         - volume: 委托数量
         """
         try:
-            url = f"http://{self.trade_server}/sale"
+            url = f"{self.trade_server}/sale"
             params = {
                 'type': 'sale',             # 报单类别：卖出
                 'token': self.token,        # 用户认证token
@@ -2316,7 +2354,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.error("未登录或登录已过期")
                 return False
             
-            url = f"http://{self.trade_server}/cancel"
+            url = f"{self.trade_server}/cancel"
             params = {
                 'token': self.token,        # 用户认证token
                 'ticket': self.ticket,      # 交易凭证
@@ -2375,7 +2413,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.error("未登录或登录已过期")
                 return None
             
-            url = f"http://{self.trade_server}/check_order"
+            url = f"{self.trade_server}/check_order"
             params = {
                 'token': self.token,        # 用户认证token
                 'ticket': self.ticket,      # 交易凭证
@@ -2449,7 +2487,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.error("未登录或登录已过期")
                 return None
             
-            url = f"http://{self.trade_server}/check_hold"
+            url = f"{self.trade_server}/check_hold"
             params = {
                 'token': self.token,        # 用户认证token
                 'ticket': self.ticket,      # 交易凭证

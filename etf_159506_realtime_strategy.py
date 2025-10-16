@@ -907,6 +907,16 @@ class ETF159506Strategy(Strategy):
 
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
+        # ====== 首先检查交易时间（午休时间不生成信号） ======
+        bar_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        bar_time_beijing = bar_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_time = bar_time_beijing.time()
+        
+        # 午休时间：11:30-13:00
+        if time(11, 30) <= current_time < time(13, 0):
+            self._log.debug(f"当前时间 {current_time} 在午休时间，跳过MACD信号检测")
+            return
+        
         # 添加调试信息
         self._log.info(f"检查MACD信号: macd_history长度={len(self.macd_history)}, signal_history长度={len(self.signal_history)}")
         
@@ -1306,6 +1316,16 @@ class ETF159506Strategy(Strategy):
     
     def detect_and_record_extremes(self, bar: Bar):
         """改进的极值点检测：每个新K线到来时检测上一个点的极值"""
+        # ====== 首先检查交易时间（午休时间不检测极值点） ======
+        bar_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        bar_time_beijing = bar_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_time = bar_time_beijing.time()
+        
+        # 午休时间：11:30-13:00
+        if time(11, 30) <= current_time < time(13, 0):
+            self._log.debug(f"当前时间 {current_time} 在午休时间，跳过极值点检测")
+            return
+        
         self._log.info(f"开始极值点检测: price_history长度={len(self.price_history)}, macd_history长度={len(self.macd_history)}")
         
         if len(self.price_history) < 3:
@@ -1460,6 +1480,16 @@ class ETF159506Strategy(Strategy):
         
     def handle_top_divergence(self, bar: Bar, action: str):
         """处理顶背离信号"""
+        # ====== 首先检查交易时间（午休时间不生成信号） ======
+        bar_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        bar_time_beijing = bar_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_time = bar_time_beijing.time()
+        
+        # 午休时间：11:30-13:00
+        if time(11, 30) <= current_time < time(13, 0):
+            self._log.debug(f"当前时间 {current_time} 在午休时间，跳过顶背离信号处理")
+            return
+        
         self._log.info("检测到顶背离信号：DIF创新高但价格未创新高，看跌信号")
         self.last_divergence_signal = "top_divergence"
         
@@ -1487,6 +1517,16 @@ class ETF159506Strategy(Strategy):
     
     def handle_bottom_divergence(self, bar: Bar, action: str):
         """处理底背离信号"""
+        # ====== 首先检查交易时间（午休时间不生成信号） ======
+        bar_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        bar_time_beijing = bar_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        current_time = bar_time_beijing.time()
+        
+        # 午休时间：11:30-13:00
+        if time(11, 30) <= current_time < time(13, 0):
+            self._log.debug(f"当前时间 {current_time} 在午休时间，跳过底背离信号处理")
+            return
+        
         self._log.info("检测到底背离信号：DIF创新低但价格未创新低，看涨信号")
         self.last_divergence_signal = "bottom_divergence"
         
