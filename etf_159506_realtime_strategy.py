@@ -19,6 +19,7 @@ from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.trading.strategy import StrategyConfig
 from nautilus_trader.model import Quantity
 from nautilus_trader.model.data import Bar
+from nautilus_trader.model.currencies import CNY
 from collections import deque
 import pandas as pd
 from datetime import datetime, time, date, timedelta
@@ -1563,8 +1564,16 @@ class ETF159506Strategy(Strategy):
         # 计算交易数量
         if self.trade_size is None:
             account = self.cache.account_for_venue(self.config.venue)
-            available_balance = account.balance_total().as_double()
+            # ✅ 修复：使用 balance_free 获取可用余额
+            free_balance = account.balance_free(CNY)
+            if free_balance is None:
+                self._log.error("无法获取CNY可用余额，跳过买入信号")
+                return
+            
+            available_balance = free_balance.as_double()
             current_price = bar.close.as_double()
+            
+            self._log.info(f"MACD买入信号 - 可用余额: {available_balance:.2f} CNY, 当前价格: {current_price:.4f}")
             
             # 检查可用余额
             if available_balance <= 0:
@@ -1670,8 +1679,16 @@ class ETF159506Strategy(Strategy):
         # 计算交易数量
         if self.trade_size is None:
             account = self.cache.account_for_venue(self.config.venue)
-            available_balance = account.balance_total().as_double()
+            # ✅ 修复：使用 balance_free 获取可用余额
+            free_balance = account.balance_free(CNY)
+            if free_balance is None:
+                self._log.error("无法获取CNY可用余额，跳过背离买入信号")
+                return
+            
+            available_balance = free_balance.as_double()
             current_price = bar.close.as_double()
+            
+            self._log.info(f"背离买入信号 - 可用余额: {available_balance:.2f} CNY, 当前价格: {current_price:.4f}")
             
             if available_balance <= 0:
                 self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过背离买入信号")
@@ -1928,16 +1945,22 @@ class ETF159506Strategy(Strategy):
             #     self.last_scheduled_buy_date = current_date
             #     return
             
-            # 执行定时买入
-            self.execute_scheduled_buy(bar)
-            
-            # 记录已执行定时买入的日期
-            self.last_scheduled_buy_date = current_date
+            # 执行定时买入，只有成功时才标记日期
+            success = self.execute_scheduled_buy(bar)
+            if success:
+                self.last_scheduled_buy_date = current_date
+                self._log.info(f"定时买入执行成功，已标记日期: {current_date}")
+            else:
+                self._log.warning(f"定时买入执行失败，将在下个K线重试")
         else:
             self._log.info(f"还未到达定时买入时间，当前时间: {current_time_only.strftime('%H:%M:%S')}, 目标时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}")
 
-    def execute_scheduled_buy(self, bar: Bar):
-        """执行定时买入"""
+    def execute_scheduled_buy(self, bar: Bar) -> bool:
+        """执行定时买入
+        
+        Returns:
+            bool: True表示订单成功提交，False表示执行失败
+        """
         # 获取北京时间用于日志显示
         current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
         current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
@@ -1951,20 +1974,36 @@ class ETF159506Strategy(Strategy):
                 self._log.info("测试模式下无账户信息，使用固定交易数量")
                 trade_quantity = Quantity.from_int(100)  # 测试模式下使用固定数量
             else:
-                available_balance = account.balance_total().as_double()
+                # ✅ 修复：使用 balance_free 获取可用余额，而不是 balance_total
+                free_balance = account.balance_free(CNY)
+                if free_balance is None:
+                    self._log.error("无法获取CNY可用余额，定时买入失败")
+                    return False
+                
+                available_balance = free_balance.as_double()
                 current_price = bar.close.as_double()
+                
+                # 详细的账户信息日志
+                total_balance = account.balance_total(CNY)
+                locked_balance = account.balance_locked(CNY)
+                self._log.info(f"账户余额详情: 总余额={total_balance.as_double():.2f}, "
+                             f"可用余额={available_balance:.2f}, "
+                             f"冻结余额={locked_balance.as_double() if locked_balance else 0:.2f}")
                 
                 # 检查可用余额
                 if available_balance <= 0:
-                    self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过定时买入")
-                    return
+                    self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法执行定时买入")
+                    return False
                     
-                quantity = int(available_balance / current_price)  # 使用100%资金满仓交易
+                quantity = int(available_balance / current_price)  # 使用100%可用资金
+                
+                self._log.info(f"交易计算: 可用余额={available_balance:.2f}, 当前价格={current_price:.4f}, "
+                             f"计算数量={quantity}, 预计花费={quantity * current_price:.2f}")
                 
                 # 检查计算出的数量是否有效
                 if quantity <= 0:
-                    self._log.info(f"计算出的交易数量无效: {quantity}，跳过定时买入")
-                    return
+                    self._log.warning(f"计算出的交易数量无效: {quantity}，无法执行定时买入")
+                    return False
                     
                 trade_quantity = Quantity.from_int(quantity)
         else:
@@ -1991,6 +2030,7 @@ class ETF159506Strategy(Strategy):
         self.trade_signals.append(trade_signal)
         
         self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        return True
         
     def is_after_scheduled_time(self, bar: Bar) -> bool:
         """检查当前时间是否在定时买入时间（2:50分）之后"""

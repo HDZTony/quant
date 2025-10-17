@@ -28,7 +28,8 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.data import QuoteTick, TradeTick, Bar
 from nautilus_trader.model.enums import BarAggregation, PriceType, AggressorSide, OmsType, AccountType, OrderStatus
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import Quantity, AccountBalance, Money
+from nautilus_trader.model.currencies import CNY
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import GenerateOrderStatusReports
 from nautilus_trader.execution.reports import OrderStatusReport
@@ -2157,6 +2158,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.info("执行客户端邮件通知功能已启用")
         else:
             self.email_notifier = None
+        
+        # 账户状态更新任务相关
+        self._account_update_task = None
+        self._account_update_interval = 10  # 每10秒更新一次账户状态
     
     # ========== jvquant API 方法 ==========
     
@@ -2534,6 +2539,81 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             traceback.print_exc()
             return None
     
+    async def _update_account_state(self) -> None:
+        """
+        查询并更新账户状态到Nautilus Cache
+        
+        此方法负责：
+        1. 从JVQuant API获取账户信息
+        2. 构建AccountBalance对象
+        3. 调用generate_account_state更新Cache
+        """
+        try:
+            # 1. 查询账户信息
+            account_info = await self._check_positions()
+            if not account_info:
+                self.logger.warning("无法获取账户信息，跳过账户状态更新")
+                return
+            
+            # 2. 提取账户余额信息
+            total = account_info['total']        # 总资产
+            usable = account_info['usable']      # 可用资金
+            locked = total - usable              # 冻结资金 = 总资产 - 可用资金
+            
+            # 3. 构建AccountBalance对象
+            # 关键：free字段必须设置为usable（可用资金），这是策略中balance_free()返回的值
+            balances = [
+                AccountBalance(
+                    total=Money(total, CNY),      # 总余额
+                    locked=Money(locked, CNY),    # 冻结余额
+                    free=Money(usable, CNY),      # ✅ 可用余额（最重要！）
+                )
+            ]
+            
+            # 4. 调用generate_account_state更新Cache
+            self.generate_account_state(
+                balances=balances,
+                margins=[],                        # 现金账户，无保证金
+                reported=True,                     # 数据来自券商API
+                ts_event=self._clock.timestamp_ns(),
+            )
+            
+            # 5. 记录日志
+            self.logger.info(
+                f"✅ 账户状态已更新: "
+                f"总资产={total:.2f} CNY, "
+                f"可用={usable:.2f} CNY, "
+                f"冻结={locked:.2f} CNY"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"❌ 更新账户状态失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def _periodic_account_update(self) -> None:
+        """
+        定期更新账户状态的后台任务
+        
+        此任务在连接时启动，断开连接时自动取消
+        每隔一定时间间隔（默认10秒）自动查询并更新账户状态
+        """
+        try:
+            self.logger.info(f"✅ 账户状态定期更新任务已启动，更新间隔: {self._account_update_interval}秒")
+            
+            while self.is_connected:
+                # 等待指定间隔
+                await asyncio.sleep(self._account_update_interval)
+                
+                # 更新账户状态
+                await self._update_account_state()
+                
+        except asyncio.CancelledError:
+            self.logger.info("账户更新任务已取消")
+            raise
+        except Exception as e:
+            self.logger.exception("账户更新任务异常", e)
+    
     # ========== NautilusTrader 接口方法 ==========
     
     def _convert_nautilus_order_to_jvquant(self, order) -> Optional[Dict]:
@@ -2655,6 +2735,16 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.info(f"✅ ETF159506执行客户端连接并登录成功")
                 logger.info(f"   交易凭证: {self.ticket}")
                 logger.info(f"   凭证有效期: {self.ticket_expire}秒")
+                
+                # ✅ 初始化账户状态
+                logger.info("📊 初始化账户状态...")
+                await self._update_account_state()
+                
+                # ✅ 启动账户状态定期更新任务
+                logger.info("🔄 启动账户状态定期更新任务...")
+                self._account_update_task = self.create_task(
+                    self._periodic_account_update()
+                )
             else:
                 logger.error("❌ 交易柜台登录失败，执行客户端无法使用")
                 logger.warning("提示: 请检查trade_account和trade_password配置是否正确")
@@ -2670,6 +2760,19 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """断开执行客户端连接 - 使用集成的jvquant断开方法"""
         try:
             logger.info("断开ETF159506合并执行客户端...")
+            
+            # ✅ 取消账户状态更新任务
+            if self._account_update_task is not None:
+                logger.info("🛑 取消账户状态更新任务...")
+                self._account_update_task.cancel()
+                try:
+                    await self._account_update_task
+                except asyncio.CancelledError:
+                    logger.info("账户更新任务已成功取消")
+                except Exception as e:
+                    logger.warning(f"取消账户更新任务时发生异常: {e}")
+                finally:
+                    self._account_update_task = None
             
             # 使用集成的jvquant断开方法
             await self.http_client.disconnect()
