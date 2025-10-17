@@ -31,9 +31,18 @@ from nautilus_trader.model.enums import BarAggregation, PriceType, AggressorSide
 from nautilus_trader.model.objects import Quantity, AccountBalance, Money
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.execution.messages import GenerateOrderStatusReports
-from nautilus_trader.execution.reports import OrderStatusReport
+from nautilus_trader.execution.messages import (
+    GenerateOrderStatusReports,
+    GenerateFillReports,
+    GeneratePositionStatusReports,
+    CancelAllOrders,
+    BatchCancelOrders,
+    ModifyOrder,
+)
+from nautilus_trader.execution.reports import OrderStatusReport, FillReport, PositionStatusReport
+from nautilus_trader.model.enums import OrderSide, OrderType, LiquiditySide, PositionSide
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.serialization.arrow.serializer import register_arrow
@@ -2924,15 +2933,26 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             logger.error(f"提交订单列表失败: {e}")
             raise
     
-    async def _modify_order(self, command) -> None:
-        """修改订单"""
-        try:
-            logger.info(f"修改订单: {command.order}")
-            # TODO: 实现订单修改逻辑
-            logger.info("订单修改成功（模拟）")
-        except Exception as e:
-            logger.error(f"修改订单失败: {e}")
-            raise
+    async def _modify_order(self, command: ModifyOrder) -> None:
+        """
+        修改订单 - JVQuant不支持订单修改
+        
+        JVQuant API不提供订单修改功能，需要先撤单再重新下单
+        """
+        self.logger.warning(
+            f"JVQuant不支持订单修改，订单 {command.client_order_id} 修改请求被拒绝。"
+            f"建议先撤单再重新下单"
+        )
+        
+        # 生成订单修改拒绝事件
+        self.generate_order_modify_rejected(
+            strategy_id=command.strategy_id,
+            instrument_id=command.instrument_id,
+            client_order_id=command.client_order_id,
+            venue_order_id=command.venue_order_id,
+            reason="JVQuant不支持订单修改，请撤单后重新下单",
+            ts_event=self._clock.timestamp_ns(),
+        )
     
     async def _cancel_order(self, command) -> None:
         """取消订单 - 使用集成的jvquant API"""
@@ -2968,46 +2988,240 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             logger.error(f"取消订单失败: {e}")
             raise
     
-    async def _cancel_all_orders(self, command) -> None:
-        """取消所有订单"""
+    async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
+        """
+        取消所有订单
+        
+        查询当前所有委托订单，然后逐个取消指定证券的订单
+        """
         try:
-            logger.info(f"取消所有订单: {command.instrument_id}")
-            # TODO: 实现取消所有订单逻辑
-            logger.info("所有订单取消成功（模拟）")
+            instrument_id = command.instrument_id
+            logger.info(f"取消所有订单: {instrument_id}")
+            
+            # 检查连接状态
+            if not self.is_connected:
+                logger.error("执行客户端未连接，无法取消订单")
+                return
+            
+            # 查询当前所有委托订单
+            orders = await self._check_orders()
+            if not orders:
+                logger.info("没有需要取消的订单")
+                return
+            
+            # 提取证券代码（如从'159506.SZSE'提取'159506'）
+            code = str(instrument_id.symbol.value).split('.')[0]
+            
+            # 过滤出指定证券的未完成订单
+            target_orders = [
+                o for o in orders 
+                if o.get('code') == code and o.get('status') not in ['已成', '已撤', '废单']
+            ]
+            
+            if not target_orders:
+                logger.info(f"证券 {code} 没有需要取消的订单")
+                return
+            
+            logger.info(f"找到 {len(target_orders)} 个待取消订单")
+            
+            # 逐个取消订单
+            success_count = 0
+            failed_count = 0
+            
+            for order in target_orders:
+                order_id = order.get('order_id')
+                if order_id:
+                    try:
+                        success = await self._cancel_jvquant_order(order_id)
+                        if success:
+                            success_count += 1
+                            logger.info(f"✅ 订单 {order_id} 取消成功")
+                        else:
+                            failed_count += 1
+                            logger.warning(f"❌ 订单 {order_id} 取消失败")
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"❌ 取消订单 {order_id} 异常: {e}")
+            
+            logger.info(
+                f"取消所有订单完成: 成功 {success_count}/{len(target_orders)}, "
+                f"失败 {failed_count}/{len(target_orders)}"
+            )
+            
         except Exception as e:
             logger.error(f"取消所有订单失败: {e}")
             raise
     
-    async def generate_fill_reports(self, command) -> list:
+    async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
+        """
+        批量取消订单
+        
+        JVQuant不支持批量取消API，通过循环调用单个取消订单实现
+        """
+        logger.info(
+            f"批量取消订单: 共 {len(command.cancels)} 个订单 "
+            f"(JVQuant不支持批量取消API，将逐个取消)"
+        )
+        
+        success_count = 0
+        failed_count = 0
+        
+        for cancel_command in command.cancels:
+            try:
+                await self._cancel_order(cancel_command)
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.warning(
+                    f"取消订单失败: {cancel_command.client_order_id}, 错误: {e}"
+                )
+                # 继续处理其他订单，不要因为单个失败而中断
+        
+        logger.info(
+            f"批量取消完成: 成功 {success_count}/{len(command.cancels)}, "
+            f"失败 {failed_count}/{len(command.cancels)}"
+        )
+    
+    async def generate_fill_reports(
+        self, 
+        command: GenerateFillReports
+    ) -> list[FillReport]:
         """
         生成成交报告列表
         
-        这个方法是为了满足 NautilusTrader LiveExecutionClient 基类的要求
-        在我们的实现中，由于 jvquant API 的限制，我们返回空列表
+        查询委托列表，提取已成交或部分成交的订单生成成交报告
         """
         try:
             logger.info(f"生成成交报告: {command}")
-            # 由于 jvquant API 的限制，我们无法获取详细的成交报告
-            # 返回空列表表示没有成交报告
-            return []
+            
+            # 查询所有委托订单
+            orders = await self._check_orders()
+            if not orders:
+                logger.info("没有委托订单")
+                return []
+            
+            fill_reports = []
+            
+            for order in orders:
+                # 只处理有成交量的订单
+                deal_volume = int(order.get('deal_volume', 0))
+                if deal_volume <= 0:
+                    continue
+                
+                try:
+                    # 解析订单信息
+                    code = order.get('code')
+                    instrument_id = InstrumentId.from_str(f"{code}.SZSE")
+                    
+                    # 解析订单方向
+                    order_type = order.get('type', '')
+                    if order_type == '买入' or order_type == 'buy':
+                        order_side = OrderSide.BUY
+                    elif order_type == '卖出' or order_type == 'sale':
+                        order_side = OrderSide.SELL
+                    else:
+                        logger.warning(f"未知订单类型: {order_type}")
+                        continue
+                    
+                    # 解析价格和数量
+                    deal_price = float(order.get('deal_price', 0))
+                    if deal_price <= 0:
+                        logger.warning(f"无效的成交价格: {deal_price}")
+                        continue
+                    
+                    # 构建成交报告
+                    report = FillReport(
+                        account_id=self.account_id,
+                        instrument_id=instrument_id,
+                        venue_order_id=VenueOrderId(order.get('order_id')),
+                        trade_id=TradeId(order.get('order_id')),  # JVQuant可能没有单独的成交ID
+                        order_side=order_side,
+                        last_qty=Quantity.from_int(deal_volume),
+                        last_px=Price.from_str(str(deal_price)),
+                        commission=Money(0, CNY),  # JVQuant API未提供佣金信息
+                        liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                        ts_event=self._clock.timestamp_ns(),
+                        report_id=UUID4(),
+                    )
+                    
+                    fill_reports.append(report)
+                    logger.debug(f"生成成交报告: {code} {order_side} {deal_volume}@{deal_price}")
+                    
+                except Exception as e:
+                    logger.warning(f"解析订单 {order.get('order_id')} 失败: {e}")
+                    continue
+            
+            logger.info(f"✅ 生成了 {len(fill_reports)} 个成交报告")
+            return fill_reports
+            
         except Exception as e:
             logger.error(f"生成成交报告失败: {e}")
+            import traceback
+            traceback.print_exc()
             return []
     
-    async def generate_position_status_reports(self, command) -> list:
+    async def generate_position_status_reports(
+        self, 
+        command: GeneratePositionStatusReports
+    ) -> list[PositionStatusReport]:
         """
         生成持仓状态报告列表
         
-        这个方法是为了满足 NautilusTrader LiveExecutionClient 基类的要求
-        在我们的实现中，由于 jvquant API 的限制，我们返回空列表
+        查询持仓信息，生成持仓状态报告
         """
         try:
             logger.info(f"生成持仓状态报告: {command}")
-            # 由于 jvquant API 的限制，我们无法获取详细的持仓状态报告
-            # 返回空列表表示没有持仓状态报告
-            return []
+            
+            # 查询持仓信息
+            account_info = await self._check_positions()
+            if not account_info or not account_info.get('hold_list'):
+                logger.info("没有持仓")
+                return []
+            
+            position_reports = []
+            
+            for position in account_info['hold_list']:
+                try:
+                    # 解析持仓信息
+                    code = position.get('code')
+                    hold_vol = int(position.get('hold_vol', 0))
+                    
+                    # 跳过空持仓
+                    if hold_vol <= 0:
+                        continue
+                    
+                    # 构建instrument_id
+                    instrument_id = InstrumentId.from_str(f"{code}.SZSE")
+                    
+                    # 构建持仓状态报告
+                    # 现金账户使用FLAT position_side
+                    report = PositionStatusReport(
+                        account_id=self.account_id,
+                        instrument_id=instrument_id,
+                        position_side=PositionSide.FLAT,  # 现金账户使用FLAT
+                        quantity=Quantity.from_int(hold_vol),
+                        report_id=UUID4(),
+                        ts_last=self._clock.timestamp_ns(),
+                        ts_init=self._clock.timestamp_ns(),
+                    )
+                    
+                    position_reports.append(report)
+                    logger.debug(
+                        f"生成持仓报告: {code} 持仓量={hold_vol}, "
+                        f"可用量={position.get('usable_vol', 0)}"
+                    )
+                    
+                except Exception as e:
+                    logger.warning(f"解析持仓 {position.get('code')} 失败: {e}")
+                    continue
+            
+            logger.info(f"✅ 生成了 {len(position_reports)} 个持仓报告")
+            return position_reports
+            
         except Exception as e:
             logger.error(f"生成持仓状态报告失败: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
 
