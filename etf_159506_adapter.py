@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from decimal import Decimal
 import json
+from pathlib import Path
 
 # NautilusTrader imports
 from nautilus_trader.common.providers import InstrumentProvider
@@ -2171,7 +2172,102 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         
         # 账户状态更新任务相关
         self._account_update_task = None
-        self._account_update_interval = 10  # 每10秒更新一次账户状态
+        self._account_update_interval = 3600  # 每1小时更新一次账户状态
+        
+        # 凭证持久化文件路径
+        self._ticket_cache_file = Path("./data_catalog/.jvquant_ticket_cache.json")
+    
+    # ========== 凭证管理方法 ==========
+    
+    def _save_ticket_to_file(self) -> None:
+        """保存交易凭证到本地文件"""
+        try:
+            if not self.ticket:
+                return
+            
+            ticket_data = {
+                'ticket': self.ticket,
+                'ticket_expire': self.ticket_expire,
+                'trade_server': self.trade_server,
+                'trade_account': self.trade_account,
+                'saved_at': time.time(),
+            }
+            
+            # 确保目录存在
+            self._ticket_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 保存到文件
+            with open(self._ticket_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(ticket_data, f, indent=2)
+            
+            self.logger.debug(f"✅ 凭证已保存到: {self._ticket_cache_file}")
+            
+        except Exception as e:
+            self.logger.warning(f"保存凭证失败: {e}")
+    
+    def _load_ticket_from_file(self) -> bool:
+        """从本地文件加载交易凭证
+        
+        Returns
+        -------
+        bool
+            成功加载返回True，否则返回False
+        """
+        try:
+            if not self._ticket_cache_file.exists():
+                self.logger.debug("凭证缓存文件不存在")
+                return False
+            
+            with open(self._ticket_cache_file, 'r', encoding='utf-8') as f:
+                ticket_data = json.load(f)
+            
+            # 验证账户是否匹配
+            if ticket_data.get('trade_account') != self.trade_account:
+                self.logger.warning("凭证账户不匹配，忽略缓存")
+                return False
+            
+            # 加载凭证信息
+            self.ticket = ticket_data.get('ticket')
+            self.ticket_expire = ticket_data.get('ticket_expire')
+            self.trade_server = ticket_data.get('trade_server')
+            
+            self.logger.debug(f"✅ 从缓存加载凭证: {self.ticket[:20]}...")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"加载凭证失败: {e}")
+            return False
+    
+    def _clear_ticket_cache(self) -> None:
+        """清理凭证缓存文件"""
+        try:
+            if self._ticket_cache_file.exists():
+                self._ticket_cache_file.unlink()
+                self.logger.debug("✅ 凭证缓存已清理")
+        except Exception as e:
+            self.logger.warning(f"清理凭证缓存失败: {e}")
+    
+    def _is_ticket_valid(self) -> bool:
+        """
+        检查凭证是否有效
+        
+        Returns
+        -------
+        bool
+            凭证有效返回True，否则返回False
+        """
+        if not self.ticket:
+            return False
+        
+        # 检查是否过期（留60秒余量）
+        if self.ticket_expire:
+            remaining = self.ticket_expire - time.time()
+            if remaining <= 60:
+                self.logger.debug(f"凭证即将过期或已过期，剩余时间: {remaining:.0f}秒")
+                return False
+            self.logger.debug(f"凭证有效，剩余时间: {remaining:.0f}秒")
+        
+        return True
     
     # ========== jvquant API 方法 ==========
     
@@ -2227,6 +2323,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     self.logger.info(f"登录成功! 交易凭证: {self.ticket} (无过期时间)")
                 
                 self.is_logged_in = True
+                
+                # ✅ 保存凭证到本地文件，供下次复用
+                self._save_ticket_to_file()
+                
                 return True
             else:
                 self.logger.error(f"登录失败: {data}")
@@ -2614,10 +2714,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         定期更新账户状态的后台任务
         
         此任务在连接时启动，断开连接时自动取消
-        每隔一定时间间隔（默认10秒）自动查询并更新账户状态
+        每隔一定时间间隔（默认3600秒/1小时）自动查询并更新账户状态
         """
         try:
-            self.logger.info(f"✅ 账户状态定期更新任务已启动，更新间隔: {self._account_update_interval}秒")
+            self.logger.info(f"✅ 账户状态定期更新任务已启动，更新间隔: {self._account_update_interval}秒 ({self._account_update_interval/60:.0f}分钟)")
             
             while self.is_connected:
                 # 等待指定间隔
@@ -2734,19 +2834,43 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             if not self.token:
                 logger.error("缺少token配置")
                 return
-                
-            # 获取交易服务器地址
-            if not await self._get_trade_server():
-                logger.error("无法获取交易服务器地址")
-                return
-                
-            connected = await self.http_client.connect()
-            if not connected:
-                logger.error("ETF159506合并执行客户端连接失败")
-                return
             
-            logger.info(f"尝试自动登录交易柜台: {self.trade_account}")
-            login_success = await self.login(self.trade_account, self.trade_password)
+            # ✅ 步骤1: 尝试加载缓存的凭证
+            logger.info("🔍 检查是否有缓存的交易凭证...")
+            ticket_loaded = self._load_ticket_from_file()
+            
+            # ✅ 步骤2: 验证凭证有效性
+            if ticket_loaded and self._is_ticket_valid():
+                logger.info("✅ 发现有效凭证，跳过登录直接复用")
+                logger.info(f"   交易凭证: {self.ticket[:30]}...")
+                if self.ticket_expire:
+                    remaining = self.ticket_expire - time.time()
+                    logger.info(f"   剩余有效期: {remaining:.0f}秒 ({remaining/3600:.1f}小时)")
+                else:
+                    logger.info(f"   凭证有效期: 无限制")
+                
+                self.is_logged_in = True
+                login_success = True
+            else:
+                # ✅ 步骤3: 凭证无效或不存在，需要重新登录
+                if ticket_loaded:
+                    logger.info("⚠️  缓存凭证已过期，需要重新登录")
+                    self._clear_ticket_cache()  # 清理过期凭证
+                else:
+                    logger.info("📝 无缓存凭证，需要登录")
+                
+                # 获取交易服务器地址
+                if not await self._get_trade_server():
+                    logger.error("无法获取交易服务器地址")
+                    return
+                    
+                connected = await self.http_client.connect()
+                if not connected:
+                    logger.error("ETF159506合并执行客户端连接失败")
+                    return
+                
+                logger.info(f"尝试自动登录交易柜台: {self.trade_account}")
+                login_success = await self.login(self.trade_account, self.trade_password)
             
             if login_success:
                 # 设置账户ID（格式：{venue}-{account_number}）
@@ -2776,8 +2900,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             else:
                 logger.error("❌ 交易柜台登录失败，执行客户端无法使用")
                 logger.warning("提示: 请检查trade_account和trade_password配置是否正确")
-                # 不设置connected为True，因为没有ticket无法交易
-                return
+                logger.warning("提示: 如果超过单日连接次数，请等待第二天或提升账户积分")
+                # 抛出异常，防止NautilusTrader将执行客户端标记为已连接
+                raise RuntimeError("交易柜台登录失败，无法建立执行客户端连接")
            
             
         except Exception as e:

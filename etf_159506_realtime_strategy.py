@@ -426,7 +426,7 @@ class ETF159506Strategy(Strategy):
         self.check_macd_top_signals(last_bar)
         self.check_macd_bottom_signals(last_bar)
         self.check_risk_management(last_bar)
-        self.technical_signal = 0
+        self._log.info(f"on_bar: 时间={beijing_time_str} technical_signal={self.technical_signal}")
         # 定期监控持仓状态（每10个K线记录一次）
         # if len(self.macd_history) % 10 == 0:
         #     current_position = self.get_current_position()
@@ -436,8 +436,10 @@ class ETF159506Strategy(Strategy):
         #         self._log.info("持仓状态监控: 无持仓")
         
         # 每分钟更新图表（非阻塞方式）
-        self.update_realtime_charts(last_bar)
-
+        # 在重置前先保存当前的 technical_signal 值用于图表显示
+        current_technical_signal = self.technical_signal
+        self.update_realtime_charts(last_bar, current_technical_signal)
+        self.technical_signal = 0
     def on_event(self, event: Event):
         """处理所有事件"""
         pass  # 通用事件处理，具体事件由专门方法处理
@@ -2044,7 +2046,7 @@ class ETF159506Strategy(Strategy):
         # 检查是否在2:50分之后
         return current_time_only >= self.scheduled_buy_time
     
-    def update_realtime_charts(self, bar: Bar):
+    def update_realtime_charts(self, bar: Bar, technical_signal: float = 0):
         """每分钟更新实时图表（非阻塞方式，数据来源于cache）"""
         try:
             # 抑制字体警告（显式静默已知的无害警告）
@@ -2063,6 +2065,7 @@ class ETF159506Strategy(Strategy):
                 target_date=target_date,
                 trade_signals=self.trade_signals,
                 technical_signals=self.technical_signals,
+                technical_signal_value=technical_signal,
             )
             self._log.info(f"实时K线图已更新: {kline_filename} (时间: {current_time_beijing.strftime('%H:%M:%S')})")
             
@@ -2912,7 +2915,7 @@ class ETF159506Strategy(Strategy):
             import traceback
             self._log.error(f"详细错误: {traceback.format_exc()}")
 
-    def create_realtime_kline_chart(self, save_path: str = None, target_date: date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None):
+    def create_realtime_kline_chart(self, save_path: str = None, target_date: date = None, trade_signals: List[Dict] = None, technical_signals: List[Dict] = None, technical_signal_value: float = 0):
         """绘制价格走势图"""
         try:
             # 获取数据（从minute_volume_data，内存访问）
@@ -3090,6 +3093,35 @@ class ETF159506Strategy(Strategy):
                    transform=ax1.transAxes, verticalalignment='top', 
                    bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8),
                    fontsize=9)
+            
+            # 添加技术信号累积值显示
+            # 根据信号值确定颜色和状态
+            if technical_signal_value >= 100:
+                signal_color = 'lightgreen'
+                signal_status = '买入信号达标'
+            elif technical_signal_value <= -100:
+                signal_color = 'lightcoral'
+                signal_status = '卖出信号达标'
+            elif technical_signal_value > 0:
+                signal_color = 'lightyellow'
+                signal_status = '偏多信号'
+            elif technical_signal_value < 0:
+                signal_color = 'lightyellow'
+                signal_status = '偏空信号'
+            else:
+                signal_color = 'lightgray'
+                signal_status = '中性信号'
+            
+            technical_signal_info = f"技术信号累积值:\n"
+            technical_signal_info += f"{technical_signal_value:.1f}\n"
+            technical_signal_info += f"({signal_status})\n"
+            technical_signal_info += f"买入阈值: {self.buy_threshold}\n"
+            technical_signal_info += f"卖出阈值: {self.sell_threshold}"
+            
+            ax1.text(0.02, 0.65, technical_signal_info, 
+                   transform=ax1.transAxes, verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor=signal_color, alpha=0.8),
+                   fontsize=9, fontweight='bold')
             
             ax1.legend(loc='upper right')
             
