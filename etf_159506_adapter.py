@@ -44,6 +44,7 @@ from nautilus_trader.model.enums import OrderSide, OrderType, LiquiditySide, Pos
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.identifiers import TradeId
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.serialization.arrow.serializer import register_arrow
 from nautilus_trader.live.data_client import LiveMarketDataClient
@@ -2214,10 +2215,18 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             if data.get("code") == "0":
                 self.ticket = data.get("ticket")
-                self.ticket_expire = data.get("expire")
-                self.is_logged_in = True
+                # expire是有效期秒数，需要转换为过期时间戳
+                expire_seconds = data.get("expire")
+                if expire_seconds:
+                    expire_seconds = float(expire_seconds)
+                    self.ticket_expire = time.time() + expire_seconds
+                    self.logger.info(f"登录成功! 交易凭证: {self.ticket}")
+                    self.logger.info(f"   凭证有效期: {expire_seconds}秒")
+                else:
+                    self.ticket_expire = None
+                    self.logger.info(f"登录成功! 交易凭证: {self.ticket} (无过期时间)")
                 
-                self.logger.info(f"登录成功! 交易凭证: {self.ticket}")
+                self.is_logged_in = True
                 return True
             else:
                 self.logger.error(f"登录失败: {data}")
@@ -2740,10 +2749,20 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             login_success = await self.login(self.trade_account, self.trade_password)
             
             if login_success:
+                # 设置账户ID（格式：{venue}-{account_number}）
+                # ✅ 修复: 使用venue而不是client_id，确保Portfolio能正确查找账户
+                account_id = AccountId(f"{self.venue.value}-{self.trade_account}")
+                self._set_account_id(account_id)
                 self._set_connected(True)
+                
                 logger.info(f"✅ ETF159506执行客户端连接并登录成功")
+                logger.info(f"   账户ID: {self.account_id}")
                 logger.info(f"   交易凭证: {self.ticket}")
-                logger.info(f"   凭证有效期: {self.ticket_expire}秒")
+                if self.ticket_expire:
+                    remaining = self.ticket_expire - time.time()
+                    logger.info(f"   凭证剩余有效期: {remaining:.0f}秒")
+                else:
+                    logger.info(f"   凭证有效期: 无限制")
                 
                 # ✅ 初始化账户状态
                 logger.info("📊 初始化账户状态...")
@@ -3185,6 +3204,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     # 解析持仓信息
                     code = position.get('code')
                     hold_vol = int(position.get('hold_vol', 0))
+                    hold_earn = float(position.get('hold_earn', 0))  # 持仓盈亏
                     
                     # 跳过空持仓
                     if hold_vol <= 0:
@@ -3192,6 +3212,25 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     # 构建instrument_id
                     instrument_id = InstrumentId.from_str(f"{code}.SZSE")
+                    
+                    # ✅ 修复: 通过持仓盈亏计算平均开仓价格
+                    # 公式: 平均成本价 = 当前价格 - (持仓盈亏 / 持仓数量)
+                    avg_px_open = None
+                    try:
+                        # 获取当前价格
+                        quote = self.cache.quote_tick(instrument_id)
+                        if quote and hold_vol > 0:
+                            current_price = (quote.bid_price.as_double() + quote.ask_price.as_double()) / 2
+                            # 反推平均成本价
+                            avg_cost_price = current_price - (hold_earn / hold_vol)
+                            avg_px_open = Decimal(str(avg_cost_price))
+                            logger.debug(
+                                f"计算avg_px_open: 当前价={current_price:.3f}, "
+                                f"持仓盈亏={hold_earn:.2f}, 持仓量={hold_vol}, "
+                                f"平均成本价={avg_px_open}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"计算平均开仓价失败: {e}")
                     
                     # 构建持仓状态报告
                     # 现金账户使用FLAT position_side
@@ -3203,12 +3242,14 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         report_id=UUID4(),
                         ts_last=self._clock.timestamp_ns(),
                         ts_init=self._clock.timestamp_ns(),
+                        avg_px_open=avg_px_open,  # ✅ 添加平均开仓价
                     )
                     
                     position_reports.append(report)
                     logger.debug(
                         f"生成持仓报告: {code} 持仓量={hold_vol}, "
-                        f"可用量={position.get('usable_vol', 0)}"
+                        f"可用量={position.get('usable_vol', 0)}, "
+                        f"估算平均价={avg_px_open}"
                     )
                     
                 except Exception as e:
