@@ -161,8 +161,8 @@ class ETF159506LiveTradingSystem:
                 trader_id=TraderId("ETF159506-LIVE-001"),
                 cache=cache_config,
                 strategies=[strategy_config],
-                data_clients={"ETF159506": data_client_config},
-                exec_clients={"ETF159506": exec_client_config},
+                data_clients={"SZSE": data_client_config},
+                exec_clients={"SZSE": exec_client_config},
                 catalogs=[catalog_config],
                 logging=LoggingConfig(
                     log_level="INFO",
@@ -222,12 +222,12 @@ class ETF159506LiveTradingSystem:
             # 注册数据客户端工厂
             logger.info("注册数据客户端工厂...")
             from etf_159506_adapter import ETF159506LiveDataClientFactory
-            self.trading_node.add_data_client_factory("ETF159506", ETF159506LiveDataClientFactory)
+            self.trading_node.add_data_client_factory("SZSE", ETF159506LiveDataClientFactory)
             
             # 注册执行客户端工厂
             logger.info("注册执行客户端工厂...")
             from etf_159506_adapter import ETF159506LiveExecClientFactory
-            self.trading_node.add_exec_client_factory("ETF159506", ETF159506LiveExecClientFactory)
+            self.trading_node.add_exec_client_factory("SZSE", ETF159506LiveExecClientFactory)
             
             # 构建TradingNode（必须先调用build()）
             logger.info("构建TradingNode...")

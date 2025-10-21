@@ -133,6 +133,9 @@ class ETF159506Strategy(Strategy):
         # 技术指标信号记录（金叉、死叉、背离等）
         self.technical_signals = []
         
+        # 技术信号累积值历史记录（每分钟记录一次）
+        self.technical_signal_history = []
+        
         # 定时买入功能
         self.scheduled_buy_time = time(14, 50)  # 2:50分买入（北京时间）
         self.last_scheduled_buy_date = None  # 记录上次定时买入的日期
@@ -145,9 +148,57 @@ class ETF159506Strategy(Strategy):
         # MACD极值点时间差属性
         self.time_diff_minutes_from_latest_extreme = None  # 距离最近极值点的分钟数
 
+    def _check_existing_positions(self):
+        """
+        检查策略启动时的现有持仓
+        
+        这个方法非常重要！因为：
+        1. 策略可能重启，之前的持仓还在
+        2. 可能有手动交易产生的持仓
+        3. 需要知道当前状态才能正确交易
+        """
+        from nautilus_trader.core.nautilus_pyo3 import LogColor
+        
+        self._log.info("=" * 80, color=LogColor.CYAN)
+        self._log.info("🔍 检查策略启动时的现有持仓", color=LogColor.CYAN)
+        self._log.info("=" * 80, color=LogColor.CYAN)
+        
+        # ✅ 只用 instrument_id 过滤，不用 strategy_id
+        # 原因：需要看到所有相关持仓，无论是哪个策略创建的
+        open_positions = self.cache.positions_open(
+            instrument_id=self.config.instrument_id
+        )
+        
+        if not open_positions:
+            self._log.info("✓ 没有现有持仓，策略可以正常开始交易", color=LogColor.GREEN)
+            self._log.info("=" * 80, color=LogColor.CYAN)
+            return
+        
+        # 如果有持仓，详细记录
+        self._log.warning(
+            f"⚠️ 发现 {len(open_positions)} 个现有持仓！",
+            color=LogColor.YELLOW
+        )
+        
+        for i, position in enumerate(open_positions, 1):
+            self._log.info(
+                f"持仓 #{i}: "
+                f"标的={position.instrument_id} | "
+                f"方向={position.side} | "
+                f"数量={position.quantity} | "
+                f"成本价={position.avg_px_open} | "
+                f"策略ID={position.strategy_id}",
+                color=LogColor.YELLOW
+            )
+        
+        self._log.info("=" * 80, color=LogColor.CYAN)
+    
     def on_start(self):
         """策略启动时调用"""
         bar_type = self.config.bar_type
+        
+        # ✅ 第一步：检查现有持仓（启动时必须先检查！）
+        self._check_existing_positions()
         
         # 请求历史数据用于初始化指标
         self._log.info(f"正在请求历史数据: {bar_type}")
@@ -438,6 +489,15 @@ class ETF159506Strategy(Strategy):
         # 每分钟更新图表（非阻塞方式）
         # 在重置前先保存当前的 technical_signal 值用于图表显示
         current_technical_signal = self.technical_signal
+        
+        # 记录每分钟的技术信号累积值
+        signal_record = {
+            'timestamp': beijing_time.isoformat(),
+            'signal_value': current_technical_signal
+        }
+        self.technical_signal_history.append(signal_record)
+        self._log.info(f"记录技术信号历史: 时间={beijing_time_str}, 信号值={current_technical_signal:.2f}")
+        
         self.update_realtime_charts(last_bar, current_technical_signal)
         self.technical_signal = 0
     def on_event(self, event: Event):
@@ -1593,10 +1653,12 @@ class ETF159506Strategy(Strategy):
         else:
             trade_quantity = self.trade_size
 
-        order = self.order_factory.market(
+        # ✅ 使用限价单（JVQuant 不支持市价单）
+        order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
+            price=bar.close,  # 使用当前收盘价
         )
         self.submit_order(order)
         
@@ -1621,17 +1683,25 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
             return
         
-        # 显式检查持仓（Explicit is better than implicit）
+        # ✅ 只用 instrument_id 过滤，不用 strategy_id！
+        # 原因：策略重启后，之前的持仓可能有不同的 strategy_id
         positions = self.cache.positions_open(
-            instrument_id=self.config.instrument_id,
-            strategy_id=self.id
+            instrument_id=self.config.instrument_id
         )
         
         if not positions:
             self._log.info("没有持仓，跳过卖出信号")
             return
         
-        # 获取当前持仓
+        # 记录持仓信息（用于调试）
+        self._log.info(f"找到 {len(positions)} 个持仓:")
+        for pos in positions:
+            self._log.info(
+                f"  - 方向={pos.side}, 数量={pos.quantity}, "
+                f"成本价={pos.avg_px_open}, 策略ID={pos.strategy_id}"
+            )
+        
+        # 获取第一个持仓（通常只有一个）
         position = positions[0]
         
         # 验证持仓方向（只处理多头持仓的卖出）
@@ -1644,11 +1714,12 @@ class ETF159506Strategy(Strategy):
         
         self._log.info(f"准备卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
         
-        # 显式创建市价SELL订单（Explicit is better than implicit）
-        order = self.order_factory.market(
+        # ✅ 使用限价单（JVQuant 不支持市价单）
+        order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,  # 显式指定SELL方向
             quantity=quantity,
+            price=bar.close,  # 使用当前收盘价
             reduce_only=True,  # 只减仓，不开新仓
             tags=["EXIT", signal_type]
         )
@@ -1705,10 +1776,12 @@ class ETF159506Strategy(Strategy):
         else:
             trade_quantity = self.trade_size
 
-        order = self.order_factory.market(
+        # ✅ 使用限价单（JVQuant 不支持市价单）
+        order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
+            price=bar.close,  # 使用当前收盘价
         )
         self.submit_order(order)
         
@@ -1756,11 +1829,12 @@ class ETF159506Strategy(Strategy):
         
         self._log.info(f"准备背离卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
         
-        # 显式创建市价SELL订单
-        order = self.order_factory.market(
+        # ✅ 使用限价单（JVQuant 不支持市价单）
+        order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,  # 显式指定SELL方向
             quantity=quantity,
+            price=bar.close,  # 使用当前收盘价
             reduce_only=True,
             tags=["EXIT", "divergence_sell"]
         )
@@ -2016,6 +2090,7 @@ class ETF159506Strategy(Strategy):
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
+            price=bar.close,  # 使用当前收盘价
         )
         self.submit_order(order)
         
@@ -2995,8 +3070,8 @@ class ETF159506Strategy(Strategy):
             complete_df = complete_df[~complete_df.index.duplicated(keep='first')]
             complete_df = complete_df[complete_df.index.notnull()]
 
-            # 创建五联图，图片高度更大
-            fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(20, 40), height_ratios=[3, 1, 1, 1, 1])
+            # 创建六联图，图片高度更大
+            fig, (ax1, ax2, ax3, ax4, ax5, ax6) = plt.subplots(6, 1, figsize=(20, 48), height_ratios=[3, 1, 1, 1, 1, 1])
 
             # 创建时间轴映射，保持时间连续性但保留原始时间信息
             def create_time_mapping(df):
@@ -3036,7 +3111,7 @@ class ETF159506Strategy(Strategy):
             x_max = new_index.max()
             
             # 为每个子图设置相同的x轴范围
-            for ax in [ax1, ax2, ax3, ax4, ax5]:
+            for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
                 ax.set_xlim(x_min, x_max)
             
 
@@ -3414,23 +3489,23 @@ class ETF159506Strategy(Strategy):
             minute_volume_stats, _ = self.calculate_minute_volume()
             
             # ====== DEBUG: 打印成交量数据 ======
-            self._log.info(f"[DEBUG K线图] 成交量数据检查:")
-            if not minute_volume_stats.empty:
-                self._log.info(f"  ✓ 数据条数: {len(minute_volume_stats)}")
-                self._log.info(f"  ✓ 总成交量: {minute_volume_stats['总成交量'].sum():,.0f}")
-                self._log.info(f"  ✓ 平均成交量: {minute_volume_stats['总成交量'].mean():,.2f}")
-                self._log.info(f"  ✓ 最大成交量: {minute_volume_stats['总成交量'].max():,.0f}")
-                self._log.info(f"  ✓ 最小成交量: {minute_volume_stats['总成交量'].min():,.0f}")
-                self._log.info(f"  ✓ 成交量>0: {(minute_volume_stats['总成交量'] > 0).sum()}/{len(minute_volume_stats)}")
-                self._log.info(f"  ✓ 时间范围: {minute_volume_stats['minute_time'].min()} 到 {minute_volume_stats['minute_time'].max()}")
-                self._log.info(f"  ✓ 前3条:")
-                for idx, row in minute_volume_stats.head(3).iterrows():
-                    self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
-                self._log.info(f"  ✓ 后3条:")
-                for idx, row in minute_volume_stats.tail(3).iterrows():
-                    self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
-            else:
-                self._log.error(f"  ✗ minute_volume_stats 为空！")
+            # self._log.info(f"[DEBUG K线图] 成交量数据检查:")
+            # if not minute_volume_stats.empty:
+            #     self._log.info(f"  ✓ 数据条数: {len(minute_volume_stats)}")
+            #     self._log.info(f"  ✓ 总成交量: {minute_volume_stats['总成交量'].sum():,.0f}")
+            #     self._log.info(f"  ✓ 平均成交量: {minute_volume_stats['总成交量'].mean():,.2f}")
+            #     self._log.info(f"  ✓ 最大成交量: {minute_volume_stats['总成交量'].max():,.0f}")
+            #     self._log.info(f"  ✓ 最小成交量: {minute_volume_stats['总成交量'].min():,.0f}")
+            #     self._log.info(f"  ✓ 成交量>0: {(minute_volume_stats['总成交量'] > 0).sum()}/{len(minute_volume_stats)}")
+            #     self._log.info(f"  ✓ 时间范围: {minute_volume_stats['minute_time'].min()} 到 {minute_volume_stats['minute_time'].max()}")
+            #     self._log.info(f"  ✓ 前3条:")
+            #     for idx, row in minute_volume_stats.head(3).iterrows():
+            #         self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
+            #     self._log.info(f"  ✓ 后3条:")
+            #     for idx, row in minute_volume_stats.tail(3).iterrows():
+            #         self._log.info(f"     {row['minute_time']} | 量:{row['总成交量']:>12,.0f} | O:{row['开盘价']:.3f} C:{row['收盘价']:.3f}")
+            # else:
+            #     self._log.error(f"  ✗ minute_volume_stats 为空！")
             # ====== END DEBUG ======
             
             if not minute_volume_stats.empty:
@@ -3623,8 +3698,97 @@ class ETF159506Strategy(Strategy):
             ax5.legend(loc='upper right')
             ax5.grid(True, alpha=0.3)
 
+            # ====== ax6 技术信号累积值副图 ======
+            if self.technical_signal_history and len(self.technical_signal_history) > 0:
+                # 将技术信号历史转换为DataFrame
+                signal_df = pd.DataFrame(self.technical_signal_history)
+                signal_df['timestamp'] = pd.to_datetime(signal_df['timestamp'])
+                
+                # 确保时区一致
+                if signal_df['timestamp'].dt.tz is None:
+                    import pytz
+                    beijing_tz = pytz.timezone('Asia/Shanghai')
+                    signal_df['timestamp'] = signal_df['timestamp'].dt.tz_localize(beijing_tz)
+                
+                # 应用时间映射（处理午休）
+                signal_df['mapped_time'] = signal_df['timestamp'].apply(
+                    lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
+                )
+                
+                # 过滤掉午休时间
+                signal_df = signal_df[
+                    (signal_df['timestamp'].dt.time < datetime_time(11, 30)) | 
+                    (signal_df['timestamp'].dt.time > datetime_time(13, 0))
+                ]
+                
+                if len(signal_df) > 0:
+                    # 绘制技术信号曲线
+                    ax6.plot(signal_df['mapped_time'], signal_df['signal_value'], 
+                            color='blue', linewidth=1.5, label='技术信号累积值')
+                    
+                    # 绘制买入和卖出阈值线
+                    ax6.axhline(self.buy_threshold, color='red', linestyle='--', 
+                               linewidth=1.5, label=f'买入阈值 ({self.buy_threshold})')
+                    ax6.axhline(self.sell_threshold, color='green', linestyle='--', 
+                               linewidth=1.5, label=f'卖出阈值 ({self.sell_threshold})')
+                    ax6.axhline(0, color='gray', linestyle='-', linewidth=0.8, alpha=0.5)
+                    
+                    # 填充颜色区域
+                    ax6.fill_between(signal_df['mapped_time'], 0, signal_df['signal_value'], 
+                                    where=(signal_df['signal_value'] > 0), 
+                                    color='red', alpha=0.2, label='多头区域')
+                    ax6.fill_between(signal_df['mapped_time'], 0, signal_df['signal_value'], 
+                                    where=(signal_df['signal_value'] < 0), 
+                                    color='green', alpha=0.2, label='空头区域')
+                    
+                    # 显示当前信号值
+                    current_signal = signal_df['signal_value'].iloc[-1]
+                    current_time = signal_df['mapped_time'].iloc[-1]
+                    ax6.scatter(current_time, current_signal, color='black', s=100, zorder=5)
+                    
+                    # 添加当前信号值标注
+                    if current_signal >= self.buy_threshold:
+                        signal_status = '买入信号达标'
+                        status_color = 'red'
+                    elif current_signal <= self.sell_threshold:
+                        signal_status = '卖出信号达标'
+                        status_color = 'green'
+                    elif current_signal > 0:
+                        signal_status = '偏多信号'
+                        status_color = 'orange'
+                    elif current_signal < 0:
+                        signal_status = '偏空信号'
+                        status_color = 'orange'
+                    else:
+                        signal_status = '中性信号'
+                        status_color = 'gray'
+                    
+                    ax6.annotate(f'{current_signal:.1f}\n{signal_status}', 
+                               xy=(current_time, current_signal),
+                               xytext=(10, 10), textcoords='offset points',
+                               fontsize=10, color=status_color, weight='bold',
+                               bbox=dict(boxstyle='round,pad=0.5', facecolor=status_color, alpha=0.3))
+                    
+                    self._log.info(f"绘制了 {len(signal_df)} 个技术信号历史数据点")
+            else:
+                self._log.warning("没有技术信号历史数据")
+            
+            if target_date:
+                ax6.set_title(f'技术信号累积值 {target_date} (北京时间)')
+            else:
+                ax6.set_title(f'技术信号累积值 {data_date} (北京时间)')
+            ax6.set_ylabel('信号值')
+            ax6.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax6.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', 
+                        fontsize=11, color='gray', ha='right', va='top')
+            ax6.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax6.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            plt.setp(ax6.xaxis.get_majorticklabels(), rotation=45)
+            ax6.legend(loc='upper left')
+            ax6.grid(True, alpha=0.3)
+
             # 统一x轴格式化，防止内容错乱
-            for ax in [ax1, ax2, ax3, ax4, ax5]:
+            for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
                 ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
                 # 根据数据时间跨度调整刻度间隔
                 time_span = x_max - x_min

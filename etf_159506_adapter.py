@@ -2738,23 +2738,27 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """将NautilusTrader订单转换为jvquant格式"""
         try:
             # 获取订单基本信息
-            instrument_id = str(order.instrument_id)
-            side = str(order.side).lower()
+            # ✅ 修复：使用 .name 获取枚举名称，而不是整数值
+            side = order.side.name.lower()  # 'buy' 或 'sell'
             quantity = int(order.quantity)
             
             # 解析股票代码（从159506.SZSE中提取159506）
-            if '.' in instrument_id:
-                code = instrument_id.split('.')[0]
+            instrument_id_str = str(order.instrument_id)
+            if '.' in instrument_id_str:
+                code = instrument_id_str.split('.')[0]
             else:
-                code = instrument_id
+                code = instrument_id_str
             
             # 动态获取股票名称
             name = self._get_instrument_name(code, order.instrument_id)
             
-            # 确定委托价格
-            price = 0.0  # 市价单价格为0
-            if hasattr(order, 'price') and order.price is not None:
-                price = float(order.price)
+            # 确定委托价格（策略统一使用限价单）
+            if not hasattr(order, 'price') or order.price is None:
+                logger.error(f"订单缺少价格信息: {order}")
+                return None
+            
+            price = float(order.price)
+            logger.info(f"订单价格: {price:.4f}")
             
             # 确定买卖方向（转换为 API 要求的格式）
             # 官方 API: 买入用 'buy', 卖出用 'sale'
@@ -2788,43 +2792,22 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """
         获取股票名称
         
-        优先级：
-        1. 从cache中查询instrument对象获取
-        2. 从映射表获取
-        3. 使用代码作为默认名称
+        从映射表获取股票名称，如果找不到则使用代码作为默认名称
         
         Parameters
         ----------
         code : str
             股票代码
-        instrument_id
-            NautilusTrader InstrumentId对象
+        instrument_id : InstrumentId
+            NautilusTrader InstrumentId对象（保留用于将来扩展）
             
         Returns
         -------
         str
             股票名称
         """
-        try:
-            # 方法1: 尝试从cache获取instrument
-            if hasattr(self, 'cache') and self.cache:
-                instrument = self.cache.instrument(instrument_id)
-                if instrument:
-                    # NautilusTrader的Equity可能没有name属性
-                    # 但我们可以尝试从raw_symbol或其他属性获取
-                    logger.debug(f"从cache获取到instrument: {instrument}")
-            
-            # 方法2: 从映射表获取
-            if code in self._instrument_names:
-                return self._instrument_names[code]
-            
-            # 方法3: 使用代码作为默认名称
-            logger.warning(f"未找到代码{code}的名称映射，使用代码作为名称")
-            return code
-            
-        except Exception as e:
-            logger.error(f"获取股票名称失败: {e}, 使用代码作为默认名称")
-            return code
+        # 从映射表获取（Simple is better than complex）
+        return self._instrument_names.get(code, code)
         
     async def _connect(self) -> None:
         """连接到执行源 - 使用集成的jvquant连接方法"""
