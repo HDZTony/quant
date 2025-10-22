@@ -78,13 +78,13 @@ class ETF159506Strategy(Strategy):
         self.position: Position | None = None
         
         # 历史数据存储 - 用于检测金叉死叉
-        self.macd_history = deque(maxlen=1000)  # 存储MACD值（DIF）
-        self.signal_history = deque(maxlen=1000)  # 存储信号线值（DEA）
-        self.histogram_history = deque(maxlen=1000)  # 存储柱状图值
+        self.macd_history = deque(maxlen=10000)  # 存储MACD值（DIF）
+        self.signal_history = deque(maxlen=10000)  # 存储信号线值（DEA）
+        self.histogram_history = deque(maxlen=10000)  # 存储柱状图值
         
         # 背离检测相关历史数据存储
-        self.price_history = deque(maxlen=1000)  # 存储收盘价历史
-        self.timestamps = deque(maxlen=1000)  # 存储K线时间戳
+        self.price_history = deque(maxlen=10000)  #存储收盘价历史
+        self.timestamps = deque(maxlen=10000)  # 存储K线时间戳
         self.divergence_lookback = 30  # 背离检测的回看周期
         self.divergence_confirmation_bars = 3  # 背离确认所需的K线数
         self.last_divergence_signal = None  # 记录上一次背离信号类型
@@ -421,8 +421,9 @@ class ETF159506Strategy(Strategy):
             # 筛选从index到当前时间前一分钟的数据
             filtered_volumes = []
             for i in range(index, len(self.minute_volume_data)):
-                filtered_volumes.append(self.minute_volume_data[i])
-                self._log.info(f"成交量对比计算: 历史成交量={self.minute_volume_data[i]:.2f}")
+                volume_value = self.minute_volume_data[i]['volume']
+                filtered_volumes.append(volume_value)
+                self._log.info(f"成交量对比计算: 历史成交量={volume_value:.2f}")
             
 
             
@@ -1617,6 +1618,10 @@ class ETF159506Strategy(Strategy):
     
     def execute_buy_signal(self, bar: Bar, signal_type: str = 'executed_buy'):
         """执行买入信号"""
+        # ✅ 先撤销所有未成交的委托（避免资金冻结和重复下单）
+        self.cancel_all_orders(self.config.instrument_id)
+        self._log.info("已撤销所有未成交委托，准备下新单")
+        
         # 检查是否已有持仓 - 使用可靠的持仓查询方法
         # current_position = self.get_current_position()
         # if current_position is not None:
@@ -1678,6 +1683,10 @@ class ETF159506Strategy(Strategy):
     
     def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
         """执行卖出信号 - 显式创建SELL订单"""
+        # ✅ 先撤销所有未成交的委托（避免重复卖出）
+        self.cancel_all_orders(self.config.instrument_id)
+        self._log.info("已撤销所有未成交委托，准备下卖单")
+        
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
             self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
@@ -1743,6 +1752,10 @@ class ETF159506Strategy(Strategy):
     
     def execute_divergence_buy_signal(self, bar: Bar):
         """执行背离买入信号"""
+        # ✅ 先撤销所有未成交的委托
+        self.cancel_all_orders(self.config.instrument_id)
+        self._log.info("已撤销所有未成交委托，准备下背离买入单")
+        
         # 检查是否已有持仓
         # current_position = self.get_current_position()
         # if current_position is not None:
@@ -1801,6 +1814,10 @@ class ETF159506Strategy(Strategy):
     
     def execute_divergence_sell_signal(self, bar: Bar):
         """执行背离卖出信号 - 显式创建SELL订单"""
+        # ✅ 先撤销所有未成交的委托
+        self.cancel_all_orders(self.config.instrument_id)
+        self._log.info("已撤销所有未成交委托，准备下背离卖出单")
+        
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
             self._log.info(f"当前时间已过2:50分，跳过背离卖出信号执行")
@@ -2037,6 +2054,10 @@ class ETF159506Strategy(Strategy):
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
+        # ✅ 先撤销所有未成交的委托
+        self.cancel_all_orders(self.config.instrument_id)
+        self._log.info("已撤销所有未成交委托，准备下定时买入单")
+        
         # 获取北京时间用于日志显示
         current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
         current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
