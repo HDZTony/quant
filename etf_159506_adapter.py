@@ -1405,14 +1405,11 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         # 初始化jvquant API相关组件（从ETF159506DataClient集成）
         self.config = global_adapter.config
         self.logger = logging.getLogger("ETF159506NautilusDataClient")
-        self.http_client = ETF159506HttpClient(self.config)
         
-        # 初始化数据保存器
-        catalog_path = self.config.get('catalog_path', './data_catalog')
-        self.data_saver = ETF159506DataSaver(catalog_path)
-        
-        # 创建WebSocket客户端，传入数据保存器
-        self.ws_client = ETF159506WebSocketClient(self.config, self.data_saver)
+        # ✅ 复用全局适配器的HTTP和WebSocket客户端（避免重复连接导致"操作频繁"错误）
+        self.http_client = global_adapter.http_client
+        self.ws_client = global_adapter.ws_client
+        self.data_saver = global_adapter.ws_client.data_processor.data_saver if hasattr(global_adapter.ws_client, 'data_processor') else None
         
         # 实时Bar成交量增量计算（匹配历史数据格式）
         self.last_minute_cumulative_volume = {}  # {bar_type: 上一分钟结束时的累计成交量}
@@ -1426,35 +1423,35 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         self._set_connected(False)
         
     async def _connect(self) -> None:
-        """连接到数据源 - 使用集成的jvquant连接方法"""
+        """连接到数据源 - 复用全局适配器的连接"""
         try:
             logger.info("连接ETF159506合并数据客户端...")
             
-            # 连接HTTP和WebSocket客户端（从ETF159506DataClient集成）
-            http_connected = await self.http_client.connect()
-            ws_connected = await self.ws_client.connect()
-            
-            if http_connected and ws_connected:
+            # ✅ 检查全局适配器的连接状态（不再创建新连接）
+            if self.http_client.is_connected and self.ws_client.is_connected:
                 self._set_connected(True)
-                logger.info("ETF159506合并数据客户端连接成功")
+                logger.info("✅ ETF159506合并数据客户端连接成功（复用全局适配器连接）")
             else:
-                logger.error("ETF159506合并数据客户端连接失败")
+                # 如果适配器连接未建立，这里不应该尝试重新连接
+                # 因为可能会触发"操作频繁"错误
+                logger.warning("⚠️  全局适配器连接未完全建立，数据客户端标记为已连接但可能无法接收数据")
+                logger.warning(f"   HTTP客户端状态: {self.http_client.is_connected}")
+                logger.warning(f"   WebSocket客户端状态: {self.ws_client.is_connected}")
+                self._set_connected(True)  # 仍然标记为已连接，避免阻塞系统启动
             
         except Exception as e:
             logger.error(f"连接ETF159506合并数据客户端失败: {e}")
             raise
     
     async def _disconnect(self) -> None:
-        """断开数据源连接 - 使用集成的jvquant断开方法"""
+        """断开数据源连接 - 不断开全局适配器的连接"""
         try:
             logger.info("断开ETF159506合并数据客户端...")
             
-            # 断开HTTP和WebSocket客户端（从ETF159506DataClient集成）
-            await self.http_client.disconnect()
-            await self.ws_client.disconnect()
-            
+            # ✅ 不断开HTTP和WebSocket客户端（它们属于全局适配器）
+            # 只标记数据客户端为未连接状态
             self._set_connected(False)
-            logger.info("ETF159506合并数据客户端已断开")
+            logger.info("✅ ETF159506合并数据客户端已断开（保持全局适配器连接）")
             
         except Exception as e:
             logger.error(f"断开ETF159506合并数据客户端失败: {e}")
@@ -1775,21 +1772,22 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
             
             if bars:
                 logger.info(f"从本地catalog加载了 {len(bars)} 条历史K线数据")
+                
+                # ✅ 只有当有数据时才调用 _handle_bars（避免NautilusTrader框架警告）
+                self._handle_bars(
+                    bar_type=bar_type,
+                    bars=bars,
+                    partial=None,
+                    correlation_id=request.id,
+                    start=start,
+                    end=end,
+                    params=request.params if hasattr(request, 'params') else None,
+                )
+                logger.info(f"✅ _handle_bars调用完成，发送了 {len(bars)} 条历史数据")
             else:
-                logger.info(f"未找到历史K线数据，返回空数据")
-            
-            # 使用NautilusTrader官方方法处理数据
-            self._handle_bars(
-                bar_type=bar_type,
-                bars=bars,  # 历史数据或空列表
-                partial=None,  # 没有部分数据
-                correlation_id=request.id,
-                start=start,
-                end=end,
-                params=request.params if hasattr(request, 'params') else None,
-            )
-            
-            logger.info(f"✅ _handle_bars调用完成，发送了 {len(bars)} 条历史数据")
+                # ✅ 没有历史数据时，不发送空数组，避免框架警告
+                # 实时交易场景下，策略会从实时数据流开始工作，这是正常情况
+                logger.info(f"📊 未找到历史K线数据，策略将从实时数据流开始工作")
                 
         except Exception as e:
             logger.error(f"请求历史K线数据失败: {e}")
@@ -2136,7 +2134,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         self.config = jvquant_config
         self.logger = logging.getLogger("ETF159506NautilusExecClient")
         self.token = jvquant_config.get('token')
-        self.http_client = ETF159506HttpClient(jvquant_config)
+        # ✅ 复用全局适配器的HTTP客户端（避免重复连接）
+        self.http_client = global_adapter.http_client
         self.orders = {}
         
         # 交易相关
@@ -2846,11 +2845,15 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 if not await self._get_trade_server():
                     logger.error("无法获取交易服务器地址")
                     return
-                    
-                connected = await self.http_client.connect()
-                if not connected:
-                    logger.error("ETF159506合并执行客户端连接失败")
-                    return
+                
+                # ✅ 检查HTTP客户端连接状态（复用全局适配器的连接）
+                if not self.http_client.is_connected:
+                    connected = await self.http_client.connect()
+                    if not connected:
+                        logger.error("ETF159506合并执行客户端连接失败")
+                        return
+                else:
+                    logger.info("✅ HTTP客户端已连接（复用全局适配器连接）")
                 
                 logger.info(f"尝试自动登录交易柜台: {self.trade_account}")
                 login_success = await self.login(self.trade_account, self.trade_password)
@@ -2910,10 +2913,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 finally:
                     self._account_update_task = None
             
-            # 使用集成的jvquant断开方法
-            await self.http_client.disconnect()
+            # ✅ 不断开HTTP客户端（它属于全局适配器）
+            # 只标记执行客户端为未连接状态
             self._set_connected(False)
-            logger.info("ETF159506合并执行客户端已断开")
+            logger.info("✅ ETF159506合并执行客户端已断开（保持全局适配器连接）")
         except Exception as e:
             logger.error(f"断开ETF159506合并执行客户端失败: {e}")
     

@@ -20,6 +20,7 @@ from nautilus_trader.trading.strategy import StrategyConfig
 from nautilus_trader.model import Quantity
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.currencies import CNY
+from nautilus_trader.model.objects import Price
 from collections import deque
 import pandas as pd
 from datetime import datetime, time, date, timedelta
@@ -196,6 +197,13 @@ class ETF159506Strategy(Strategy):
     def on_start(self):
         """策略启动时调用"""
         bar_type = self.config.bar_type
+        
+        # ✅ 初始化 instrument 对象（用于价格创建）
+        self.instrument = self.cache.instrument(self.config.instrument_id)
+        if self.instrument is None:
+            self._log.error(f"无法从缓存获取 instrument: {self.config.instrument_id}")
+            raise RuntimeError(f"Instrument {self.config.instrument_id} not found in cache")
+        self._log.info(f"已获取 instrument: {self.instrument.id}, 价格精度: {self.instrument.price_precision}")
         
         # ✅ 第一步：检查现有持仓（启动时必须先检查！）
         self._check_existing_positions()
@@ -1638,16 +1646,21 @@ class ETF159506Strategy(Strategy):
                 return
             
             available_balance = free_balance.as_double()
-            current_price = bar.close.as_double()
             
-            self._log.info(f"MACD买入信号 - 可用余额: {available_balance:.2f} CNY, 当前价格: {current_price:.4f}")
+            # ✅ 先计算订单价格（加价提高成交概率）
+            buy_price_value = bar.close.as_double() + 0.001
+            buy_price = self.instrument.make_price(buy_price_value)
+            
+            self._log.info(f"MACD买入信号 - 可用余额: {available_balance:.2f} CNY, 收盘价: {bar.close.as_double():.4f}, 订单价格: {buy_price_value:.4f}")
             
             # 检查可用余额
             if available_balance <= 0:
                 self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过买入信号")
                 return
-                
-            quantity = int(available_balance / current_price)  # 使用100%资金满仓交易
+            
+            # ✅ 用订单价格计算数量，避免超出可用余额
+            # 留0.1%的安全边际，防止手续费等导致余额不足
+            quantity = int(available_balance * 0.999 / buy_price_value)
             
             # 检查计算出的数量是否有效
             if quantity <= 0:
@@ -1657,20 +1670,20 @@ class ETF159506Strategy(Strategy):
             trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
-
-        # ✅ 使用限价单（JVQuant 不支持市价单）
+            # ✅ 固定数量模式下仍需计算价格
+            buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
         order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
-            price=bar.close,  # 使用当前收盘价
+            price=buy_price,
         )
         self.submit_order(order)
         
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
+            'price': buy_price.as_double(),
             'side': 'BUY',
             'quantity': trade_quantity.as_double(),
             'order_id': str(order.client_order_id),
@@ -1679,7 +1692,7 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
     
     def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
         """执行卖出信号 - 显式创建SELL订单"""
@@ -1724,11 +1737,13 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"准备卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
         
         # ✅ 使用限价单（JVQuant 不支持市价单）
+        # 卖出价格 -0.001 提高成交概率
+        sell_price = self.instrument.make_price(bar.close.as_double() - 0.001)
         order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,  # 显式指定SELL方向
             quantity=quantity,
-            price=bar.close,  # 使用当前收盘价
+            price=sell_price,
             reduce_only=True,  # 只减仓，不开新仓
             tags=["EXIT", signal_type]
         )
@@ -1739,7 +1754,7 @@ class ETF159506Strategy(Strategy):
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
+            'price': sell_price.as_double(),
             'side': 'SELL',
             'quantity': quantity.as_double(),
             'order_id': str(order.client_order_id),
@@ -1748,7 +1763,7 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行显式SELL订单: 数量={quantity}, 价格={bar.close.as_double():.4f}, 订单ID={order.client_order_id}")
+        self._log.info(f"执行显式SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, 订单ID={order.client_order_id}")
     
     def execute_divergence_buy_signal(self, bar: Bar):
         """执行背离买入信号"""
@@ -1772,15 +1787,20 @@ class ETF159506Strategy(Strategy):
                 return
             
             available_balance = free_balance.as_double()
-            current_price = bar.close.as_double()
             
-            self._log.info(f"背离买入信号 - 可用余额: {available_balance:.2f} CNY, 当前价格: {current_price:.4f}")
+            # ✅ 先计算订单价格（加价提高成交概率）
+            buy_price_value = bar.close.as_double() + 0.001
+            buy_price = self.instrument.make_price(buy_price_value)
+            
+            self._log.info(f"背离买入信号 - 可用余额: {available_balance:.2f} CNY, 收盘价: {bar.close.as_double():.4f}, 订单价格: {buy_price_value:.4f}")
             
             if available_balance <= 0:
                 self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过背离买入信号")
                 return
-                
-            quantity = int(available_balance / current_price)
+            
+            # ✅ 用订单价格计算数量，避免超出可用余额
+            # 留0.1%的安全边际，防止手续费等导致余额不足
+            quantity = int(available_balance * 0.999 / buy_price_value)
             if quantity <= 0:
                 self._log.info(f"计算出的交易数量无效: {quantity}，跳过背离买入信号")
                 return
@@ -1788,20 +1808,20 @@ class ETF159506Strategy(Strategy):
             trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
-
-        # ✅ 使用限价单（JVQuant 不支持市价单）
+            # ✅ 固定数量模式下仍需计算价格
+            buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
         order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
-            price=bar.close,  # 使用当前收盘价
+            price=buy_price,
         )
         self.submit_order(order)
         
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
+            'price': buy_price.as_double(),
             'side': 'BUY',
             'quantity': trade_quantity.as_double(),
             'order_id': str(order.client_order_id),
@@ -1810,7 +1830,7 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行背离买入交易: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"执行背离买入交易: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
     
     def execute_divergence_sell_signal(self, bar: Bar):
         """执行背离卖出信号 - 显式创建SELL订单"""
@@ -1847,11 +1867,13 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"准备背离卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
         
         # ✅ 使用限价单（JVQuant 不支持市价单）
+        # 卖出价格 -0.001 提高成交概率
+        sell_price = self.instrument.make_price(bar.close.as_double() - 0.001)
         order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,  # 显式指定SELL方向
             quantity=quantity,
-            price=bar.close,  # 使用当前收盘价
+            price=sell_price,
             reduce_only=True,
             tags=["EXIT", "divergence_sell"]
         )
@@ -1862,7 +1884,7 @@ class ETF159506Strategy(Strategy):
         # 记录实际交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
+            'price': sell_price.as_double(),
             'side': 'SELL',
             'quantity': quantity.as_double(),
             'order_id': str(order.client_order_id),
@@ -1871,7 +1893,7 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行背离显式SELL订单: 数量={quantity}, 价格={bar.close.as_double():.4f}, 订单ID={order.client_order_id}")
+        self._log.info(f"执行背离显式SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, 订单ID={order.client_order_id}")
     
     def check_risk_management(self, bar: Bar):
         """检查风险管理"""
@@ -2078,7 +2100,10 @@ class ETF159506Strategy(Strategy):
                     return False
                 
                 available_balance = free_balance.as_double()
-                current_price = bar.close.as_double()
+                
+                # ✅ 先计算订单价格（加价提高成交概率）
+                buy_price_value = bar.close.as_double() + 0.001
+                buy_price = self.instrument.make_price(buy_price_value)
                 
                 # 详细的账户信息日志
                 total_balance = account.balance_total(CNY)
@@ -2091,11 +2116,13 @@ class ETF159506Strategy(Strategy):
                 if available_balance <= 0:
                     self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法执行定时买入")
                     return False
-                    
-                quantity = int(available_balance / current_price)  # 使用100%可用资金
                 
-                self._log.info(f"交易计算: 可用余额={available_balance:.2f}, 当前价格={current_price:.4f}, "
-                             f"计算数量={quantity}, 预计花费={quantity * current_price:.2f}")
+                # ✅ 用订单价格计算数量，避免超出可用余额
+                # 留0.1%的安全边际，防止手续费等导致余额不足
+                quantity = int(available_balance * 0.999 / buy_price_value)
+                
+                self._log.info(f"交易计算: 可用余额={available_balance:.2f}, 收盘价={bar.close.as_double():.4f}, "
+                             f"订单价格={buy_price_value:.4f}, 计算数量={quantity}, 预计花费={quantity * buy_price_value:.2f}")
                 
                 # 检查计算出的数量是否有效
                 if quantity <= 0:
@@ -2105,20 +2132,20 @@ class ETF159506Strategy(Strategy):
                 trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
-
-        # 创建市价买入订单
-        order = self.order_factory.market(
+            # ✅ 固定数量模式下仍需计算价格
+            buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
+        order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=trade_quantity,
-            price=bar.close,  # 使用当前收盘价
+            price=buy_price,
         )
         self.submit_order(order)
         
         # 记录定时买入交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': bar.close.as_double(),
+            'price': buy_price.as_double(),
             'side': 'BUY',
             'quantity': trade_quantity.as_double(),
             'order_id': str(order.client_order_id),
@@ -2127,7 +2154,7 @@ class ETF159506Strategy(Strategy):
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
         return True
         
     def is_after_scheduled_time(self, bar: Bar) -> bool:
