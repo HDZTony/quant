@@ -313,14 +313,8 @@ class ETF159506ServerManager:
         """获取分配的服务器地址"""
         url = f"{self.base_url}?market={market}&type={type}&token={self.token}"
         
-        # 配置代理
-        proxies = {
-            'http': 'http://127.0.0.1:10809',
-            'https': 'http://127.0.0.1:10809'
-        }
-        
         try:
-            response = requests.get(url, timeout=30, proxies=proxies)
+            response = requests.get(url, timeout=30)
             data = response.json()
             
             if data.get("code") == "0":
@@ -417,12 +411,7 @@ class ETF159506HttpClient:
             # 发送请求 - 使用requests作为备选方案
             try:
                 import requests
-                # 配置代理
-                proxies = {
-                    'http': 'http://127.0.0.1:10809',
-                    'https': 'http://127.0.0.1:10809'
-                }
-                response = requests.get(url, params=params, timeout=30, proxies=proxies)
+                response = requests.get(url, params=params, timeout=30)
                 if response.status_code == 200:
                     data = response.json()
                     
@@ -436,11 +425,9 @@ class ETF159506HttpClient:
                     return []
             except ImportError:
                 # 如果没有requests，使用aiohttp
-                # 配置代理
                 connector = aiohttp.TCPConnector()
-                proxy = 'http://127.0.0.1:10809'
                 async with aiohttp.ClientSession(connector=connector) as session:
-                    async with session.get(url, params=params, proxy=proxy) as response:
+                    async with session.get(url, params=params) as response:
                         if response.status == 200:
                             data = await response.json()
                             
@@ -2335,19 +2322,57 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             self.logger.error(f"登录异常: {e}")
             return False
     
-    def _check_login_status(self) -> bool:
-        """检查登录状态"""
-        if not self.is_logged_in or not self.ticket:
-            return False
+    async def _ensure_login(self) -> bool:
+        """
+        确保登录状态有效（Pythonic: 显式优于隐式）
         
-        # 检查ticket是否过期
-        if self.ticket_expire and time.time() > self.ticket_expire:
-            self.logger.warning("交易凭证已过期，需要重新登录")
-            self.is_logged_in = False
-            self.ticket = None
-            return False
+        策略：
+        1. 检查当前ticket是否有效
+        2. 无效时尝试从缓存加载
+        3. 仍无效时重新登录
         
-        return True
+        Returns
+        -------
+        bool
+            登录成功返回True，否则返回False
+        """
+        # 1. 检查当前ticket
+        if self._is_ticket_valid():
+            self.logger.debug("✅ 当前ticket有效")
+            return True
+        
+        self.logger.warning("⚠️ 当前ticket无效或已过期")
+        
+        # 2. 尝试从缓存加载
+        self.logger.info("📂 尝试从缓存加载ticket...")
+        if self._load_ticket_from_file():
+            if self._is_ticket_valid():
+                self.logger.info("✅ 从缓存成功加载有效ticket")
+                self.is_logged_in = True
+                return True
+            else:
+                self.logger.warning("⚠️ 缓存ticket已过期")
+        
+        # 3. 重新登录
+        self.logger.info("🔄 重新登录交易柜台...")
+        
+        # 清理旧的ticket缓存
+        self._clear_ticket_cache()
+        
+        # 先确保有trade_server
+        if not self.trade_server:
+            self.logger.info("获取交易服务器地址...")
+            if not await self._get_trade_server():
+                self.logger.error("❌ 获取交易服务器失败")
+                return False
+        
+        # 执行登录
+        if await self.login(self.trade_account, self.trade_password):
+            self.logger.info("✅ 重新登录成功")
+            return True
+        else:
+            self.logger.error("❌ 重新登录失败")
+            return False
     
     async def _buy_stock(self, code: str, name: str, price: float, volume: int) -> Optional[str]:
         """
@@ -2472,8 +2497,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             True if 撤单成功, False otherwise
         """
         try:
-            if not self._check_login_status():
-                logger.error("未登录或登录已过期")
+            # ✅ 确保登录状态有效
+            if not await self._ensure_login():
+                logger.error("❌ 登录状态无效，无法撤单")
                 return False
             
             url = f"{self.trade_server}/cancel"
@@ -2531,8 +2557,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             委托列表，如果查询失败返回 None
         """
         try:
-            if not self._check_login_status():
-                logger.error("未登录或登录已过期")
+            # ✅ 确保登录状态有效
+            if not await self._ensure_login():
+                logger.error("❌ 登录状态无效，无法查询订单")
                 return None
             
             url = f"{self.trade_server}/check_order"
@@ -2605,8 +2632,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             持仓信息字典，如果查询失败返回 None
         """
         try:
-            if not self._check_login_status():
-                logger.error("未登录或登录已过期")
+            # ✅ 确保登录状态有效
+            if not await self._ensure_login():
+                logger.error("❌ 登录状态无效，无法查询持仓")
                 return None
             
             url = f"{self.trade_server}/check_hold"
@@ -2977,6 +3005,12 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             # 检查执行客户端连接状态
             if not self.is_connected:
                 logger.error("执行客户端未连接，无法提交订单")
+                return
+            
+            # ✅ 确保登录状态有效（Pythonic: 错误不应该悄悄发生）
+            if not await self._ensure_login():
+                logger.error("❌ 登录状态无效，无法提交订单")
+                # TODO: 生成订单拒绝事件通知策略
                 return
             
             # 将NautilusTrader订单转换为jvquant格式
