@@ -21,6 +21,7 @@ dependencies = [
     "redis",
     "pyarrow>=20.0.0",
     "pytz>=2025.2",
+    "psutil>=5.9.0",
 ]
 
 [build-system]

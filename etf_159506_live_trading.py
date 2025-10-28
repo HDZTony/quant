@@ -310,7 +310,7 @@ class ETF159506LiveTradingSystem:
             traceback.print_exc()
     
     async def get_system_status(self) -> Dict[str, Any]:
-        """获取系统状态"""
+        """获取系统状态（包含内存监控信息）"""
         try:
             status = {
                 "is_running": self.is_running,
@@ -322,10 +322,15 @@ class ETF159506LiveTradingSystem:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             
-            # 添加适配器状态
+            # 添加适配器状态（包含内存监控信息）
             if self.adapter:
                 adapter_status = await self.adapter.get_status()
                 status.update(adapter_status)
+                
+                # ✅ 显示内存统计摘要
+                if 'memory_stats' in adapter_status:
+                    mem = adapter_status['memory_stats']
+                    logger.info(f"💾 内存使用: {mem['current_mb']:.1f} MB (峰值: {mem['peak_mb']:.1f} MB)")
             
             # 添加TradingNode状态
             if self.trading_node:

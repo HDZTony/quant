@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Any
 from decimal import Decimal
 import json
 from pathlib import Path
+from collections import deque
+import psutil  # 用于内存监控
 
 # NautilusTrader imports
 from nautilus_trader.common.providers import InstrumentProvider
@@ -60,6 +62,189 @@ import pyarrow as pa
 logger = logging.getLogger(__name__)
 
 
+class MemoryMonitor:
+    """
+    内存监控器 - 监控进程内存使用情况并提供告警
+    
+    Pythonic原则：
+    - Explicit: 显式的内存阈值和告警策略
+    - Simple: 简单直观的API
+    - Readable: 清晰的内存统计输出
+    """
+    
+    def __init__(
+        self,
+        warning_threshold_mb: float = 500.0,  # 内存警告阈值（MB）
+        critical_threshold_mb: float = 1000.0,  # 内存严重告警阈值（MB）
+        check_interval: int = 60,  # 检查间隔（秒）
+    ):
+        """
+        初始化内存监控器
+        
+        Parameters
+        ----------
+        warning_threshold_mb : float
+            内存警告阈值（MB），超过此值发出警告
+        critical_threshold_mb : float
+            内存严重告警阈值（MB），超过此值发出严重告警
+        check_interval : int
+            内存检查间隔（秒）
+        """
+        self.logger = logging.getLogger("MemoryMonitor")
+        self.warning_threshold_mb = warning_threshold_mb
+        self.critical_threshold_mb = critical_threshold_mb
+        self.check_interval = check_interval
+        
+        # 获取当前进程
+        self.process = psutil.Process()
+        
+        # 内存统计
+        self.peak_memory_mb = 0.0
+        self.last_check_time = time.time()
+        self.check_count = 0
+        
+        # 告警状态
+        self.warning_triggered = False
+        self.critical_triggered = False
+        
+        self.logger.info(f"✅ 内存监控器已启动")
+        self.logger.info(f"   警告阈值: {warning_threshold_mb:.1f} MB")
+        self.logger.info(f"   严重阈值: {critical_threshold_mb:.1f} MB")
+        self.logger.info(f"   检查间隔: {check_interval} 秒")
+    
+    def get_memory_usage(self) -> Dict[str, float]:
+        """
+        获取当前内存使用情况
+        
+        Returns
+        -------
+        Dict[str, float]
+            包含内存使用信息的字典
+        """
+        try:
+            mem_info = self.process.memory_info()
+            
+            # RSS (Resident Set Size): 实际物理内存使用量
+            rss_mb = mem_info.rss / (1024 * 1024)
+            
+            # VMS (Virtual Memory Size): 虚拟内存使用量
+            vms_mb = mem_info.vms / (1024 * 1024)
+            
+            # 更新峰值
+            if rss_mb > self.peak_memory_mb:
+                self.peak_memory_mb = rss_mb
+            
+            return {
+                'rss_mb': rss_mb,  # 物理内存（MB）
+                'vms_mb': vms_mb,  # 虚拟内存（MB）
+                'peak_mb': self.peak_memory_mb,  # 峰值内存（MB）
+                'percent': self.process.memory_percent(),  # 占系统总内存百分比
+            }
+        except Exception as e:
+            self.logger.error(f"获取内存使用失败: {e}")
+            return {'rss_mb': 0, 'vms_mb': 0, 'peak_mb': 0, 'percent': 0}
+    
+    def check_memory(self) -> Dict[str, Any]:
+        """
+        检查内存使用情况并触发告警
+        
+        Returns
+        -------
+        Dict[str, Any]
+            内存检查结果
+        """
+        current_time = time.time()
+        
+        # 检查是否需要执行检查
+        if current_time - self.last_check_time < self.check_interval:
+            return {'checked': False}
+        
+        self.last_check_time = current_time
+        self.check_count += 1
+        
+        # 获取内存使用
+        mem_usage = self.get_memory_usage()
+        rss_mb = mem_usage['rss_mb']
+        
+        # 检查告警级别
+        alert_level = 'normal'
+        alert_message = None
+        
+        if rss_mb >= self.critical_threshold_mb:
+            alert_level = 'critical'
+            alert_message = f"⛔ 【严重】内存使用达到严重级别: {rss_mb:.1f} MB (阈值: {self.critical_threshold_mb:.1f} MB)"
+            
+            # 只在第一次触发时记录完整信息
+            if not self.critical_triggered:
+                self.logger.critical(alert_message)
+                self.logger.critical(f"   虚拟内存: {mem_usage['vms_mb']:.1f} MB")
+                self.logger.critical(f"   系统占比: {mem_usage['percent']:.1f}%")
+                self.logger.critical(f"   峰值内存: {mem_usage['peak_mb']:.1f} MB")
+                self.critical_triggered = True
+                self.warning_triggered = True
+        
+        elif rss_mb >= self.warning_threshold_mb:
+            alert_level = 'warning'
+            alert_message = f"⚠️  【警告】内存使用超过警告阈值: {rss_mb:.1f} MB (阈值: {self.warning_threshold_mb:.1f} MB)"
+            
+            # 只在第一次触发时记录完整信息
+            if not self.warning_triggered:
+                self.logger.warning(alert_message)
+                self.logger.warning(f"   虚拟内存: {mem_usage['vms_mb']:.1f} MB")
+                self.logger.warning(f"   系统占比: {mem_usage['percent']:.1f}%")
+                self.logger.warning(f"   峰值内存: {mem_usage['peak_mb']:.1f} MB")
+                self.warning_triggered = True
+        
+        else:
+            # 如果内存降下来了，重置告警状态
+            if self.warning_triggered and rss_mb < self.warning_threshold_mb * 0.8:
+                self.logger.info(f"✅ 内存使用恢复正常: {rss_mb:.1f} MB")
+                self.warning_triggered = False
+                self.critical_triggered = False
+        
+        # 定期记录内存统计（每10次检查记录一次）
+        if self.check_count % 10 == 0:
+            self.logger.info(f"📊 内存统计 (第{self.check_count}次检查)")
+            self.logger.info(f"   当前物理内存: {rss_mb:.1f} MB")
+            self.logger.info(f"   峰值内存: {mem_usage['peak_mb']:.1f} MB")
+            self.logger.info(f"   系统占比: {mem_usage['percent']:.1f}%")
+        
+        return {
+            'checked': True,
+            'alert_level': alert_level,
+            'alert_message': alert_message,
+            'memory_usage': mem_usage,
+            'check_count': self.check_count,
+        }
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """
+        获取内存统计信息
+        
+        Returns
+        -------
+        Dict[str, Any]
+            内存统计信息
+        """
+        mem_usage = self.get_memory_usage()
+        
+        return {
+            'current_mb': mem_usage['rss_mb'],
+            'peak_mb': mem_usage['peak_mb'],
+            'percent': mem_usage['percent'],
+            'warning_threshold_mb': self.warning_threshold_mb,
+            'critical_threshold_mb': self.critical_threshold_mb,
+            'check_count': self.check_count,
+            'warning_triggered': self.warning_triggered,
+            'critical_triggered': self.critical_triggered,
+        }
+    
+    def reset_peak(self) -> None:
+        """重置峰值内存记录"""
+        self.peak_memory_mb = 0.0
+        self.logger.info("🔄 峰值内存已重置")
+
+
 class ETF159506DataSaver:
     """159506 ETF数据保存管理器 - 支持流式保存到磁盘"""
     
@@ -68,9 +253,9 @@ class ETF159506DataSaver:
         self.catalog_path = catalog_path
         self.catalog = None
         self.instrument_id = InstrumentId.from_str("159506.SZSE")
-        # 分离缓冲区，避免混合存储导致的数据保存问题
-        self.quote_buffer = []  # QuoteTick专用缓冲区
-        self.trade_buffer = []  # TradeTick专用缓冲区
+        # ✅ 改进1: 使用deque限制缓冲区大小，避免内存无限增长
+        self.quote_buffer = deque(maxlen=10000)  # QuoteTick专用缓冲区（最多10000条）
+        self.trade_buffer = deque(maxlen=10000)  # TradeTick专用缓冲区（最多10000条）
         self.last_save_time = time.time()
        
         
@@ -1063,6 +1248,15 @@ class ETF159506Adapter:
         self.config = config
         self.logger = logging.getLogger("ETF159506Adapter")
         
+        # ✅ 初始化内存监控器
+        memory_config = config.get('memory_monitor', {})
+        self.memory_monitor = MemoryMonitor(
+            warning_threshold_mb=memory_config.get('warning_threshold_mb', 500.0),
+            critical_threshold_mb=memory_config.get('critical_threshold_mb', 1000.0),
+            check_interval=memory_config.get('check_interval', 60),
+        )
+        self.logger.info("✅ 内存监控器已集成到适配器")
+        
         # 初始化组件
         self.http_client = ETF159506HttpClient(config)
         
@@ -1140,16 +1334,23 @@ class ETF159506Adapter:
     # 注意：get_data_client和get_execution_client方法已移除，数据客户端和执行客户端现在都由NautilusTrader管理
     
     async def get_status(self) -> Dict:
-        """获取适配器状态"""
-        return {
+        """获取适配器状态（包含内存监控信息）"""
+        # ✅ 检查内存使用情况
+        memory_check = self.memory_monitor.check_memory()
+        
+        status = {
             'adapter_name': 'ETF159506Adapter',
             'is_connected': self.is_connected,
             'connection_attempts': self.connection_attempts,
             'max_connection_attempts': self.max_connection_attempts,
             'instruments_count': self.instrument_provider.count,
             'http_client_connected': self.http_client.is_connected,
+            # ✅ 添加内存监控信息
+            'memory_stats': self.memory_monitor.get_memory_stats(),
             # 注意：数据客户端和执行客户端状态现在都由NautilusTrader管理
         }
+        
+        return status
     
     async def reset_connection_attempts(self) -> None:
         """重置连接尝试次数"""
@@ -1403,9 +1604,15 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         self.current_minute_start_volume = {}    # {bar_type: 当前分钟开始时的累计成交量}
         self.current_minute_key = {}             # {bar_type: 当前分钟标识"HH:MM"}
         
-        # 1分钟Bar聚合器：从tick数据聚合成分钟Bar
+        # ✅ 改进2: 1分钟Bar聚合器 - 使用deque限制历史Bar数量
         self.current_minute_bar_data = {}        # {bar_type: {open, high, low, close, volume, ts_start}}
-        self.completed_minute_bar = {}           # {bar_type: Bar对象} 存储上一分钟完成的Bar
+        # 使用deque存储已完成的Bar，限制最多10000条历史Bar
+        self._completed_bars_deque = deque(maxlen=10000)  # 统一存储所有bar_type的历史Bar
+        self.completed_minute_bar = {}           # {bar_type: Bar对象} 存储上一分钟完成的Bar（仅最新一条）
+        
+        # Bar清理计数器 - 每处理1000个bar检查一次字典大小
+        self._bar_process_count = 0
+        self._bar_cleanup_threshold = 1000
         
         self._set_connected(False)
         
@@ -2123,7 +2330,12 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         self.token = jvquant_config.get('token')
         # ✅ 复用全局适配器的HTTP客户端（避免重复连接）
         self.http_client = global_adapter.http_client
+        
+        # ✅ 改进3: 使用deque限制订单历史，避免无限增长
+        # 活跃订单字典（当前未完成的订单）
         self.orders = {}
+        # 历史订单队列（已完成/已取消的订单，限制10000条）
+        self._completed_orders = deque(maxlen=10000)
         
         # 交易相关
         self.trade_server = None
@@ -2137,8 +2349,15 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         
         self._set_connected(False)
         
-        # 订单ID映射：NautilusTrader client_order_id -> jvquant order_id
+        # ✅ 改进3: 订单ID映射也使用deque限制
+        # 活跃映射字典（当前未完成的订单映射）
         self._order_id_mapping = {}
+        # 历史映射队列（已完成订单的映射，限制10000条）
+        self._completed_order_id_mapping = deque(maxlen=10000)
+        
+        # 订单清理相关
+        self._order_cleanup_count = 0
+        self._order_cleanup_threshold = 100  # 每100个订单检查一次清理
         
         # 股票代码到名称的映射（可从配置读取）
         default_names = {
