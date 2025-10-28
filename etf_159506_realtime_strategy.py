@@ -245,6 +245,48 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
 
+    def _round_to_lot_size(self, quantity: int, lot_size: int = 100) -> int:
+        """
+        将订单数量规整到交易所要求的最小交易单位（手数）
+        
+        Pythonic原则：
+        - Explicit: 显式的lot_size参数
+        - Simple: 简单的向下取整逻辑
+        - Practical: 避免订单被交易所拒绝
+        
+        Parameters
+        ----------
+        quantity : int
+            原始订单数量（股）
+        lot_size : int, optional
+            最小交易单位（股/手），默认100股
+            - 深交所ETF: 100股/手
+            - 上交所ETF: 100股/手
+        
+        Returns
+        -------
+        int
+            规整后的数量（保证是lot_size的整数倍）
+        
+        Examples
+        --------
+        >>> _round_to_lot_size(148460, 100)
+        148400  # 向下取整到100的倍数
+        >>> _round_to_lot_size(99, 100)
+        0  # 不足1手，返回0
+        """
+        if quantity < lot_size:
+            self._log.warning(f"⚠️  订单数量 {quantity} 小于最小交易单位 {lot_size}，无法交易")
+            return 0
+        
+        # 向下取整到lot_size的整数倍
+        rounded_quantity = (quantity // lot_size) * lot_size
+        
+        if rounded_quantity != quantity:
+            self._log.info(f"📐 订单数量规整: {quantity} → {rounded_quantity} (手数: {rounded_quantity // lot_size})")
+        
+        return rounded_quantity
+    
     def on_stop(self):
         """策略停止时调用"""
         # current_position = self.get_current_position()
@@ -1660,11 +1702,14 @@ class ETF159506Strategy(Strategy):
             
             # ✅ 用订单价格计算数量，避免超出可用余额
             # 留0.1%的安全边际，防止手续费等导致余额不足
-            quantity = int(available_balance * 0.999 / buy_price_value)
+            raw_quantity = int(available_balance * 0.999 / buy_price_value)
             
-            # 检查计算出的数量是否有效
+            # ✅ 规整到100股的整数倍（交易所要求）
+            quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
+            
+            # 检查规整后的数量是否有效
             if quantity <= 0:
-                self._log.info(f"计算出的交易数量无效: {quantity}，跳过买入信号")
+                self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），跳过买入信号")
                 return
                 
             trade_quantity = Quantity.from_int(quantity)
@@ -1800,9 +1845,13 @@ class ETF159506Strategy(Strategy):
             
             # ✅ 用订单价格计算数量，避免超出可用余额
             # 留0.1%的安全边际，防止手续费等导致余额不足
-            quantity = int(available_balance * 0.999 / buy_price_value)
+            raw_quantity = int(available_balance * 0.999 / buy_price_value)
+            
+            # ✅ 规整到100股的整数倍（交易所要求）
+            quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
+            
             if quantity <= 0:
-                self._log.info(f"计算出的交易数量无效: {quantity}，跳过背离买入信号")
+                self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），跳过背离买入信号")
                 return
                 
             trade_quantity = Quantity.from_int(quantity)
@@ -2119,14 +2168,17 @@ class ETF159506Strategy(Strategy):
                 
                 # ✅ 用订单价格计算数量，避免超出可用余额
                 # 留0.1%的安全边际，防止手续费等导致余额不足
-                quantity = int(available_balance * 0.999 / buy_price_value)
+                raw_quantity = int(available_balance * 0.999 / buy_price_value)
+                
+                # ✅ 规整到100股的整数倍（交易所要求）
+                quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
                 
                 self._log.info(f"交易计算: 可用余额={available_balance:.2f}, 收盘价={bar.close.as_double():.4f}, "
-                             f"订单价格={buy_price_value:.4f}, 计算数量={quantity}, 预计花费={quantity * buy_price_value:.2f}")
+                             f"订单价格={buy_price_value:.4f}, 原始数量={raw_quantity}, 规整后数量={quantity}, 预计花费={quantity * buy_price_value:.2f}")
                 
-                # 检查计算出的数量是否有效
+                # 检查规整后的数量是否有效
                 if quantity <= 0:
-                    self._log.warning(f"计算出的交易数量无效: {quantity}，无法执行定时买入")
+                    self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），无法执行定时买入")
                     return False
                     
                 trade_quantity = Quantity.from_int(quantity)
