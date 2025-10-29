@@ -111,8 +111,7 @@ class ETF159506Strategy(Strategy):
         self.technical_signal = 0  # 技术指标信号累积值，+100买入，-100卖出
         self.buy_threshold = 100   # 买入信号阈值
         self.sell_threshold = -100 # 卖出信号阈值
-        self.macd_top_signal = False
-        self.macd_bottom_signal = False
+        self.technical_signal_steps = []  # 记录每分钟的计算步骤
         # 记录极值点检测参数
         self._log.info(f"极值点检测参数: 回看极值点数量={self.divergence_lookback_peaks}, 最大极值点数量={config.max_extremes}")
         self._log.info(f"DIF信号过滤: 阈值={abs(self.divergence_threshold):.6f} (过滤DIF绝对值小于此值的金叉死叉和背离信号)")
@@ -502,6 +501,9 @@ class ETF159506Strategy(Strategy):
         
     def on_bar(self, bar: Bar):
         """处理K线数据"""
+        # 清空本分钟的计算步骤记录
+        self.technical_signal_steps = []
+        
         # 记录每分钟成交量
         self._process_bar(bar)
         # Show latest bars
@@ -527,12 +529,81 @@ class ETF159506Strategy(Strategy):
         self.check_macd_signals(last_bar)
         self.check_macd_top_signals(last_bar)
         self.check_macd_bottom_signals(last_bar)
-        self.check_risk_management(last_bar)
         self._log.info(f"on_bar: 时间={beijing_time_str} technical_signal={self.technical_signal}")
         
         # 每分钟更新图表（非阻塞方式）
         # 在重置前先保存当前的 technical_signal 值用于图表显示
         current_technical_signal = self.technical_signal
+        
+        # ========== 输出本分钟 technical_signal 的详细计算过程 ==========
+        self._log.info("=" * 80)
+        self._log.info(f"【{beijing_time_str}】technical_signal 计算过程汇总")
+        self._log.info("=" * 80)
+        
+        # 显示计算步骤
+        if self.technical_signal_steps:
+            self._log.info("计算步骤明细:")
+            cumulative_value = 0.0
+            for i, step in enumerate(self.technical_signal_steps, 1):
+                cumulative_value += step['delta']
+                self._log.info(f"  步骤{i}: {step['description']}")
+                self._log.info(f"         变化值: {step['delta']:+.2f}, 累积值: {cumulative_value:.2f}")
+        else:
+            self._log.info("本分钟无信号计算步骤")
+        
+        self._log.info("-" * 80)
+        self._log.info(f"最终信号值: {current_technical_signal:.2f}")
+        self._log.info(f"买入阈值: {self.buy_threshold}, 卖出阈值: {self.sell_threshold}")
+        
+        # 显示当前MACD相关指标
+        if len(self.macd_history) > 0 and len(self.signal_history) > 0:
+            current_macd = self.macd_history[-1]
+            current_signal = self.signal_history[-1]
+            current_histogram = current_macd - current_signal
+            self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
+        
+        # 显示RSI
+        if self.rsi.initialized:
+            rsi_value = self.rsi.value * 100
+            self._log.info(f"RSI指标: {rsi_value:.2f}")
+        else:
+            self._log.info("RSI指标: 未初始化")
+        
+        # 显示KDJ
+        if self.kdj.initialized:
+            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+            kdj_max_diff = max(kdj_values) - min(kdj_values)
+            self._log.info(f"KDJ指标: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}, 最大差值={kdj_max_diff:.2f}")
+        else:
+            self._log.info("KDJ指标: 未初始化")
+        
+        # 显示极值点信息
+        if hasattr(self, 'latest_extreme_type') and self.latest_extreme_type:
+            self._log.info(f"最近极值点类型: {self.latest_extreme_type}")
+            if self.time_diff_minutes_from_latest_extreme is not None:
+                self._log.info(f"距离最近极值点: {self.time_diff_minutes_from_latest_extreme:.2f}分钟")
+        
+        # 显示本分钟触发的信号类型
+        if current_technical_signal > 0:
+            self._log.info("信号方向: 【买入】")
+        elif current_technical_signal < 0:
+            self._log.info("信号方向: 【卖出】")
+        else:
+            self._log.info("信号方向: 【无信号】")
+        
+        self._log.info("=" * 80)
+        # ========== 计算过程汇总结束 ==========
+        
+        # ========== 统一判断买入/卖出阈值 ==========
+        if current_technical_signal >= self.buy_threshold:
+            self._log.info(f"【买入信号达到阈值】信号值={current_technical_signal:.2f} >= 买入阈值={self.buy_threshold}")
+            self.execute_buy_signal(last_bar)
+        elif current_technical_signal <= self.sell_threshold:
+            self._log.info(f"【卖出信号达到阈值】信号值={current_technical_signal:.2f} <= 卖出阈值={self.sell_threshold}")
+            self.execute_sell_signal(last_bar)
+        else:
+            self._log.info(f"【未达到交易阈值】信号值={current_technical_signal:.2f}, 需要达到 ≥{self.buy_threshold}(买入) 或 ≤{self.sell_threshold}(卖出)")
+        # ========== 买入/卖出判断结束 ==========
         
         # 记录每分钟的技术信号累积值
         signal_record = {
@@ -766,6 +837,10 @@ class ETF159506Strategy(Strategy):
                         signal_strength = (base_signal * abs(min_trough_value)) ** power * volume_ratio
                         
                         self.technical_signal += signal_strength
+                        self.technical_signal_steps.append({
+                            'description': f'极小值信号(min_trough={min_trough_value:.6f}, 成交量比值={volume_ratio:.4f})',
+                            'delta': signal_strength
+                        })
                         self._log.info(f"极小值信号触发: min_trough_value={min_trough_value:.6f}, 动态信号强度={signal_strength:.1f}, 当前信号值={self.technical_signal}")
                        
                         # 记录极小值技术指标信号
@@ -786,12 +861,6 @@ class ETF159506Strategy(Strategy):
                         
                         self.technical_signals.append(technical_signal)
                         self._log.info(f"记录极小值技术信号: {technical_signal}")
-                        
-                        # 检查是否达到买入阈值
-                        if self.technical_signal >= self.buy_threshold:
-                            self._log.info(f"极小值买入信号达到阈值{self.buy_threshold}，执行买入操作")
-                            self.execute_buy_signal(bar)
-                            self.technical_signal = 0  # 信号归零
                             
                     else:
                         self._log.info(f"从{time_str}到当前时间中未找到极小值")
@@ -914,13 +983,23 @@ class ETF159506Strategy(Strategy):
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
                 # 避免除零错误，当rank_ratio为0时使用一个很小的值
                 safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
-                self.technical_signal -= 10/volume_ratio+safe_rank_ratio*30
+                top_signal_contribution = -(10/volume_ratio+safe_rank_ratio*30)
+                self.technical_signal += top_signal_contribution
+                self.technical_signal_steps.append({
+                    'description': f'顶部信号(成交量比值={volume_ratio:.4f}, 排名比例={safe_rank_ratio:.3f})',
+                    'delta': top_signal_contribution
+                })
                 self._log.info(f"成交量比值: {volume_ratio:.4f}")
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
                     rsi_value = self.rsi.value * 100
-                    self.technical_signal -= rsi_value - 60
+                    rsi_contribution = -(rsi_value - 60)
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'顶部信号RSI调整(RSI={rsi_value:.2f}, 贡献=-(RSI-60))',
+                        'delta': rsi_contribution
+                    })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
@@ -934,27 +1013,23 @@ class ETF159506Strategy(Strategy):
                 
                 # 如果KDJ三个值最大差值小于10且都小于20，增强信号
                 if kdj_max_diff < 20:
-                    self.technical_signal -= 40-kdj_max_diff
+                    kdj_contribution = -(40-kdj_max_diff)
+                    self.technical_signal += kdj_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'顶部信号KDJ调整(最大差值={kdj_max_diff:.2f}, 贡献=-(40-差值))',
+                        'delta': kdj_contribution
+                    })
                     self._log.info("KDJ条件满足：最大差值<20且超卖，增强买入信号")
                 else:
                     self._log.info("KDJ条件不满足，使用标准信号")
                 self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
-        
-                
-                # 检查是否达到卖出阈值
-                if self.technical_signal <= self.sell_threshold:
-                    self._log.info(f"卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
-                    self.execute_sell_signal(bar, signal_type='macd_top_signals')
-                    self.technical_signal = 0  # 信号归零
-                    self.macd_top_signal = True
-                    self.macd_bottom_signal = False
             else:
                 self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
         else:
             self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} >= 0.2, 无需计算成交量比值")
     def check_macd_bottom_signals(self, bar: Bar):
         rank_ratio = self.check_macd_rank('trough')  # 比较极小值
-        if self.macd_top_signal and self.latest_extreme_type == 'trough':
+        if self.latest_extreme_type == 'trough':
             # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
             if self.time_diff_minutes_from_latest_extreme is not None:
                 # 根据时间差计算索引
@@ -976,13 +1051,23 @@ class ETF159506Strategy(Strategy):
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
                 # 避免除零错误，当rank_ratio为0时使用一个很小的值
                 safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
-                self.technical_signal += 10/volume_ratio+safe_rank_ratio*30
+                bottom_signal_contribution = 10/volume_ratio+safe_rank_ratio*30
+                self.technical_signal += bottom_signal_contribution
+                self.technical_signal_steps.append({
+                    'description': f'底部信号(成交量比值={volume_ratio:.4f}, 排名比例={safe_rank_ratio:.3f})',
+                    'delta': bottom_signal_contribution
+                })
                 self._log.info(f"成交量比值: {volume_ratio:.4f}")
                 self._log.info(f"技术信号: {self.technical_signal:.2f}")
                  # 检查RSI条件
                 if self.rsi.initialized:
                     rsi_value = self.rsi.value * 100
-                    self.technical_signal += 80 - rsi_value
+                    rsi_contribution = 80 - rsi_value
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'底部信号RSI调整(RSI={rsi_value:.2f}, 贡献=80-RSI)',
+                        'delta': rsi_contribution
+                    })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
 
@@ -995,22 +1080,18 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
                 
                 # 如果KDJ三个值最大差值小于10且都小于20，增强信号
-                self.technical_signal += 60-self.kdj.value_k
+                kdj_contribution = 60-self.kdj.value_k
+                self.technical_signal += kdj_contribution
+                self.technical_signal_steps.append({
+                    'description': f'底部信号KDJ调整(K={self.kdj.value_k:.2f}, 贡献=60-K)',
+                    'delta': kdj_contribution
+                })
                 
                 self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
-        
-                
-                # 检查是否达到买入阈值
-                if self.technical_signal >= self.buy_threshold:
-                    self._log.info(f"买入信号达到阈值{self.buy_threshold}，执行买入操作")
-                    self.execute_buy_signal(bar, signal_type='macd_bottom_signals')
-                    self.technical_signal = 0  # 信号归零
-                    self.macd_top_signal = False
-                    self.macd_bottom_signal = True
             else:
                 self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
         else:
-            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f}, 无需计算成交量比值, 最近极值点类型={self.latest_extreme_type} 或 macd_top_signal={self.macd_top_signal}")
+            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f}, 无需计算成交量比值, 最近极值点类型={self.latest_extreme_type}")
 
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
@@ -1045,7 +1126,7 @@ class ETF159506Strategy(Strategy):
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0 and not self.macd_bottom_signal:
+        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0:
             # 获取前5个DIF值（不包括当前值）
             last_five_dif = list(self.macd_history)[-6:-1]  # 前5个值
             current_dif = current_macd
@@ -1074,9 +1155,9 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"DIF单调递减检查: 前5个DIF值={last_five_dif}, 当前DIF={current_dif}, 是否单调递减={is_monotonic_decreasing}")
             self._log.info(f"卖出操作检查: 当前时间={current_timestamp}, 是否有卖出操作={has_sell_operation}")
             
-            # 如果前5个DIF单调递减且当前DIF<0且最后一个交易不是SELL，执行全部卖出
+            # 如果前5个DIF单调递减且当前DIF<0且最后一个交易不是SELL，添加卖出信号
             if is_monotonic_decreasing and not has_sell_operation:
-                self._log.info(f"检测到DIF<0且前5个DIF单调递减且最后一个交易不是SELL，执行全部卖出")
+                self._log.info(f"检测到DIF<0且前5个DIF单调递减且最后一个交易不是SELL")
                 self._log.info(f"前5个DIF值: {last_five_dif}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
@@ -1089,16 +1170,22 @@ class ETF159506Strategy(Strategy):
                     max_dif_diff = max_dif - min_dif
                     self._log.info(f"最近三个MACD极值点DIF值: {dif_values}, 最大差值: {max_dif_diff:.6f}")
                     if max_dif_diff < 0.0005:
-                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值小于0.0005，跳过卖出操作")
+                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值小于0.0005，跳过卖出信号")
                         return
                 else:
                     self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")
-                # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
+                # 检查当前时间是否在2:50分之后，如果是则跳过卖出信号
                 if self.is_after_scheduled_time(bar):
-                    self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
+                    self._log.info(f"当前时间已过2:50分，跳过卖出信号")
                     return
-                # 执行全部卖出
-                self.execute_sell_signal(bar ,signal_type='DIF<0且前五个DIF都是单调递减')
+                # 不再直接卖出，而是给 technical_signal 减 300
+                dif_decreasing_contribution = -300
+                self.technical_signal += dif_decreasing_contribution
+                self.technical_signal_steps.append({
+                    'description': f'DIF<0且前五个DIF都是单调递减(固定贡献=-300)',
+                    'delta': dif_decreasing_contribution
+                })
+                self._log.info(f"DIF单调递减卖出信号：减少信号值 {dif_decreasing_contribution}，当前信号值={self.technical_signal:.2f}")
                 
                 return
         
@@ -1128,13 +1215,23 @@ class ETF159506Strategy(Strategy):
             # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
             is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
             signal_coefficient = 40000 if is_first_golden_cross else 20000
-            self.technical_signal += signal_coefficient*current_macd_abs
+            macd_contribution = signal_coefficient*current_macd_abs
+            self.technical_signal += macd_contribution
+            self.technical_signal_steps.append({
+                'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f})',
+                'delta': macd_contribution
+            })
             self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
 
             # 检查RSI条件
             if self.rsi.initialized:
                 rsi_value = self.rsi.value * 100
-                self.technical_signal += 50 - rsi_value
+                rsi_contribution = 50 - rsi_value
+                self.technical_signal += rsi_contribution
+                self.technical_signal_steps.append({
+                    'description': f'RSI调整(RSI={rsi_value:.2f}, 贡献=50-RSI)',
+                    'delta': rsi_contribution
+                })
                 self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
             else:
                 rsi_status = f"{self.rsi.value * 100:.2f}" if self.rsi.initialized else "未初始化"
@@ -1153,7 +1250,12 @@ class ETF159506Strategy(Strategy):
             
             # 如果KDJ三个值最大差值小于10且都小于20，增强信号
             if kdj_max_diff < 20 and kdj_oversold:
-                self.technical_signal += 40-kdj_max_diff
+                kdj_contribution = 40-kdj_max_diff
+                self.technical_signal += kdj_contribution
+                self.technical_signal_steps.append({
+                    'description': f'KDJ调整(最大差值={kdj_max_diff:.2f}, 超卖, 贡献=40-差值)',
+                    'delta': kdj_contribution
+                })
                 self._log.info("KDJ条件满足：最大差值<20且超卖，增强买入信号")
             else:
                 self._log.info("KDJ条件不满足，使用标准信号")
@@ -1174,12 +1276,6 @@ class ETF159506Strategy(Strategy):
             }
             self.technical_signals.append(technical_signal)
             self._log.info(f"记录金叉技术信号: {technical_signal}")
-            
-            # 检查是否达到买入阈值
-            if self.technical_signal >= self.buy_threshold:
-                self._log.info(f"金叉买入信号达到阈值{self.buy_threshold}，执行买入操作")
-                self.execute_buy_signal(bar)
-                self.technical_signal = 0  # 信号归零
         
         elif death_cross:
             self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
@@ -1195,14 +1291,24 @@ class ETF159506Strategy(Strategy):
             # 如果是第一个死叉技术信号，使用40000系数，否则使用20000
             is_first_death_cross = not any(signal.get('signal_type') == 'death_cross' for signal in self.technical_signals)
             signal_coefficient = 40000 if is_first_death_cross else 20000
-            self.technical_signal -= signal_coefficient*current_macd_abs
+            macd_contribution = -signal_coefficient*current_macd_abs
+            self.technical_signal += macd_contribution
+            self.technical_signal_steps.append({
+                'description': f'死叉信号(系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f})',
+                'delta': macd_contribution
+            })
             self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
             if self.rsi.initialized:
                 rsi_value = self.rsi.value * 100
                 if rsi_value < 50:
-                    self.technical_signal -= rsi_value
+                    rsi_contribution = -rsi_value
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'RSI调整(RSI={rsi_value:.2f} < 50, 贡献=-RSI)',
+                        'delta': rsi_contribution
+                    })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强卖出信号")
                 else:
                     self._log.info(f"RSI条件不满足：RSI={rsi_value:.2f}")
@@ -1221,7 +1327,12 @@ class ETF159506Strategy(Strategy):
             
             # 如果KDJ三个值最大差值小于10且都大于80，增强信号
             if kdj_max_diff < 20 and kdj_oversold:
-                self.technical_signal -= 30-kdj_max_diff
+                kdj_contribution = -(30-kdj_max_diff)
+                self.technical_signal += kdj_contribution
+                self.technical_signal_steps.append({
+                    'description': f'KDJ调整(最大差值={kdj_max_diff:.2f}, 超买, 贡献=-(30-差值))',
+                    'delta': kdj_contribution
+                })
                 self._log.info("KDJ条件满足：最大差值<20且超买，增强卖出信号")
             else:
                 self._log.info("KDJ条件不满足，使用标准信号")
@@ -1241,12 +1352,6 @@ class ETF159506Strategy(Strategy):
             }
             self.technical_signals.append(technical_signal)
             self._log.info(f"记录死叉技术信号: {technical_signal}")
-            
-            # 检查是否达到卖出阈值
-            if self.technical_signal <= self.sell_threshold:
-                self._log.info(f"死叉卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
-                self.execute_sell_signal(bar)
-                self.technical_signal = 0  # 信号归零
     
     def check_divergence(self, bar: Bar, action: str):
         """检查DIF背离信号"""
@@ -1602,7 +1707,12 @@ class ETF159506Strategy(Strategy):
         
         # 累积卖出信号
         if action == 'keep':
-            self.technical_signal -= 30
+            divergence_contribution = -30
+            self.technical_signal += divergence_contribution
+            self.technical_signal_steps.append({
+                'description': f'顶背离信号(DIF创新高但价格未创新高, 固定贡献=-30)',
+                'delta': divergence_contribution
+            })
         self._log.info(f"顶背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录顶背离技术信号
@@ -1615,12 +1725,6 @@ class ETF159506Strategy(Strategy):
         }
         self.technical_signals.append(divergence_signal)
         self._log.info(f"记录顶背离技术信号: {divergence_signal}")
-        
-        # 检查是否达到卖出阈值
-        if self.technical_signal <= self.sell_threshold:
-            self._log.info(f"顶背离卖出信号达到阈值{self.sell_threshold}，执行卖出操作")
-            self.execute_divergence_sell_signal(bar)
-            self.technical_signal = 0  # 信号归零
     
     def handle_bottom_divergence(self, bar: Bar, action: str):
         """处理底背离信号"""
@@ -1639,7 +1743,12 @@ class ETF159506Strategy(Strategy):
         
         # 累积买入信号
         if action == 'keep':
-            self.technical_signal += 30
+            divergence_contribution = 30
+            self.technical_signal += divergence_contribution
+            self.technical_signal_steps.append({
+                'description': f'底背离信号(DIF创新低但价格未创新低, 固定贡献=+30)',
+                'delta': divergence_contribution
+            })
         self._log.info(f"底背离信号累积: 当前信号值={self.technical_signal}")
         
         # 记录底背离技术信号
@@ -1652,64 +1761,114 @@ class ETF159506Strategy(Strategy):
         }
         self.technical_signals.append(divergence_signal)
         self._log.info(f"记录底背离技术信号: {divergence_signal}")
-        
-        # 检查是否达到买入阈值
-        if self.technical_signal >= self.buy_threshold:
-            self._log.info(f"底背离买入信号达到阈值{self.buy_threshold}，执行买入操作")
-            self.execute_divergence_buy_signal(bar)
-            self.technical_signal = 0  # 信号归零
     
-    def execute_buy_signal(self, bar: Bar, signal_type: str = 'executed_buy'):
-        """执行买入信号"""
-        # ✅ 先撤销所有未成交的委托（避免资金冻结和重复下单）
+    def _execute_buy_order(
+        self, 
+        bar: Bar, 
+        signal_type: str,
+        signal_value: int = 0,
+        log_detailed_balance: bool = False,
+        log_time_info: bool = False
+    ) -> bool:
+        """核心买入逻辑（内部方法）
+        
+        将买入逻辑统一到一个方法中，避免代码重复。
+        
+        Args:
+            bar: K线数据
+            signal_type: 信号类型（'executed_buy'/'scheduled_buy'等）
+            signal_value: 技术指标信号值
+            log_detailed_balance: 是否记录详细的账户余额信息（总余额、冻结余额等）
+            log_time_info: 是否记录UTC和北京时间信息
+            
+        Returns:
+            bool: True表示订单成功提交，False表示执行失败
+        """
+        # ✅ 先撤销所有未成交的委托
         self.cancel_all_orders(self.config.instrument_id)
         self._log.info("已撤销所有未成交委托，准备下新单")
         
-        # 检查是否已有持仓 - 使用可靠的持仓查询方法
-        # current_position = self.get_current_position()
-        # if current_position is not None:
-        #     self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过买入信号")
-        #     return
+        # 可选的时间信息日志
+        if log_time_info:
+            current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+            current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+            self._log.info(
+                f"执行买入: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, "
+                f"北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         
         # 计算交易数量
         if self.trade_size is None:
             account = self.cache.account_for_venue(self.config.venue)
-            # ✅ 修复：使用 balance_free 获取可用余额
-            free_balance = account.balance_free(CNY)
-            if free_balance is None:
-                self._log.error("无法获取CNY可用余额，跳过买入信号")
-                return
-            
-            available_balance = free_balance.as_double()
-            
-            # ✅ 先计算订单价格（加价提高成交概率）
-            buy_price_value = bar.close.as_double() + 0.001
-            buy_price = self.instrument.make_price(buy_price_value)
-            
-            self._log.info(f"MACD买入信号 - 可用余额: {available_balance:.2f} CNY, 收盘价: {bar.close.as_double():.4f}, 订单价格: {buy_price_value:.4f}")
-            
-            # 检查可用余额
-            if available_balance <= 0:
-                self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过买入信号")
-                return
-            
-            # ✅ 用订单价格计算数量，避免超出可用余额
-            # 留0.1%的安全边际，防止手续费等导致余额不足
-            raw_quantity = int(available_balance * 0.999 / buy_price_value)
-            
-            # ✅ 规整到100股的整数倍（交易所要求）
-            quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
-            
-            # 检查规整后的数量是否有效
-            if quantity <= 0:
-                self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），跳过买入信号")
-                return
+            if account is None:
+                self._log.info("测试模式下无账户信息，使用固定交易数量")
+                trade_quantity = Quantity.from_int(100)
+                buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
+            else:
+                # ✅ 修复：使用 balance_free 获取可用余额
+                free_balance = account.balance_free(CNY)
+                if free_balance is None:
+                    self._log.error("无法获取CNY可用余额，买入失败")
+                    return False
                 
-            trade_quantity = Quantity.from_int(quantity)
+                available_balance = free_balance.as_double()
+                
+                # ✅ 先计算订单价格（加价提高成交概率）
+                buy_price_value = bar.close.as_double() + 0.001
+                buy_price = self.instrument.make_price(buy_price_value)
+                
+                # 详细或简洁的余额信息日志
+                if log_detailed_balance:
+                    total_balance = account.balance_total(CNY)
+                    locked_balance = account.balance_locked(CNY)
+                    self._log.info(
+                        f"账户余额详情: 总余额={total_balance.as_double():.2f}, "
+                        f"可用余额={available_balance:.2f}, "
+                        f"冻结余额={locked_balance.as_double() if locked_balance else 0:.2f}"
+                    )
+                else:
+                    self._log.info(
+                        f"买入信号 - 可用余额: {available_balance:.2f} CNY, "
+                        f"收盘价: {bar.close.as_double():.4f}, "
+                        f"订单价格: {buy_price_value:.4f}"
+                    )
+                
+                # 检查可用余额
+                if available_balance <= 0:
+                    self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法买入")
+                    return False
+                
+                # ✅ 用订单价格计算数量，避免超出可用余额
+                # 留0.1%的安全边际，防止手续费等导致余额不足
+                raw_quantity = int(available_balance * 0.999 / buy_price_value)
+                
+                # ✅ 规整到100股的整数倍（交易所要求）
+                quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
+                
+                # 可选的详细计算日志
+                if log_detailed_balance:
+                    self._log.info(
+                        f"交易计算: 可用余额={available_balance:.2f}, "
+                        f"收盘价={bar.close.as_double():.4f}, "
+                        f"订单价格={buy_price_value:.4f}, "
+                        f"原始数量={raw_quantity}, 规整后数量={quantity}, "
+                        f"预计花费={quantity * buy_price_value:.2f}"
+                    )
+                
+                # 检查规整后的数量是否有效
+                if quantity <= 0:
+                    self._log.warning(
+                        f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），无法买入"
+                    )
+                    return False
+                    
+                trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
             # ✅ 固定数量模式下仍需计算价格
             buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
+        
+        # 创建并提交订单
         order = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
@@ -1718,7 +1877,7 @@ class ETF159506Strategy(Strategy):
         )
         self.submit_order(order)
         
-        # 记录实际交易信号
+        # 记录交易信号
         trade_signal = {
             'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
             'price': buy_price.as_double(),
@@ -1726,40 +1885,84 @@ class ETF159506Strategy(Strategy):
             'quantity': trade_quantity.as_double(),
             'order_id': str(order.client_order_id),
             'signal_type': signal_type,
-            'signal_value': self.technical_signal
+            'signal_value': signal_value
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行买入交易: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
+        self._log.info(
+            f"买入订单已提交: 数量={trade_quantity}, "
+            f"价格={buy_price.as_double():.4f}, 类型={signal_type}"
+        )
+        return True
     
-    def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
-        """执行卖出信号 - 显式创建SELL订单"""
-        # ✅ 先撤销所有未成交的委托（避免重复卖出）
+    def execute_buy_signal(self, bar: Bar, signal_type: str = 'executed_buy'):
+        """执行买入信号
+        
+        基于技术指标信号执行买入操作。
+        """
+        self._execute_buy_order(
+            bar=bar,
+            signal_type=signal_type,
+            signal_value=self.technical_signal,
+            log_detailed_balance=False,
+            log_time_info=False
+        )
+    
+    def _execute_sell_order(
+        self,
+        bar: Bar,
+        signal_type: str,
+        signal_value: int = 0,
+        filter_by_strategy_id: bool = False
+    ) -> bool:
+        """核心卖出逻辑（内部方法）
+        
+        将卖出逻辑统一到一个方法中，避免代码重复。
+        
+        Args:
+            bar: K线数据
+            signal_type: 信号类型（'executed_sell'/'executed_divergence_sell'等）
+            signal_value: 技术指标信号值
+            filter_by_strategy_id: 是否按strategy_id过滤持仓
+                False: 查询所有持仓（用于策略重启场景）
+                True: 只查询当前策略的持仓
+        
+        Returns:
+            bool: True表示订单成功提交，False表示执行失败
+        """
+        # ✅ 先撤销所有未成交的委托
         self.cancel_all_orders(self.config.instrument_id)
         self._log.info("已撤销所有未成交委托，准备下卖单")
         
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
-            self._log.info(f"当前时间已过2:50分，跳过卖出信号执行")
-            return
+            self._log.info("当前时间已过2:50分，跳过卖出信号执行")
+            return False
         
-        # ✅ 只用 instrument_id 过滤，不用 strategy_id！
-        # 原因：策略重启后，之前的持仓可能有不同的 strategy_id
-        positions = self.cache.positions_open(
-            instrument_id=self.config.instrument_id
-        )
+        # 查询持仓（根据参数决定是否过滤strategy_id）
+        if filter_by_strategy_id:
+            positions = self.cache.positions_open(
+                instrument_id=self.config.instrument_id,
+                strategy_id=self.id
+            )
+        else:
+            # 不用 strategy_id 过滤 - 处理策略重启后的持仓
+            positions = self.cache.positions_open(
+                instrument_id=self.config.instrument_id
+            )
         
         if not positions:
             self._log.info("没有持仓，跳过卖出信号")
-            return
+            return False
         
-        # 记录持仓信息（用于调试）
-        self._log.info(f"找到 {len(positions)} 个持仓:")
-        for pos in positions:
-            self._log.info(
-                f"  - 方向={pos.side}, 数量={pos.quantity}, "
-                f"成本价={pos.avg_px_open}, 策略ID={pos.strategy_id}"
-            )
+        # 记录持仓信息（仅非strategy_id过滤时记录详细信息）
+        if not filter_by_strategy_id:
+            self._log.info(f"找到 {len(positions)} 个持仓:")
+            for pos in positions:
+                self._log.info(
+                    f"  - 方向={pos.side}, 数量={pos.quantity}, "
+                    f"成本价={pos.avg_px_open}, 策略ID={pos.strategy_id}"
+                )
         
         # 获取第一个持仓（通常只有一个）
         position = positions[0]
@@ -1767,12 +1970,15 @@ class ETF159506Strategy(Strategy):
         # 验证持仓方向（只处理多头持仓的卖出）
         if position.side != PositionSide.LONG:
             self._log.warning(f"持仓方向不是LONG而是{position.side}，跳过卖出")
-            return
+            return False
         
         # 获取持仓数量
         quantity = position.quantity
         
-        self._log.info(f"准备卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
+        self._log.info(
+            f"准备卖出: 持仓ID={position.id}, 数量={quantity}, "
+            f"价格={bar.close.as_double():.4f}"
+        )
         
         # ✅ 使用限价单（JVQuant 不支持市价单）
         # 卖出价格 -0.001 提高成交概率
@@ -1797,173 +2003,53 @@ class ETF159506Strategy(Strategy):
             'quantity': quantity.as_double(),
             'order_id': str(order.client_order_id),
             'signal_type': signal_type,
-            'signal_value': self.technical_signal
+            'signal_value': signal_value
         }
         self.trade_signals.append(trade_signal)
         
-        self._log.info(f"执行显式SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, 订单ID={order.client_order_id}")
+        self._log.info(
+            f"执行SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, "
+            f"订单ID={order.client_order_id}, 类型={signal_type}"
+        )
+        return True
+    
+    def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
+        """执行卖出信号
+        
+        基于技术指标信号执行卖出操作。
+        不按strategy_id过滤持仓，以便处理策略重启后的持仓。
+        """
+        self._execute_sell_order(
+            bar=bar,
+            signal_type=signal_type,
+            signal_value=self.technical_signal,
+            filter_by_strategy_id=False  # 不按strategy_id过滤，处理策略重启场景
+        )
     
     def execute_divergence_buy_signal(self, bar: Bar):
-        """执行背离买入信号"""
-        # ✅ 先撤销所有未成交的委托
-        self.cancel_all_orders(self.config.instrument_id)
-        self._log.info("已撤销所有未成交委托，准备下背离买入单")
+        """执行背离买入信号
         
-        # 检查是否已有持仓
-        # current_position = self.get_current_position()
-        # if current_position is not None:
-        #     self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过背离买入信号")
-        #     return
-        
-        # 计算交易数量
-        if self.trade_size is None:
-            account = self.cache.account_for_venue(self.config.venue)
-            # ✅ 修复：使用 balance_free 获取可用余额
-            free_balance = account.balance_free(CNY)
-            if free_balance is None:
-                self._log.error("无法获取CNY可用余额，跳过背离买入信号")
-                return
-            
-            available_balance = free_balance.as_double()
-            
-            # ✅ 先计算订单价格（加价提高成交概率）
-            buy_price_value = bar.close.as_double() + 0.001
-            buy_price = self.instrument.make_price(buy_price_value)
-            
-            self._log.info(f"背离买入信号 - 可用余额: {available_balance:.2f} CNY, 收盘价: {bar.close.as_double():.4f}, 订单价格: {buy_price_value:.4f}")
-            
-            if available_balance <= 0:
-                self._log.info(f"可用余额不足: {available_balance:.2f} CNY，跳过背离买入信号")
-                return
-            
-            # ✅ 用订单价格计算数量，避免超出可用余额
-            # 留0.1%的安全边际，防止手续费等导致余额不足
-            raw_quantity = int(available_balance * 0.999 / buy_price_value)
-            
-            # ✅ 规整到100股的整数倍（交易所要求）
-            quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
-            
-            if quantity <= 0:
-                self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），跳过背离买入信号")
-                return
-                
-            trade_quantity = Quantity.from_int(quantity)
-        else:
-            trade_quantity = self.trade_size
-            # ✅ 固定数量模式下仍需计算价格
-            buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
-        order = self.order_factory.limit(
-            instrument_id=self.config.instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=trade_quantity,
-            price=buy_price,
+        基于MACD背离检测执行买入操作。
+        """
+        self._execute_buy_order(
+            bar=bar,
+            signal_type='executed_divergence_buy',
+            signal_value=self.technical_signal,
+            log_detailed_balance=False,
+            log_time_info=False
         )
-        self.submit_order(order)
-        
-        # 记录实际交易信号
-        trade_signal = {
-            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': buy_price.as_double(),
-            'side': 'BUY',
-            'quantity': trade_quantity.as_double(),
-            'order_id': str(order.client_order_id),
-            'signal_type': 'executed_divergence_buy',
-            'signal_value': self.technical_signal
-        }
-        self.trade_signals.append(trade_signal)
-        
-        self._log.info(f"执行背离买入交易: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
     
     def execute_divergence_sell_signal(self, bar: Bar):
-        """执行背离卖出信号 - 显式创建SELL订单"""
-        # ✅ 先撤销所有未成交的委托
-        self.cancel_all_orders(self.config.instrument_id)
-        self._log.info("已撤销所有未成交委托，准备下背离卖出单")
+        """执行背离卖出信号
         
-        # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
-        if self.is_after_scheduled_time(bar):
-            self._log.info(f"当前时间已过2:50分，跳过背离卖出信号执行")
-            return
-        
-        # 显式检查持仓（Explicit is better than implicit）
-        positions = self.cache.positions_open(
-            instrument_id=self.config.instrument_id,
-            strategy_id=self.id
+        基于MACD背离检测执行卖出操作。
+        """
+        self._execute_sell_order(
+            bar=bar,
+            signal_type='executed_divergence_sell',
+            signal_value=self.technical_signal,
+            filter_by_strategy_id=True  # 按strategy_id过滤持仓
         )
-        
-        if not positions:
-            self._log.info("没有持仓，跳过背离卖出信号")
-            return
-        
-        # 获取当前持仓
-        position = positions[0]
-        
-        # 验证持仓方向
-        if position.side != PositionSide.LONG:
-            self._log.warning(f"持仓方向不是LONG而是{position.side}，跳过背离卖出")
-            return
-        
-        # 获取持仓数量
-        quantity = position.quantity
-        
-        self._log.info(f"准备背离卖出: 持仓ID={position.id}, 数量={quantity}, 价格={bar.close.as_double():.4f}")
-        
-        # ✅ 使用限价单（JVQuant 不支持市价单）
-        # 卖出价格 -0.001 提高成交概率
-        sell_price = self.instrument.make_price(bar.close.as_double() - 0.001)
-        order = self.order_factory.limit(
-            instrument_id=self.config.instrument_id,
-            order_side=OrderSide.SELL,  # 显式指定SELL方向
-            quantity=quantity,
-            price=sell_price,
-            reduce_only=True,
-            tags=["EXIT", "divergence_sell"]
-        )
-        
-        # 提交订单
-        self.submit_order(order, position_id=position.id)
-        
-        # 记录实际交易信号
-        trade_signal = {
-            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': sell_price.as_double(),
-            'side': 'SELL',
-            'quantity': quantity.as_double(),
-            'order_id': str(order.client_order_id),
-            'signal_type': 'executed_divergence_sell',
-            'signal_value': self.technical_signal
-        }
-        self.trade_signals.append(trade_signal)
-        
-        self._log.info(f"执行背离显式SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, 订单ID={order.client_order_id}")
-    
-    def check_risk_management(self, bar: Bar):
-        """检查风险管理"""
-        # 检查当前时间是否在2:50分之后，如果是则跳过风险管理
-        if self.is_after_scheduled_time(bar):
-            self._log.info(f"当前时间已过2:50分，跳过风险管理检查")
-            return
-        
-        # 检查是否有持仓 - 使用可靠的持仓查询方法
-        # current_position = self.get_current_position()
-        # if current_position is None:
-        #     return
-        
-        # current_price = bar.close.as_double()
-        # entry_price = current_position.avg_px_open
-        
-        # # 计算盈亏百分比
-        # pnl_pct = (current_price - entry_price) / entry_price
-        
-        # # 止损检查
-        # if pnl_pct <= -self.stop_loss_pct:
-        #     self.close_position(current_position)
-        #     self._log.info(f"触发止损: 亏损{pnl_pct*100:.2f}%")
-        
-        # # 止盈检查
-        # elif pnl_pct >= self.take_profit_pct:
-        #     self.close_position(current_position)
-        #     self._log.info(f"触发止盈: 盈利{pnl_pct*100:.2f}%")
 
     def get_current_position(self):
         """获取当前持仓状态 - 回测环境优化版本"""
@@ -2094,113 +2180,35 @@ class ETF159506Strategy(Strategy):
         # 检查是否到达定时买入时间（2:50分）
         if current_time_only >= self.scheduled_buy_time:
             self._log.info(f"到达定时买入时间: {current_time_only.strftime('%H:%M:%S')}")
-            
-            # 检查是否已有持仓
-            # current_position = self.get_current_position()
-            # if current_position is not None:
-            #     self._log.info(f"已有持仓: {current_position.quantity.as_double()} 股，跳过定时买入")
-            #     self.last_scheduled_buy_date = current_date
-            #     return
-            
-            # 执行定时买入，只有成功时才标记日期
-            success = self.execute_scheduled_buy(bar)
-            if success:
-                self.last_scheduled_buy_date = current_date
-                self._log.info(f"定时买入执行成功，已标记日期: {current_date}")
-            else:
-                self._log.warning(f"定时买入执行失败，将在下个K线重试")
+            # 不再直接买入，而是给 technical_signal 增加 300
+            scheduled_buy_contribution = 300
+            self.technical_signal += scheduled_buy_contribution
+            self.technical_signal_steps.append({
+                'description': f'2:50定时买入信号(固定贡献=300)',
+                'delta': scheduled_buy_contribution
+            })
+            # 标记今天已经添加过定时买入信号
+            self.last_scheduled_buy_date = current_date
+            self._log.info(f"2:50定时买入：增加信号值 +{scheduled_buy_contribution}，当前信号值={self.technical_signal:.2f}")
+            self._log.info(f"已标记日期: {current_date}，今天不会再次添加定时买入信号")
         else:
             self._log.info(f"还未到达定时买入时间，当前时间: {current_time_only.strftime('%H:%M:%S')}, 目标时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}")
 
     def execute_scheduled_buy(self, bar: Bar) -> bool:
         """执行定时买入
         
+        每天定时（2:50分）执行买入操作，使用所有可用余额。
+        
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
-        # ✅ 先撤销所有未成交的委托
-        self.cancel_all_orders(self.config.instrument_id)
-        self._log.info("已撤销所有未成交委托，准备下定时买入单")
-        
-        # 获取北京时间用于日志显示
-        current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
-        current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
-        
-        self._log.info(f"执行定时买入: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # 计算交易数量
-        if self.trade_size is None:
-            account = self.cache.account_for_venue(self.config.venue)
-            if account is None:
-                self._log.info("测试模式下无账户信息，使用固定交易数量")
-                trade_quantity = Quantity.from_int(100)  # 测试模式下使用固定数量
-            else:
-                # ✅ 修复：使用 balance_free 获取可用余额，而不是 balance_total
-                free_balance = account.balance_free(CNY)
-                if free_balance is None:
-                    self._log.error("无法获取CNY可用余额，定时买入失败")
-                    return False
-                
-                available_balance = free_balance.as_double()
-                
-                # ✅ 先计算订单价格（加价提高成交概率）
-                buy_price_value = bar.close.as_double() + 0.001
-                buy_price = self.instrument.make_price(buy_price_value)
-                
-                # 详细的账户信息日志
-                total_balance = account.balance_total(CNY)
-                locked_balance = account.balance_locked(CNY)
-                self._log.info(f"账户余额详情: 总余额={total_balance.as_double():.2f}, "
-                             f"可用余额={available_balance:.2f}, "
-                             f"冻结余额={locked_balance.as_double() if locked_balance else 0:.2f}")
-                
-                # 检查可用余额
-                if available_balance <= 0:
-                    self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法执行定时买入")
-                    return False
-                
-                # ✅ 用订单价格计算数量，避免超出可用余额
-                # 留0.1%的安全边际，防止手续费等导致余额不足
-                raw_quantity = int(available_balance * 0.999 / buy_price_value)
-                
-                # ✅ 规整到100股的整数倍（交易所要求）
-                quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
-                
-                self._log.info(f"交易计算: 可用余额={available_balance:.2f}, 收盘价={bar.close.as_double():.4f}, "
-                             f"订单价格={buy_price_value:.4f}, 原始数量={raw_quantity}, 规整后数量={quantity}, 预计花费={quantity * buy_price_value:.2f}")
-                
-                # 检查规整后的数量是否有效
-                if quantity <= 0:
-                    self._log.warning(f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），无法执行定时买入")
-                    return False
-                    
-                trade_quantity = Quantity.from_int(quantity)
-        else:
-            trade_quantity = self.trade_size
-            # ✅ 固定数量模式下仍需计算价格
-            buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
-        order = self.order_factory.limit(
-            instrument_id=self.config.instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=trade_quantity,
-            price=buy_price,
+        return self._execute_buy_order(
+            bar=bar,
+            signal_type='scheduled_buy',
+            signal_value=0,  # 定时买入不依赖技术指标信号
+            log_detailed_balance=True,  # 定时买入记录详细余额信息
+            log_time_info=True  # 定时买入记录时间信息
         )
-        self.submit_order(order)
-        
-        # 记录定时买入交易信号
-        trade_signal = {
-            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': buy_price.as_double(),
-            'side': 'BUY',
-            'quantity': trade_quantity.as_double(),
-            'order_id': str(order.client_order_id),
-            'signal_type': 'scheduled_buy',
-            'signal_value': 0  # 定时买入不依赖技术指标信号
-        }
-        self.trade_signals.append(trade_signal)
-        
-        self._log.info(f"定时买入订单已提交: 数量={trade_quantity}, 价格={buy_price.as_double():.4f}")
-        return True
         
     def is_after_scheduled_time(self, bar: Bar) -> bool:
         """检查当前时间是否在定时买入时间（2:50分）之后"""
