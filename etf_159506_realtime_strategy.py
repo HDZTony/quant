@@ -529,13 +529,6 @@ class ETF159506Strategy(Strategy):
         self.check_macd_bottom_signals(last_bar)
         self.check_risk_management(last_bar)
         self._log.info(f"on_bar: 时间={beijing_time_str} technical_signal={self.technical_signal}")
-        # 定期监控持仓状态（每10个K线记录一次）
-        # if len(self.macd_history) % 10 == 0:
-        #     current_position = self.get_current_position()
-        #     if current_position:
-        #         self._log.info(f"持仓状态监控: {current_position.quantity.as_double()} 股, 成本: {current_position.avg_px_open:.4f}")
-        #     else:
-        #         self._log.info("持仓状态监控: 无持仓")
         
         # 每分钟更新图表（非阻塞方式）
         # 在重置前先保存当前的 technical_signal 值用于图表显示
