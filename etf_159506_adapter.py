@@ -1621,6 +1621,27 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
         try:
             logger.info("连接ETF159506合并数据客户端...")
             
+            # ✅ 关键修复：将InstrumentProvider中的instruments发送到DataEngine
+            # 使用官方API _handle_data()，它会自动：
+            # 1. 添加到Cache
+            # 2. 发布到MessageBus
+            # 3. 更新Catalog（如需要）
+            try:
+                # 加载全局适配器的instruments
+                await self.adapter.instrument_provider.load_all_async()
+                
+                # 使用官方API发送instruments（遵循Binance等官方适配器的模式）
+                instruments = self.adapter.instrument_provider.get_all()
+                logger.info(f"准备发送 {len(instruments)} 个instruments到DataEngine...")
+                for instrument_id, instrument in instruments.items():
+                    self._handle_data(instrument)  # ✅ 使用公开API，不直接访问_cache
+                    logger.info(f"✅ 已发送instrument到DataEngine: {instrument_id}")
+                logger.info("✅ 所有instruments已成功发送到DataEngine")
+            except Exception as e:
+                logger.error(f"发送instruments到DataEngine失败: {e}")
+                import traceback
+                logger.error(f"错误详情: {traceback.format_exc()}")
+            
             # ✅ 检查全局适配器的连接状态（不再创建新连接）
             if self.http_client.is_connected and self.ws_client.is_connected:
                 self._set_connected(True)
@@ -3577,24 +3598,35 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     # 构建instrument_id
                     instrument_id = InstrumentId.from_str(f"{code}.SZSE")
                     
-                    # ✅ 修复: 通过持仓盈亏计算平均开仓价格
+                    # ✅ 尝试通过持仓盈亏计算平均开仓价格
                     # 公式: 平均成本价 = 当前价格 - (持仓盈亏 / 持仓数量)
+                    # 注意：启动时Cache中可能还没有QuoteTick，avg_px_open会为None
+                    #      这是正常的，ExecutionEngine会生成推断的OrderFilled来reconcile
                     avg_px_open = None
                     try:
-                        # 获取当前价格
-                        quote = self.cache.quote_tick(instrument_id)
+                        # 从Cache获取当前价格（启动时可能为None）
+                        quote = self._cache.quote_tick(instrument_id)
+                        
                         if quote and hold_vol > 0:
                             current_price = (quote.bid_price.as_double() + quote.ask_price.as_double()) / 2
                             # 反推平均成本价
                             avg_cost_price = current_price - (hold_earn / hold_vol)
                             avg_px_open = Decimal(str(avg_cost_price))
-                            logger.debug(
-                                f"计算avg_px_open: 当前价={current_price:.3f}, "
+                            logger.info(
+                                f"✅ 计算avg_px_open成功: 当前价={current_price:.3f}, "
                                 f"持仓盈亏={hold_earn:.2f}, 持仓量={hold_vol}, "
                                 f"平均成本价={avg_px_open}"
                             )
+                        else:
+                            logger.info(
+                                f"ℹ️  启动时无法计算avg_px_open (Cache中暂无QuoteTick)，"
+                                f"将在reconciliation时由ExecutionEngine推断。"
+                                f"持仓: {code}, 数量: {hold_vol}, 盈亏: {hold_earn}"
+                            )
                     except Exception as e:
-                        logger.debug(f"计算平均开仓价失败: {e}")
+                        logger.warning(f"计算平均开仓价时出错: {e}")
+                        import traceback
+                        logger.debug(f"错误详情: {traceback.format_exc()}")
                     
                     # 构建持仓状态报告
                     # 现金账户使用FLAT position_side
