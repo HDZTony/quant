@@ -9,6 +9,7 @@ from nautilus_trader.core import Data
 from nautilus_trader.core.message import Event
 from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
 from nautilus_trader.indicators.momentum import RelativeStrengthIndex
+from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
@@ -62,6 +63,9 @@ class ETF159506Strategy(Strategy):
             fast_period=config.fast_ema_period,
             slow_period=config.slow_ema_period,
         )
+        
+        # MACD信号线（DEA）- 对DIF的9期EMA（增量计算）
+        self.macd_signal = ExponentialMovingAverage(9)
         
         # KDJ指标 - 使用自定义实现
         self.kdj = CatalogKDJIndicator(n=9, k_period=3, d_period=3)
@@ -210,10 +214,13 @@ class ETF159506Strategy(Strategy):
         # 请求历史数据用于初始化指标
         self._log.info(f"正在请求历史数据: {bar_type}")
         
-        # Register the indicators for updating
-        self.register_indicator_for_bars(bar_type, self.macd)
-        self.register_indicator_for_bars(bar_type, self.kdj)
-        self.register_indicator_for_bars(bar_type, self.rsi)
+        # 注册指标自动更新（框架会自动将 bar 数据推送给指标）
+        self.register_indicator_for_bars(bar_type, self.macd)  # MACD（DIF）
+        self.register_indicator_for_bars(bar_type, self.kdj)   # KDJ
+        self.register_indicator_for_bars(bar_type, self.rsi)   # RSI
+        
+        # 注意：self.macd_signal（DEA）无法注册，因为它需要 DIF 值作为输入
+        # DEA = EMA(DIF, 9)，将在 on_bar 中手动更新
 
         
         
@@ -598,6 +605,13 @@ class ETF159506Strategy(Strategy):
         
     def on_bar(self, bar: Bar):
         """处理K线数据"""
+        # 注意：self.macd, self.kdj, self.rsi 已通过注册自动更新
+        
+        # 手动更新级联指标：MACD信号线（DEA）
+        # 原因：self.macd_signal 需要 DIF 值作为输入，无法直接注册到 bar
+        if self.macd.initialized:
+            self.macd_signal.update_raw(self.macd.value)
+        
         # 清空本分钟的计算步骤记录
         self.technical_signal_steps = []
         
@@ -681,27 +695,38 @@ class ETF159506Strategy(Strategy):
         return
     
     def update_history_data(self, bar: Bar):
-        """更新历史数据"""
-        # 获取MACD值（DIF）
-        macd_value = self.macd.value  # 这是DIF值
+        """更新历史数据 - 记录MACD指标到历史队列（用于回溯分析）
         
-        # 计算信号线（DEA）- 对DIF的EMA
-        self.macd_history.append(macd_value)
-        signal_value = self.calculate_signal_line()
+        注意：self.macd_signal 已在 on_bar 中自动更新，这里只负责记录历史数据
+        """
+        # 获取DIF值（已由注册机制自动更新）
+        dif = self.macd.value
         
-        # 计算柱状图（MACD柱）
-        histogram_value = macd_value - signal_value
-        
-        # 添加到历史数据
-        self.signal_history.append(signal_value)
-        self.histogram_history.append(histogram_value)
-        
-        # 更新价格历史数据（用于背离检测）
-        self.price_history.append(bar.close.as_double())
-        self.timestamps.append(bar.ts_event)
-                
-        # 记录当前指标值
-        self._log.info(f"DIF: {macd_value:.6f}, DEA: {signal_value:.6f}, MACD柱: {histogram_value:.6f}")
+        # 只有在信号线初始化后才记录完整指标
+        if self.macd_signal.initialized:
+            dea = self.macd_signal.value
+            histogram = dif - dea
+            
+            # 添加到历史数据队列（用于回溯分析、背离检测等）
+            self.macd_history.append(dif)
+            self.signal_history.append(dea)
+            self.histogram_history.append(histogram)
+            
+            # 更新价格历史数据（用于背离检测）
+            self.price_history.append(bar.close.as_double())
+            self.timestamps.append(bar.ts_event)
+            
+            # 记录当前指标值
+            self._log.info(
+                f"MACD指标: DIF={dif:.6f}, DEA={dea:.6f}, "
+                f"柱状图={histogram:.6f}"
+            )
+        else:
+            # 初始化阶段，只记录日志
+            self._log.debug(
+                f"MACD信号线初始化中... DIF={dif:.6f}, "
+                f"需要{9 - self.macd_signal.count}个数据点"
+            )
     
     def calculate_chart_macd(self, bar: Bar):
         """计算图表风格的MACD值，弥补前26分钟的空白"""
@@ -709,11 +734,13 @@ class ETF159506Strategy(Strategy):
         current_price = bar.close.as_double()
         
         # 如果MACD指标已初始化，使用官方指标值
-        if self.macd.initialized:
+        if self.macd.initialized and self.macd_signal.initialized:
+            dif = self.macd.value
+            dea = self.macd_signal.value
             return {
-                'macd': self.macd.value,  # DIF
-                'signal': self.calculate_signal_line(),  # DEA
-                'histogram': self.macd.value - self.calculate_signal_line()  # MACD柱
+                'macd': dif,  # DIF
+                'signal': dea,  # DEA
+                'histogram': dif - dea  # MACD柱
             }
         
         # 如果MACD指标未初始化，使用图表方法计算
@@ -758,19 +785,6 @@ class ETF159506Strategy(Strategy):
             'signal': dea,    # DEA
             'histogram': histogram  # MACD柱
         }
-    
-    def calculate_signal_line(self):
-        """计算信号线（DEA）- 对DIF的9周期EMA"""
-        if len(self.macd_history) < 2:
-            # 如果数据不足，返回当前MACD值作为信号线
-            return self.macd_history[-1] if self.macd_history else 0.0
-        
-        # 使用pandas的ewm计算EMA，span=9是标准MACD参数
-        dif_series = pd.Series(list(self.macd_history))
-        # 如果数据不足9个，使用所有可用数据
-        span = min(9, len(dif_series))
-        dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
-        return dea
     
     def check_negative_positive_histogram(self, bar: Bar, lookback_minutes: int = 5):
         """
