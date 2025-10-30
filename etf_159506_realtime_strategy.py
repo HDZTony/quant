@@ -323,21 +323,110 @@ class ETF159506Strategy(Strategy):
         # 保存每分钟成交量数据到策略实例变量中，供回测系统获取
         if not hasattr(self, '_saved_minute_volume_data'):
             self._saved_minute_volume_data = list(self.minute_volume_data)
-            self._log.info(f"策略停止时保存了 {len(self.minute_volume_data)} 分钟的成交量数据")
+            # self._log.info(f"策略停止时保存了 {len(self.minute_volume_data)} 分钟的成交量数据")
         
         self.print_extremes_history()
         
         # 打印每分钟成交量汇总
         self.print_minute_volume_data()
     
+    def _process_technical_signals(self, bar: Bar, beijing_time_str: str, is_historical: bool = False):
+        """处理技术信号计算和显示
+        
+        Args:
+            bar: K线数据
+            beijing_time_str: 北京时间字符串
+            is_historical: 是否为历史数据（历史数据不执行交易）
+        
+        Returns:
+            float: 当前技术信号值
+        """
+        # 检查定时买入信号
+        self.check_scheduled_buy(bar)
+        # 统一的交易信号检测
+        self.check_macd_signals(bar)
+        self.check_macd_top_signals(bar)
+        self.check_macd_bottom_signals(bar)
+        
+        # 保存当前信号值
+        current_technical_signal = self.technical_signal
+        
+        # ========== 输出本分钟 technical_signal 的详细计算过程 ==========
+        data_type = "历史数据" if is_historical else ""
+        self._log.info("=" * 80)
+        self._log.info(f"【{data_type} {beijing_time_str}】technical_signal 计算过程{'汇总' if not is_historical else ''}")
+        self._log.info("=" * 80)
+        
+        # 显示计算步骤
+        if self.technical_signal_steps:
+            self._log.info("计算步骤明细:")
+            cumulative_value = 0.0
+            for i, step in enumerate(self.technical_signal_steps, 1):
+                cumulative_value += step['delta']
+                self._log.info(f"  步骤{i}: {step['description']}")
+                self._log.info(f"         变化值: {step['delta']:+.2f}, 累积值: {cumulative_value:.2f}")
+        else:
+            self._log.info("本分钟无信号计算步骤")
+        
+        self._log.info("-" * 80)
+        self._log.info(f"最终信号值: {current_technical_signal:.2f}")
+        self._log.info(f"买入阈值: {self.buy_threshold}, 卖出阈值: {self.sell_threshold}")
+        
+        # 显示当前MACD相关指标（仅实时数据）
+        if not is_historical:
+            if len(self.macd_history) > 0 and len(self.signal_history) > 0:
+                current_macd = self.macd_history[-1]
+                current_signal = self.signal_history[-1]
+                current_histogram = current_macd - current_signal
+                self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
+            
+            # 显示RSI
+            if self.rsi.initialized:
+                rsi_value = self.rsi.value * 100
+                self._log.info(f"RSI指标: {rsi_value:.2f}")
+            else:
+                self._log.info("RSI指标: 未初始化")
+            
+            # 显示KDJ
+            if self.kdj.initialized:
+                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                kdj_max_diff = max(kdj_values) - min(kdj_values)
+                self._log.info(f"KDJ指标: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}, 最大差值={kdj_max_diff:.2f}")
+            else:
+                self._log.info("KDJ指标: 未初始化")
+            
+            # 显示极值点信息
+            if hasattr(self, 'latest_extreme_type') and self.latest_extreme_type:
+                self._log.info(f"最近极值点类型: {self.latest_extreme_type}")
+                if self.time_diff_minutes_from_latest_extreme is not None:
+                    self._log.info(f"距离最近极值点: {self.time_diff_minutes_from_latest_extreme:.2f}分钟")
+            
+            # 显示本分钟触发的信号类型
+            if current_technical_signal > 0:
+                self._log.info("信号方向: 【买入】")
+            elif current_technical_signal < 0:
+                self._log.info("信号方向: 【卖出】")
+            else:
+                self._log.info("信号方向: 【无信号】")
+        
+        self._log.info("=" * 80)
+        # ========== 计算过程汇总结束 ==========
+        
+        return current_technical_signal
+    
     def on_historical_data(self, data):
         """处理历史数据"""
         from nautilus_trader.model.data import Bar
         if type(data) is Bar:
             self._log.info(f"🎯 on_historical_data被调用！数据类型: {type(data)}")
-                # 处理单条历史K线数据
+            # 处理单条历史K线数据
             self._log.info(f"📈 接收到历史K线数据: {data.ts_event}, 价格: {data.close}")
+            
+            # 清空本分钟的计算步骤记录
+            self.technical_signal_steps = []
+            
             self._process_bar(data)
+            
             # 转换为北京时间用于日志
             utc_time = pd.to_datetime(data.ts_event, unit='ns')
             beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
@@ -345,6 +434,14 @@ class ETF159506Strategy(Strategy):
             
             self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
                         f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
+            
+            # 如果MACD已初始化，执行信号计算（但不执行交易）
+            if self.macd.initialized:
+                # 调用统一的信号处理方法
+                self._process_technical_signals(data, beijing_time_str, is_historical=True)
+                
+                # 历史数据处理：信号归零但不执行交易
+                self.technical_signal = 0
     
     def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""
@@ -523,76 +620,8 @@ class ETF159506Strategy(Strategy):
         if self.rsi.initialized:
             self._log.info(f"RSI状态: RSI={self.rsi.value * 100:.2f}")
         
-        # 检查定时买入信号
-        self.check_scheduled_buy(last_bar)
-        # 统一的交易信号检测和风险管理
-        self.check_macd_signals(last_bar)
-        self.check_macd_top_signals(last_bar)
-        self.check_macd_bottom_signals(last_bar)
-        self._log.info(f"on_bar: 时间={beijing_time_str} technical_signal={self.technical_signal}")
-        
-        # 每分钟更新图表（非阻塞方式）
-        # 在重置前先保存当前的 technical_signal 值用于图表显示
-        current_technical_signal = self.technical_signal
-        
-        # ========== 输出本分钟 technical_signal 的详细计算过程 ==========
-        self._log.info("=" * 80)
-        self._log.info(f"【{beijing_time_str}】technical_signal 计算过程汇总")
-        self._log.info("=" * 80)
-        
-        # 显示计算步骤
-        if self.technical_signal_steps:
-            self._log.info("计算步骤明细:")
-            cumulative_value = 0.0
-            for i, step in enumerate(self.technical_signal_steps, 1):
-                cumulative_value += step['delta']
-                self._log.info(f"  步骤{i}: {step['description']}")
-                self._log.info(f"         变化值: {step['delta']:+.2f}, 累积值: {cumulative_value:.2f}")
-        else:
-            self._log.info("本分钟无信号计算步骤")
-        
-        self._log.info("-" * 80)
-        self._log.info(f"最终信号值: {current_technical_signal:.2f}")
-        self._log.info(f"买入阈值: {self.buy_threshold}, 卖出阈值: {self.sell_threshold}")
-        
-        # 显示当前MACD相关指标
-        if len(self.macd_history) > 0 and len(self.signal_history) > 0:
-            current_macd = self.macd_history[-1]
-            current_signal = self.signal_history[-1]
-            current_histogram = current_macd - current_signal
-            self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
-        
-        # 显示RSI
-        if self.rsi.initialized:
-            rsi_value = self.rsi.value * 100
-            self._log.info(f"RSI指标: {rsi_value:.2f}")
-        else:
-            self._log.info("RSI指标: 未初始化")
-        
-        # 显示KDJ
-        if self.kdj.initialized:
-            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
-            kdj_max_diff = max(kdj_values) - min(kdj_values)
-            self._log.info(f"KDJ指标: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}, 最大差值={kdj_max_diff:.2f}")
-        else:
-            self._log.info("KDJ指标: 未初始化")
-        
-        # 显示极值点信息
-        if hasattr(self, 'latest_extreme_type') and self.latest_extreme_type:
-            self._log.info(f"最近极值点类型: {self.latest_extreme_type}")
-            if self.time_diff_minutes_from_latest_extreme is not None:
-                self._log.info(f"距离最近极值点: {self.time_diff_minutes_from_latest_extreme:.2f}分钟")
-        
-        # 显示本分钟触发的信号类型
-        if current_technical_signal > 0:
-            self._log.info("信号方向: 【买入】")
-        elif current_technical_signal < 0:
-            self._log.info("信号方向: 【卖出】")
-        else:
-            self._log.info("信号方向: 【无信号】")
-        
-        self._log.info("=" * 80)
-        # ========== 计算过程汇总结束 ==========
+        # 调用统一的信号处理方法
+        current_technical_signal = self._process_technical_signals(last_bar, beijing_time_str, is_historical=False)
         
         # ========== 统一判断买入/卖出阈值 ==========
         if current_technical_signal >= self.buy_threshold:
@@ -2370,9 +2399,9 @@ class ETF159506Strategy(Strategy):
                 self._log.warning("没有交易时间内的数据可绘制")
                 return
             
-            self._log.info(f"上午数据: {len(morning_data)} 条")
-            self._log.info(f"下午数据: {len(afternoon_data)} 条")
-            self._log.info(f"总交易数据: {len(trading_data)} 条")
+            # self._log.info(f"上午数据: {len(morning_data)} 条")
+            # self._log.info(f"下午数据: {len(afternoon_data)} 条")
+            # self._log.info(f"总交易数据: {len(trading_data)} 条")
             
             # 使用交易数据的时间作为索引
             trading_data = trading_data.set_index('timestamp')
@@ -2529,7 +2558,7 @@ class ETF159506Strategy(Strategy):
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
                            alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
-                    self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                    # self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
@@ -2825,7 +2854,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"图表时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
                 
                 for i, signal in enumerate(trade_signals):
-                    self._log.info(f"处理第 {i+1} 个信号: {signal}")
+                    # self._log.info(f"处理第 {i+1} 个信号: {signal}")
                     
                     # 转换时间戳为pandas datetime
                     if isinstance(signal['timestamp'], str):
@@ -3035,7 +3064,7 @@ class ETF159506Strategy(Strategy):
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
                            alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
-                    self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                    # self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
@@ -3328,7 +3357,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"图表时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
                 
                 for i, signal in enumerate(trade_signals):
-                    self._log.info(f"处理第 {i+1} 个信号: {signal}")
+                    # self._log.info(f"处理第 {i+1} 个信号: {signal}")
                     
                     # 转换时间戳为pandas datetime
                     if isinstance(signal['timestamp'], str):
@@ -3413,7 +3442,7 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"开始处理 {len(technical_signals)} 个技术指标信号...")
                 
                 for i, signal in enumerate(technical_signals):
-                    self._log.info(f"处理第 {i+1} 个技术信号: {signal}")
+                    # self._log.info(f"处理第 {i+1} 个技术信号: {signal}")
                     
                     # 转换时间戳为pandas datetime
                     if isinstance(signal['timestamp'], str):
@@ -3644,7 +3673,7 @@ class ETF159506Strategy(Strategy):
                     ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
                            alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
                     
-                    self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                    # self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
                 else:
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
