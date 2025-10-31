@@ -9,7 +9,7 @@ from nautilus_trader.core import Data
 from nautilus_trader.core.message import Event
 from nautilus_trader.indicators.trend import MovingAverageConvergenceDivergence
 from nautilus_trader.indicators.momentum import RelativeStrengthIndex
-from nautilus_trader.indicators.average.ema import ExponentialMovingAverage
+from nautilus_trader.indicators.averages import ExponentialMovingAverage
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
 from nautilus_trader.model.enums import OrderSide
@@ -83,7 +83,7 @@ class ETF159506Strategy(Strategy):
         self.position: Position | None = None
         
         # 历史数据存储 - 用于检测金叉死叉
-        self.macd_history = deque(maxlen=10000)  # 存储MACD值（DIF）
+        self.dif_history = deque(maxlen=10000)  # 存储MACD值（DIF）
         self.signal_history = deque(maxlen=10000)  # 存储信号线值（DEA）
         self.histogram_history = deque(maxlen=10000)  # 存储柱状图值
         
@@ -381,8 +381,8 @@ class ETF159506Strategy(Strategy):
         
         # 显示当前MACD相关指标（仅实时数据）
         if not is_historical:
-            if len(self.macd_history) > 0 and len(self.signal_history) > 0:
-                current_macd = self.macd_history[-1]
+            if len(self.dif_history) > 0 and len(self.signal_history) > 0:
+                current_macd = self.dif_history[-1]
                 current_signal = self.signal_history[-1]
                 current_histogram = current_macd - current_signal
                 self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
@@ -440,7 +440,7 @@ class ETF159506Strategy(Strategy):
             beijing_time_str = beijing_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
             
             self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
-                        f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.macd_history)}")
+                        f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.dif_history)}")
             
             # 如果MACD已初始化，执行信号计算（但不执行交易）
             if self.macd.initialized:
@@ -462,7 +462,7 @@ class ETF159506Strategy(Strategy):
         # 根据MACD初始化状态选择数据源
         if not self.macd.initialized:
             # 使用图表MACD值
-            self.macd_history.append(chart_macd['macd'])
+            self.dif_history.append(chart_macd['macd'])
             self.signal_history.append(chart_macd['signal'])
             self.histogram_history.append(chart_macd['histogram'])
             
@@ -702,19 +702,21 @@ class ETF159506Strategy(Strategy):
         # 获取DIF值（已由注册机制自动更新）
         dif = self.macd.value
         
-        # 只有在信号线初始化后才记录完整指标
+        # 【重要】始终更新价格历史数据（极值点检测需要）
+        self.price_history.append(bar.close.as_double())
+        self.timestamps.append(bar.ts_event)
+        
+        # 【重要】始终更新DIF历史数据（金叉死叉检测需要）
+        self.dif_history.append(dif)
+        
+        # 只有在信号线初始化后才记录完整MACD指标（DEA和柱状图）
         if self.macd_signal.initialized:
             dea = self.macd_signal.value
             histogram = dif - dea
             
-            # 添加到历史数据队列（用于回溯分析、背离检测等）
-            self.macd_history.append(dif)
+            # 添加到历史数据队列（用于回溯分析）
             self.signal_history.append(dea)
             self.histogram_history.append(histogram)
-            
-            # 更新价格历史数据（用于背离检测）
-            self.price_history.append(bar.close.as_double())
-            self.timestamps.append(bar.ts_event)
             
             # 记录当前指标值
             self._log.info(
@@ -722,11 +724,31 @@ class ETF159506Strategy(Strategy):
                 f"柱状图={histogram:.6f}"
             )
         else:
-            # 初始化阶段，只记录日志
-            self._log.debug(
-                f"MACD信号线初始化中... DIF={dif:.6f}, "
-                f"需要{9 - self.macd_signal.count}个数据点"
-            )
+            # 初始化阶段：计算临时DEA（与calculate_chart_macd相同的逻辑）
+            # 这样可以让金叉死叉检测在信号线初始化前就能工作
+            if len(self.dif_history) >= 2:
+                # 计算临时DEA（使用pandas ewm，与calculate_chart_macd一致）
+                dif_series = pd.Series(list(self.dif_history))
+                span = min(9, len(dif_series))
+                temp_dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
+                temp_histogram = dif - temp_dea
+                
+                # 添加临时数据（供金叉死叉检测使用）
+                self.signal_history.append(temp_dea)
+                self.histogram_history.append(temp_histogram)
+                
+                self._log.debug(
+                    f"MACD信号线初始化中... DIF={dif:.6f}, 临时DEA={temp_dea:.6f}, "
+                    f"需要{9 - self.macd_signal.count}个数据点"
+                )
+            else:
+                # 数据不足，DEA = DIF
+                self.signal_history.append(dif)
+                self.histogram_history.append(0.0)
+                self._log.debug(
+                    f"MACD信号线初始化中... DIF={dif:.6f}, 数据不足(DEA=DIF), "
+                    f"需要{9 - self.macd_signal.count}个数据点"
+                )
     
     def calculate_chart_macd(self, bar: Bar):
         """计算图表风格的MACD值，弥补前26分钟的空白"""
@@ -803,14 +825,14 @@ class ETF159506Strategy(Strategy):
             如果检测到模式，返回包含时间点信息的字典；否则返回None
         """
         # 需要足够的历史数据
-        if len(self.macd_history) < lookback_minutes or len(self.signal_history) < lookback_minutes:
+        if len(self.dif_history) < lookback_minutes or len(self.signal_history) < lookback_minutes:
             self._log.info(f"历史数据不足，需要至少{lookback_minutes}个数据点")
             return 
         
         # # 检查DIF值是否由负转正
-        if len(self.macd_history) >= 2:
-            current_dif = self.macd_history[-1]
-            previous_dif = self.macd_history[-2]
+        if len(self.dif_history) >= 2:
+            current_dif = self.dif_history[-1]
+            previous_dif = self.dif_history[-2]
             if previous_dif < 0 and current_dif >= 0:
                 self._log.info(f"DIF值由负转正: 前值={previous_dif:.6f}, 当前值={current_dif:.6f}")
             else:
@@ -911,7 +933,7 @@ class ETF159506Strategy(Strategy):
                 break
         
 
-    def check_macd_rank(self, extreme_type='peak'):
+    def check_macd_rank(self, extreme_type):
         """
         检查MACD极值排名：返回当前MACD值在指定类型极值中的排名比例
         
@@ -923,17 +945,17 @@ class ETF159506Strategy(Strategy):
         """
         if not self.macd_extremes_history:
             self._log.debug("MACD极值点历史为空，无法进行排序分析")
-            return 1
+            return 0.01
         
         # 获取当前MACD值
-        current_macd = self.macd_history[-1] if self.macd_history else 0
+        current_macd = self.dif_history[-1] if self.dif_history else 0
         
         # 根据极值类型筛选对应的极值点
         filtered_extremes = [extreme for extreme in self.macd_extremes_history if extreme[2] == extreme_type]
         
         if not filtered_extremes:
             self._log.debug(f"没有找到{extreme_type}类型的极值点")
-            return 1
+            return 0.01
         
         # 提取筛选后极值点的MACD值进行排序
         macd_values = [extreme[1] for extreme in filtered_extremes]  # extreme[1]是MACD值
@@ -944,15 +966,22 @@ class ETF159506Strategy(Strategy):
         # 计算当前MACD值的排名百分比
         total_count = len(sorted_macd_values)
         if total_count == 0:
-            return 1
+            return 0.01
         
         # 计算有多少个值小于当前值
         values_below_current = sum(1 for val in sorted_macd_values if val < current_macd)
         
-        rank_ratio = values_below_current / total_count
-
-        self._log.info(f"MACD{extreme_type}排序分析: 总{extreme_type}点数={total_count}, 当前MACD={current_macd:.6f}")
-        self._log.info(f"排名比例={rank_ratio:.3f} (0=最低, 1=最高)")
+        # 根据极值类型调整排名逻辑
+        if extreme_type == 'trough':
+            # 极小值：MACD值越小，排名越高（越接近1）
+            rank_ratio = 1 - (values_below_current / total_count)
+            self._log.info(f"MACD极小值排序分析: 总极小值点数={total_count}, 当前MACD={current_macd:.6f}")
+            self._log.info(f"排名比例={rank_ratio:.3f} (值越小排名越高，1=最小值)")
+        else:  # extreme_type == 'peak'
+            # 极大值：MACD值越大，排名越高（越接近1）
+            rank_ratio = values_below_current / total_count
+            self._log.info(f"MACD极大值排序分析: 总极大值点数={total_count}, 当前MACD={current_macd:.6f}")
+            self._log.info(f"排名比例={rank_ratio:.3f} (值越大排名越高，1=最大值)")
         
         return rank_ratio
     
@@ -994,16 +1023,24 @@ class ETF159506Strategy(Strategy):
         # 计算有多少个值小于当前值
         values_below_current = sum(1 for val in sorted_price_values if val < current_price)
         
-        rank_ratio = values_below_current / total_count
-
-        self._log.info(f"价格{extreme_type}排序分析: 总{extreme_type}点数={total_count}, 当前价格={current_price:.4f}")
-        self._log.info(f"排名比例={rank_ratio:.3f} (0=最低, 1=最高)")
+        # 根据极值类型调整排名逻辑
+        if extreme_type == 'trough':
+            # 极小值：价格越低，排名越高（越接近1）
+            rank_ratio = 1 - (values_below_current / total_count)
+            self._log.info(f"价格极小值排序分析: 总极小值点数={total_count}, 当前价格={current_price:.4f}")
+            self._log.info(f"排名比例={rank_ratio:.3f} (价格越低排名越高，1=最低价)")
+        else:  # extreme_type == 'peak'
+            # 极大值：价格越高，排名越高（越接近1）
+            rank_ratio = values_below_current / total_count
+            self._log.info(f"价格极大值排序分析: 总极大值点数={total_count}, 当前价格={current_price:.4f}")
+            self._log.info(f"排名比例={rank_ratio:.3f} (价格越高排名越高，1=最高价)")
         
         return rank_ratio
     
     def check_macd_top_signals(self, bar: Bar):
         rank_ratio = self.check_macd_rank('peak')  # 比较极大值
         price_rank_ratio = self.check_price_rank('peak')
+        self._log.info(f"【顶部信号检查】MACD排名={rank_ratio:.3f}, 价格排名={price_rank_ratio:.3f}, 最近极值点类型={self.latest_extreme_type}, 是否有时间差={self.time_diff_minutes_from_latest_extreme is not None}")
         if rank_ratio > 0.9 and price_rank_ratio > 0.9 and self.latest_extreme_type == 'peak':
             # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
             if self.time_diff_minutes_from_latest_extreme is not None:
@@ -1024,12 +1061,11 @@ class ETF159506Strategy(Strategy):
                 
                 # 计算成交量比值
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
-                # 避免除零错误，当rank_ratio为0时使用一个很小的值
-                safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
-                top_signal_contribution = -(10/volume_ratio+safe_rank_ratio*30)
+                # rank_ratio 已经通过 > 0.9 条件判断，直接使用
+                top_signal_contribution = -(10/volume_ratio+rank_ratio*30)
                 self.technical_signal += top_signal_contribution
                 self.technical_signal_steps.append({
-                    'description': f'顶部信号(成交量比值={volume_ratio:.4f}, 排名比例={safe_rank_ratio:.3f})',
+                    'description': f'顶部信号(成交量比值={volume_ratio:.4f}, 排名比例={rank_ratio:.3f})',
                     'delta': top_signal_contribution
                 })
                 self._log.info(f"成交量比值: {volume_ratio:.4f}")
@@ -1067,12 +1103,14 @@ class ETF159506Strategy(Strategy):
                     self._log.info("KDJ条件不满足，使用标准信号")
                 self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
             else:
-                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
+                self._log.warning(f"✗ 顶部信号条件满足但无时间差数据")
         else:
-            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} >= 0.2, 无需计算成交量比值")
+            self._log.debug(f"✗ 顶部信号条件不满足")
+    
     def check_macd_bottom_signals(self, bar: Bar):
         rank_ratio = self.check_macd_rank('trough')  # 比较极小值
-        if self.latest_extreme_type == 'trough':
+        self._log.info(f"【底部信号检查】排名比例={rank_ratio:.3f}, 最近极值点类型={self.latest_extreme_type}, 是否有时间差={self.time_diff_minutes_from_latest_extreme is not None}")
+        if rank_ratio > 0.9 and self.latest_extreme_type == 'trough':
             # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
             if self.time_diff_minutes_from_latest_extreme is not None:
                 # 根据时间差计算索引
@@ -1092,12 +1130,11 @@ class ETF159506Strategy(Strategy):
                 
                 # 计算成交量比值
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
-                # 避免除零错误，当rank_ratio为0时使用一个很小的值
-                safe_rank_ratio = max(rank_ratio, 0.01)  # 避免除零
-                bottom_signal_contribution = 10/volume_ratio+safe_rank_ratio*30
+                # rank_ratio 已经通过 > 0.9 条件判断，直接使用
+                bottom_signal_contribution = 10/volume_ratio+rank_ratio*30
                 self.technical_signal += bottom_signal_contribution
                 self.technical_signal_steps.append({
-                    'description': f'底部信号(成交量比值={volume_ratio:.4f}, 排名比例={safe_rank_ratio:.3f})',
+                    'description': f'底部信号(成交量比值={volume_ratio:.4f}, 排名比例={rank_ratio:.3f})',
                     'delta': bottom_signal_contribution
                 })
                 self._log.info(f"成交量比值: {volume_ratio:.4f}")
@@ -1132,9 +1169,9 @@ class ETF159506Strategy(Strategy):
                 
                 self._log.info(f"KDJ技术信号: {self.technical_signal:.2f}")
             else:
-                self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f} > 0.9, 但无时间差数据, 最近极值点类型={self.latest_extreme_type}")
+                self._log.warning(f"✗ 底部信号条件满足但无时间差数据")
         else:
-            self._log.info(f"MACD排名分析: 排名比例={rank_ratio:.3f}, 无需计算成交量比值, 最近极值点类型={self.latest_extreme_type}")
+            self._log.debug(f"✗ 底部信号条件不满足")
 
     def check_macd_signals(self, bar: Bar):
         """检查MACD金叉死叉信号"""
@@ -1149,15 +1186,15 @@ class ETF159506Strategy(Strategy):
             return
         
         # 添加调试信息
-        self._log.info(f"检查MACD信号: macd_history长度={len(self.macd_history)}, signal_history长度={len(self.signal_history)}")
+        self._log.info(f"检查MACD信号: macd_history长度={len(self.dif_history)}, signal_history长度={len(self.signal_history)}")
         
         # 需要至少2个数据点来检测金叉死叉
-        if len(self.macd_history) < 2 or len(self.signal_history) < 2:
-            self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.macd_history)}, signal_history={len(self.signal_history)}, 需要至少2个数据点")
+        if len(self.dif_history) < 2 or len(self.signal_history) < 2:
+            self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.dif_history)}, signal_history={len(self.signal_history)}, 需要至少2个数据点")
             return
         
-        current_macd = self.macd_history[-1]
-        previous_macd = self.macd_history[-2]
+        current_macd = self.dif_history[-1]
+        previous_macd = self.dif_history[-2]
         current_signal = self.signal_history[-1]
         previous_signal = self.signal_history[-2]
         
@@ -1169,9 +1206,9 @@ class ETF159506Strategy(Strategy):
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_macd < 0 and len(self.macd_history) >= 6 and current_histogram < 0:
+        if current_macd < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
             # 获取前5个DIF值（不包括当前值）
-            last_five_dif = list(self.macd_history)[-6:-1]  # 前5个值
+            last_five_dif = list(self.dif_history)[-6:-1]  # 前5个值
             current_dif = current_macd
             
             # 检查是否单调递减（从历史到当前，即从旧到新）
@@ -1581,7 +1618,7 @@ class ETF159506Strategy(Strategy):
             self._log.debug(f"当前时间 {current_time} 在午休时间，跳过极值点检测")
             return
         
-        self._log.info(f"开始极值点检测: price_history长度={len(self.price_history)}, macd_history长度={len(self.macd_history)}")
+        self._log.info(f"开始极值点检测: price_history长度={len(self.price_history)}, macd_history长度={len(self.dif_history)}")
         
         if len(self.price_history) < 3:
             self._log.info("价格历史数据不足3个点，跳过极值点检测")
@@ -1589,14 +1626,14 @@ class ETF159506Strategy(Strategy):
         
         current_timestamp = bar.ts_event
         current_price = self.price_history[-1]
-        current_macd = self.macd_history[-1]
+        current_macd = self.dif_history[-1]
         
         # 检测上一个价格点的极值（延迟检测）
         if len(self.price_history) >= 2:
             prev_price_index = len(self.price_history) - 2  # 上一个价格点的索引
             prev_price_timestamp = self.timestamps[-2] if len(self.timestamps) >= 2 else current_timestamp
             prev_price = self.price_history[-2]
-            prev_macd = self.macd_history[-2]
+            prev_macd = self.dif_history[-2]
             price_extreme, price_type = self._detect_extreme(self.price_history, prev_price_index)
             if price_extreme:
                 self._log.info(f"检测到价格极值点: 类型={price_type}, 价格={prev_price:.4f}")
@@ -1644,12 +1681,12 @@ class ETF159506Strategy(Strategy):
                 self._log.debug(f"未检测到价格极值点: 上一个价格={prev_price:.4f}")
         
         # 检测上一个MACD点的极值（延迟检测）
-        if len(self.macd_history) >= 2:
-            prev_macd_index = len(self.macd_history) - 2  # 上一个MACD点的索引
+        if len(self.dif_history) >= 2:
+            prev_macd_index = len(self.dif_history) - 2  # 上一个MACD点的索引
             prev_macd_timestamp = self.timestamps[-2] if len(self.timestamps) >= 2 else current_timestamp
-            prev_macd = self.macd_history[-2]
+            prev_macd = self.dif_history[-2]
             prev_price = self.price_history[-2]
-            macd_extreme, macd_type = self._detect_extreme(self.macd_history, prev_macd_index)
+            macd_extreme, macd_type = self._detect_extreme(self.dif_history, prev_macd_index)
             if macd_extreme:
                 self._log.info(f"检测到DIF极值点: 类型={macd_type}, DIF={prev_macd:.6f}")
                 
