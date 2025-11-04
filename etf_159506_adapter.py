@@ -3575,52 +3575,77 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """
         生成成交报告列表
         
-        查询委托列表，提取已成交或部分成交的订单生成成交报告
+        查询交易所的实际成交订单，转换为NautilusTrader成交报告
+        
+        Parameters
+        ----------
+        command : GenerateFillReports
+            生成成交报告的命令
+            
+        Returns
+        -------
+        list[FillReport]
+            成交报告列表
         """
+        fill_reports = []
+        
         try:
-            logger.info(f"生成成交报告: {command}")
+            logger.info("=" * 80)
+            logger.info("📊 【对账】开始查询交易所成交订单...")
+            logger.info("=" * 80)
             
-            # 查询所有委托订单
-            orders = await self._check_orders()
-            if not orders:
-                logger.info("没有委托订单")
-                return []
+            # ✅ 查询交易所的实际委托（而不是本地缓存）
+            exchange_orders = await self._check_orders()
             
-            fill_reports = []
+            if not exchange_orders:
+                logger.info("交易所当前没有委托订单")
+                return fill_reports
             
-            for order in orders:
-                # 只处理有成交量的订单
-                deal_volume = int(order.get('deal_volume', 0))
-                if deal_volume <= 0:
-                    continue
-                
+            logger.info(f"查询到交易所委托订单: {len(exchange_orders)} 个")
+            
+            # 遍历交易所返回的订单，提取有成交的订单
+            for order in exchange_orders:
                 try:
-                    # 解析订单信息
-                    code = order.get('code')
-                    instrument_id = InstrumentId.from_str(f"{code}.SZSE")
+                    # 提取订单信息
+                    code = order.get('code', '159506')
+                    order_id = order.get('order_id')
+                    order_type = order.get('type', '')  # "证券买入" 或 "证券卖出"
+                    deal_volume = int(order.get('deal_volume', 0))
+                    deal_price = float(order.get('deal_price', 0))
                     
-                    # 解析订单方向
-                    order_type = order.get('type', '')
-                    if order_type == '买入' or order_type == 'buy':
+                    # ✅ 只对账当前工具的订单
+                    if code != '159506':
+                        continue
+                    
+                    # ✅ 只处理有成交量的订单
+                    if deal_volume <= 0:
+                        continue
+                    
+                    # ✅ 成交价格必须有效
+                    if deal_price <= 0:
+                        logger.warning(f"订单 {order_id} 成交价格无效: {deal_price}")
+                        continue
+                    
+                    logger.info(f"  成交: {order_id} | {code} | {order_type} | {deal_volume}@{deal_price}")
+                    
+                    # ✅ 转换订单方向
+                    if '买入' in order_type or order_type == 'buy':
                         order_side = OrderSide.BUY
-                    elif order_type == '卖出' or order_type == 'sale':
+                    elif '卖出' in order_type or order_type == 'sale':
                         order_side = OrderSide.SELL
                     else:
-                        logger.warning(f"未知订单类型: {order_type}")
+                        logger.warning(f"未知订单类型: {order_type}, 跳过")
                         continue
                     
-                    # 解析价格和数量
-                    deal_price = float(order.get('deal_price', 0))
-                    if deal_price <= 0:
-                        logger.warning(f"无效的成交价格: {deal_price}")
-                        continue
+                    # ✅ 构建 InstrumentId
+                    instrument_id = InstrumentId(Symbol(code), Venue("SZSE"))
                     
-                    # 构建成交报告
+                    # ✅ 创建成交报告
                     report = FillReport(
-                        account_id=self.account_id,
+                        account_id=command.account_id,  # ✅ 使用 command 中的 account_id
                         instrument_id=instrument_id,
-                        venue_order_id=VenueOrderId(order.get('order_id')),
-                        trade_id=TradeId(order.get('order_id')),  # JVQuant可能没有单独的成交ID
+                        venue_order_id=VenueOrderId(order_id),
+                        trade_id=TradeId(order_id),  # JVQuant 没有单独的成交ID，使用订单ID
                         order_side=order_side,
                         last_qty=Quantity.from_int(deal_volume),
                         last_px=Price.from_str(str(deal_price)),
@@ -3631,20 +3656,23 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     )
                     
                     fill_reports.append(report)
-                    logger.debug(f"生成成交报告: {code} {order_side} {deal_volume}@{deal_price}")
+                    logger.info(f"    ✅ 生成成交报告: {order_id} | {order_side} | {deal_volume}@{deal_price}")
                     
                 except Exception as e:
-                    logger.warning(f"解析订单 {order.get('order_id')} 失败: {e}")
+                    logger.error(f"处理成交报告失败: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     continue
             
-            logger.info(f"✅ 生成了 {len(fill_reports)} 个成交报告")
-            return fill_reports
+            logger.info(f"✅ 对账完成: 生成 {len(fill_reports)} 个成交报告")
+            logger.info("=" * 80)
             
         except Exception as e:
-            logger.error(f"生成成交报告失败: {e}")
+            logger.error(f"❌ 生成成交报告失败: {e}")
             import traceback
-            traceback.print_exc()
-            return []
+            logger.error(traceback.format_exc())
+                
+        return fill_reports
     
     async def generate_position_status_reports(
         self, 
