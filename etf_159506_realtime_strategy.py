@@ -28,6 +28,7 @@ from datetime import datetime, time, date, timedelta
 import pytz
 import warnings
 from typing import List, Dict
+import threading
 
 from etf_159506_strategy_config import ETF159506Config
 from etf_159506_strategy import CatalogKDJIndicator
@@ -147,6 +148,10 @@ class ETF159506Strategy(Strategy):
         
         # 每分钟成交量记录（输入为1分钟Bar，无需累加）
         self.minute_volume_data = deque(maxlen=1000)  # 存储每分钟成交量数据 [(minute_key, volume), ...]
+        
+        # 异步图表更新相关
+        self._chart_update_thread = None  # 图表更新线程
+        self._chart_update_lock = threading.Lock()  # 线程锁，保护共享数据
         self._log.info("每分钟成交量记录功能已启用")
         
         # MACD极值点时间差属性
@@ -656,7 +661,8 @@ class ETF159506Strategy(Strategy):
         self.technical_signal_history.append(signal_record)
         self._log.info(f"记录技术信号历史: 时间={beijing_time_str}, 信号值={current_technical_signal:.2f}")
         
-        self.update_realtime_charts(last_bar, current_technical_signal)
+        # ✅ 使用异步方式更新图表，不阻塞订单提交
+        self.update_realtime_charts_async(last_bar, current_technical_signal)
         self.technical_signal = 0
     def on_event(self, event: Event):
         """处理所有事件"""
@@ -1864,9 +1870,11 @@ class ETF159506Strategy(Strategy):
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
-        # ✅ 先撤销所有未成交的委托
+        # ✅ 撤销所有未成交的委托
+        # 注意：框架会先查询缓存，如果缓存中没有订单会跳过执行
+        # 但交易所可能还有实际未成交的委托，需要定期对账
+        self._log.info("检查并撤销未成交委托...")
         self.cancel_all_orders(self.config.instrument_id)
-        self._log.info("已撤销所有未成交委托，准备下新单")
         
         # 可选的时间信息日志
         if log_time_info:
@@ -1879,70 +1887,86 @@ class ETF159506Strategy(Strategy):
         
         # 计算交易数量
         if self.trade_size is None:
-            account = self.cache.account_for_venue(self.config.venue)
+            # 从 instrument_id 提取 venue（官方推荐方式）
+            venue = self.config.instrument_id.venue
+            self._log.info(f"正在获取账户信息，venue={venue}")
+            
+            # 按venue获取账户
+            account = self.cache.account_for_venue(venue)
             if account is None:
-                self._log.info("测试模式下无账户信息，使用固定交易数量")
-                trade_quantity = Quantity.from_int(100)
-                buy_price = self.instrument.make_price(bar.close.as_double() + 0.001)
-            else:
-                # ✅ 修复：使用 balance_free 获取可用余额
-                free_balance = account.balance_free(CNY)
-                if free_balance is None:
-                    self._log.error("无法获取CNY可用余额，买入失败")
-                    return False
+                self._log.error(f"无法获取venue={venue}的账户信息，买入失败")
                 
-                available_balance = free_balance.as_double()
-                
-                # ✅ 先计算订单价格（加价提高成交概率）
-                buy_price_value = bar.close.as_double() + 0.001
-                buy_price = self.instrument.make_price(buy_price_value)
-                
-                # 详细或简洁的余额信息日志
-                if log_detailed_balance:
-                    total_balance = account.balance_total(CNY)
-                    locked_balance = account.balance_locked(CNY)
-                    self._log.info(
-                        f"账户余额详情: 总余额={total_balance.as_double():.2f}, "
-                        f"可用余额={available_balance:.2f}, "
-                        f"冻结余额={locked_balance.as_double() if locked_balance else 0:.2f}"
-                    )
+                # 调试信息：列出所有账户
+                all_accounts = self.cache.accounts()
+                if all_accounts:
+                    self._log.error(f"缓存中有 {len(all_accounts)} 个账户:")
+                    for acc in all_accounts:
+                        self._log.error(f"  账户: {acc.id}, venue={acc.id.get_issuer()}")
                 else:
-                    self._log.info(
-                        f"买入信号 - 可用余额: {available_balance:.2f} CNY, "
-                        f"收盘价: {bar.close.as_double():.4f}, "
-                        f"订单价格: {buy_price_value:.4f}"
-                    )
+                    self._log.error("缓存中没有任何账户信息")
                 
-                # 检查可用余额
-                if available_balance <= 0:
-                    self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法买入")
-                    return False
+                return False
+            
+            self._log.info(f"成功获取账户: {account.id}")
+            
+            # 获取可用余额
+            free_balance = account.balance_free(CNY)
+            if free_balance is None:
+                self._log.error("无法获取CNY可用余额，买入失败")
+                return False
+            
+            available_balance = free_balance.as_double()
+            
+            # 计算订单价格（加价提高成交概率）
+            buy_price_value = bar.close.as_double() + 0.001
+            buy_price = self.instrument.make_price(buy_price_value)
+            
+            # 详细或简洁的余额信息日志
+            if log_detailed_balance:
+                total_balance = account.balance_total(CNY)
+                locked_balance = account.balance_locked(CNY)
+                self._log.info(
+                    f"账户余额详情: 总余额={total_balance.as_double():.2f}, "
+                    f"可用余额={available_balance:.2f}, "
+                    f"冻结余额={locked_balance.as_double() if locked_balance else 0:.2f}"
+                )
+            else:
+                self._log.info(
+                    f"买入信号 - 可用余额: {available_balance:.2f} CNY, "
+                    f"收盘价: {bar.close.as_double():.4f}, "
+                    f"订单价格: {buy_price_value:.4f}"
+                )
+            
+            # 检查可用余额
+            if available_balance <= 0:
+                self._log.warning(f"可用余额不足: {available_balance:.2f} CNY，无法买入")
+                return False
+            
+            # 用订单价格计算数量，避免超出可用余额
+            # 留0.1%的安全边际，防止手续费等导致余额不足
+            raw_quantity = int(available_balance * 0.999 / buy_price_value)
+            
+            # 规整到100股的整数倍（交易所要求）
+            quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
+            
+            # 可选的详细计算日志
+            if log_detailed_balance:
+                self._log.info(
+                    f"交易计算: 可用余额={available_balance:.2f}, "
+                    f"收盘价={bar.close.as_double():.4f}, "
+                    f"订单价格={buy_price_value:.4f}, "
+                    f"原始数量={raw_quantity}, 规整后数量={quantity}, "
+                    f"预计花费={quantity * buy_price_value:.2f}"
+                )
+            
+            # 检查规整后的数量是否有效
+            if quantity <= 0:
+                self._log.warning(
+                    f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），无法买入"
+                )
+                return False
                 
-                # ✅ 用订单价格计算数量，避免超出可用余额
-                # 留0.1%的安全边际，防止手续费等导致余额不足
-                raw_quantity = int(available_balance * 0.999 / buy_price_value)
-                
-                # ✅ 规整到100股的整数倍（交易所要求）
-                quantity = self._round_to_lot_size(raw_quantity, lot_size=100)
-                
-                # 可选的详细计算日志
-                if log_detailed_balance:
-                    self._log.info(
-                        f"交易计算: 可用余额={available_balance:.2f}, "
-                        f"收盘价={bar.close.as_double():.4f}, "
-                        f"订单价格={buy_price_value:.4f}, "
-                        f"原始数量={raw_quantity}, 规整后数量={quantity}, "
-                        f"预计花费={quantity * buy_price_value:.2f}"
-                    )
-                
-                # 检查规整后的数量是否有效
-                if quantity <= 0:
-                    self._log.warning(
-                        f"⚠️  规整后交易数量无效: {quantity}（原始: {raw_quantity}），无法买入"
-                    )
-                    return False
-                    
-                trade_quantity = Quantity.from_int(quantity)
+            trade_quantity = Quantity.from_int(quantity)
         else:
             trade_quantity = self.trade_size
             # ✅ 固定数量模式下仍需计算价格
@@ -2010,9 +2034,11 @@ class ETF159506Strategy(Strategy):
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
-        # ✅ 先撤销所有未成交的委托
+        # ✅ 撤销所有未成交的委托
+        # 注意：框架会先查询缓存，如果缓存中没有订单会跳过执行
+        # 但交易所可能还有实际未成交的委托，需要定期对账
+        self._log.info("检查并撤销未成交委托...")
         self.cancel_all_orders(self.config.instrument_id)
-        self._log.info("已撤销所有未成交委托，准备下卖单")
         
         # 检查当前时间是否在2:50分之后，如果是则跳过卖出操作
         if self.is_after_scheduled_time(bar):
@@ -2302,8 +2328,34 @@ class ETF159506Strategy(Strategy):
         # 检查是否在2:50分之后
         return current_time_only >= self.scheduled_buy_time
     
+    def update_realtime_charts_async(self, bar: Bar, technical_signal: float = 0):
+        """异步更新实时图表（不阻塞订单提交）"""
+        # 如果上一个图表更新线程还在运行，跳过本次更新
+        if self._chart_update_thread and self._chart_update_thread.is_alive():
+            self._log.warning("上一次图表更新还未完成，跳过本次更新")
+            return
+        
+        # 创建新线程进行图表更新
+        self._chart_update_thread = threading.Thread(
+            target=self._update_realtime_charts_internal,
+            args=(bar, technical_signal),
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        self._chart_update_thread.start()
+        self._log.info("✅ 已启动异步图表更新线程（不阻塞订单提交）")
+    
+    def _update_realtime_charts_internal(self, bar: Bar, technical_signal: float = 0):
+        """内部图表更新方法（在独立线程中运行）"""
+        try:
+            with self._chart_update_lock:  # 使用锁保护共享数据
+                self.update_realtime_charts(bar, technical_signal)
+        except Exception as e:
+            self._log.error(f"异步图表更新失败: {e}")
+            import traceback
+            self._log.error(f"错误详情: {traceback.format_exc()}")
+    
     def update_realtime_charts(self, bar: Bar, technical_signal: float = 0):
-        """每分钟更新实时图表（非阻塞方式，数据来源于cache）"""
+        """每分钟更新实时图表（同步方法，由异步包装调用）"""
         try:
             # 抑制字体警告（显式静默已知的无害警告）
             warnings.filterwarnings('ignore', category=UserWarning, message='.*Glyph.*missing from font.*')
@@ -3287,11 +3339,27 @@ class ETF159506Strategy(Strategy):
             mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
             mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
             
-            # 设置x轴范围
-            x_min = new_index.min()
-            x_max = new_index.max()
+            # 固定X轴范围为完整交易日（不随数据量变化）
+            # 获取基准日期和时区（从数据中取第一个有效时间）
+            if len(mapped_df) > 0:
+                base_date = mapped_df.index[0].date()
+                # 获取数据的时区信息
+                tz_info = mapped_df.index[0].tzinfo
+            else:
+                base_date = data_date
+                # 如果没有数据，使用北京时区
+                import pytz
+                tz_info = pytz.timezone('Asia/Shanghai')
             
-            # 为每个子图设置相同的x轴范围
+            # 设置固定的交易时间范围（必须带时区信息，与数据时间匹配）
+            # 上午：9:30-11:30（映射后保持不变）
+            # 下午：13:00-15:00（映射后为11:30-13:30，因为减去了1.5小时）
+            x_min = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day, 
+                                hour=9, minute=30, second=0, tz=tz_info)
+            x_max = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day, 
+                                hour=13, minute=30, second=0, tz=tz_info)  # 映射后的下午15:00
+            
+            # 为每个子图设置相同的固定x轴范围
             for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
                 ax.set_xlim(x_min, x_max)
             
@@ -3963,24 +4031,22 @@ class ETF159506Strategy(Strategy):
             ax6.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', 
                         fontsize=11, color='gray', ha='right', va='top')
             ax6.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-            ax6.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax6.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 主刻度10分钟
+            ax6.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))   # 次刻度1分钟
             plt.setp(ax6.xaxis.get_majorticklabels(), rotation=45)
             ax6.legend(loc='upper left')
-            ax6.grid(True, alpha=0.3)
+            ax6.grid(True, alpha=0.3, which='major')  # 主网格线
+            ax6.grid(True, alpha=0.1, which='minor', linestyle=':')  # 次网格线（1分钟）
 
-            # 统一x轴格式化，防止内容错乱
+            # 统一x轴格式化，主刻度10分钟，次刻度1分钟
             for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
                 ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-                # 根据数据时间跨度调整刻度间隔
-                time_span = x_max - x_min
-                if time_span.total_seconds() < 3600:  # 小于1小时
-                    interval = 5  # 每5分钟
-                elif time_span.total_seconds() < 7200:  # 小于2小时
-                    interval = 10  # 每10分钟
-                else:
-                    interval = 15  # 每15分钟
-                ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=interval))
+                ax.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 主刻度10分钟
+                ax.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))   # 次刻度1分钟
                 plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+                # 同时设置主网格线和1分钟的细网格线
+                ax.grid(True, alpha=0.3, which='major')  # 主网格线（10分钟）
+                ax.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)  # 次网格线（1分钟）
 
             plt.tight_layout()
             

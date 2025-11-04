@@ -14,12 +14,11 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.config import LoggingConfig, TradingNodeConfig
+from nautilus_trader.config import LoggingConfig, TradingNodeConfig, LiveExecEngineConfig
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.config import ImportableStrategyConfig
 
 # 导入配置和适配器
-from etf_159506_live_config import ETF159506LiveConfig, create_default_live_config
 from etf_159506_adapter import ETF159506Adapter
 
 # 导入策略
@@ -52,7 +51,6 @@ class ETF159506LiveTradingSystem:
     
     def __init__(
         self,
-        config: Optional[ETF159506LiveConfig] = None,
         adapter_config: Optional[Dict[str, Any]] = None,
     ):
         """
@@ -60,12 +58,9 @@ class ETF159506LiveTradingSystem:
         
         Parameters
         ----------
-        config : Optional[ETF159506LiveConfig]
-            主配置
         adapter_config : Optional[Dict[str, Any]]
             适配器配置（包含token等）
         """
-        self.config = config or create_default_live_config()
         self.adapter_config = adapter_config or {
             'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 使用您adapter中的token
             'stock_code': '159506'
@@ -92,7 +87,7 @@ class ETF159506LiveTradingSystem:
         self.is_running = False
         self.shutdown_event = asyncio.Event()
         
-        logger.info(f"ETF159506实时交易系统初始化: trader_id={self.config.trader_id}")
+        logger.info("ETF159506实时交易系统初始化")
     
     def _create_trading_node_config(self) -> TradingNodeConfig:
         """创建TradingNode配置 - 参考官方回测配置"""
@@ -156,10 +151,20 @@ class ETF159506LiveTradingSystem:
             
             data_client_config = create_etf_159506_data_client_config()
             exec_client_config = create_etf_159506_exec_client_config()
+            
+            # ✅ 创建执行引擎配置（启用对账功能）
+            exec_engine_config = LiveExecEngineConfig(
+                reconciliation=True,  # ✅ 启用对账，同步交易所订单到缓存
+                reconciliation_lookback_mins=1440,  # 对账回溯24小时
+                inflight_check_interval_ms=5000,  # 5秒检查未响应订单
+                inflight_check_threshold_ms=10000,  # 10秒超时阈值
+            )
+            
             # 创建TradingNode配置
             config = TradingNodeConfig(
                 trader_id=TraderId("ETF159506-LIVE-001"),
                 cache=cache_config,
+                exec_engine=exec_engine_config,  # ✅ 关键：启用对账功能
                 strategies=[strategy_config],
                 data_clients={"SZSE": data_client_config},
                 exec_clients={"SZSE": exec_client_config},
@@ -202,10 +207,6 @@ class ETF159506LiveTradingSystem:
         """
         try:
             logger.info("启动ETF159506实时交易系统...")
-            
-            # 验证配置
-            if not self.config.validate_config():
-                raise ValueError("配置验证失败")
             
             # 设置全局适配器实例（在创建TradingNode之前设置）
             logger.info("设置全局适配器实例...")
@@ -314,13 +315,12 @@ class ETF159506LiveTradingSystem:
         try:
             status = {
                 "is_running": self.is_running,
-                "trader_id": self.config.trader_id,
-                "instrument_id": str(self.config.instrument_id),
-                "bar_type": str(self.config.bar_type),
-                "testnet": self.config.testnet,
-                "starting_balance": self.config.starting_balance,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            
+            # 添加配置信息（从 trading_node_config）
+            if self.trading_node_config:
+                status["trader_id"] = str(self.trading_node_config.trader_id)
             
             # 添加适配器状态（包含内存监控信息）
             if self.adapter:
@@ -350,25 +350,12 @@ class ETF159506LiveTradingSystem:
             logger.info("=" * 80)
             
             # 基本配置信息
-            logger.info(f"交易者ID: {self.config.trader_id}")
-            logger.info(f"工具ID: {self.config.instrument_id}")
-            logger.info(f"K线类型: {self.config.bar_type}")
-            logger.info(f"测试网络: {self.config.testnet}")
-            logger.info(f"初始资金: {self.config.starting_balance}")
-            
-            # Redis配置信息
-            logger.info(f"Redis主机: {self.config.redis_host}:{self.config.redis_port}")
-            logger.info(f"Redis数据库: {self.config.redis_db}")
+            if self.trading_node_config:
+                logger.info(f"交易者ID: {self.trading_node_config.trader_id}")
             
             # 适配器配置信息
             logger.info(f"适配器Token: {self.adapter_config.get('token', 'N/A')}")
             logger.info(f"股票代码: {self.adapter_config.get('stock_code', 'N/A')}")
-            
-            # 工具信息
-            instrument_info = self.config.get_instrument_info()
-            logger.info("工具详细信息:")
-            for key, value in instrument_info.items():
-                logger.info(f"  {key}: {value}")
             
             logger.info("=" * 80)
             
@@ -439,7 +426,6 @@ class LiveTradingManager:
     
     def run(
         self,
-        config: Optional[ETF159506LiveConfig] = None,
         adapter_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
@@ -455,7 +441,6 @@ class LiveTradingManager:
             
             # 创建交易系统
             self.trading_system = ETF159506LiveTradingSystem(
-                config=config,
                 adapter_config=adapter_config,
             )
             
@@ -514,32 +499,24 @@ class LiveTradingManager:
 
 def create_testnet_system() -> ETF159506LiveTradingSystem:
     """创建测试网络交易系统"""
-    from etf_159506_live_config import create_testnet_live_config
-    
-    config = create_testnet_live_config()
     adapter_config = {
         'token': 'd0c519adcd47d266f1c96750d4e80aa6',
         'stock_code': '159506'
     }
     
     return ETF159506LiveTradingSystem(
-        config=config,
         adapter_config=adapter_config,
     )
 
 
 def create_production_system() -> ETF159506LiveTradingSystem:
     """创建生产环境交易系统"""
-    from etf_159506_live_config import create_production_live_config
-    
-    config = create_production_live_config()
     adapter_config = {
         'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 生产环境token
         'stock_code': '159506'
     }
     
     return ETF159506LiveTradingSystem(
-        config=config,
         adapter_config=adapter_config,
     )
 
@@ -571,7 +548,6 @@ def main():
         # 根据模式创建系统
         if args.mode == 'testnet':
             logger.info("创建测试网络交易系统...")
-            config = None
             adapter_config = {
                 'token': 'd0c519adcd47d266f1c96750d4e80aa6',
                 'stock_code': '159506',
@@ -586,7 +562,6 @@ def main():
             }
         else:
             logger.info("创建生产环境交易系统...")
-            config = None
             adapter_config = {
                 'token': 'd0c519adcd47d266f1c96750d4e80aa6',  # 生产环境token
                 'stock_code': '159506',
@@ -602,7 +577,6 @@ def main():
         
         # 运行系统（同步调用）
         manager.run(
-            config=config,
             adapter_config=adapter_config,
         )
         

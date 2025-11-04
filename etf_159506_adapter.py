@@ -26,7 +26,7 @@ import psutil  # 用于内存监控
 # NautilusTrader imports
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
 from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.model.data import QuoteTick, TradeTick, Bar
@@ -43,7 +43,7 @@ from nautilus_trader.execution.messages import (
     ModifyOrder,
 )
 from nautilus_trader.execution.reports import OrderStatusReport, FillReport, PositionStatusReport
-from nautilus_trader.model.enums import OrderSide, OrderType, LiquiditySide, PositionSide
+from nautilus_trader.model.enums import OrderSide, OrderType, LiquiditySide, PositionSide, TimeInForce
 from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.identifiers import TradeId
@@ -3188,12 +3188,35 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         except Exception as e:
             logger.error(f"断开ETF159506合并执行客户端失败: {e}")
     
+    def _convert_order_status(self, status: str) -> OrderStatus:
+        """
+        转换交易所订单状态为NautilusTrader格式
+        
+        交易所状态映射：
+        - "已成" → FILLED
+        - "已撤" → CANCELED  
+        - "部成" → PARTIALLY_FILLED
+        - "未成" → ACCEPTED
+        - "废单" → REJECTED
+        """
+        status_mapping = {
+            '已成': OrderStatus.FILLED,
+            '已撤': OrderStatus.CANCELED,
+            '部成': OrderStatus.PARTIALLY_FILLED,
+            '未成': OrderStatus.ACCEPTED,
+            '废单': OrderStatus.REJECTED,
+        }
+        
+        return status_mapping.get(status, OrderStatus.ACCEPTED)
+    
     async def generate_order_status_reports(
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
         """
         生成订单状态报告列表
+        
+        查询交易所的实际委托订单，转换为NautilusTrader订单状态报告
         
         Parameters
         ----------
@@ -3207,33 +3230,90 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """
         reports = []
         
-        # 遍历所有订单，生成状态报告
-        for client_order_id, order_info in self.orders.items():
-            try:
-                # 创建订单状态报告
-                report = OrderStatusReport(
-                    account_id=command.account_id,
-                    instrument_id=order_info.get('instrument_id'),
-                    client_order_id=client_order_id,
-                    venue_order_id=order_info.get('venue_order_id'),
-                    order_side=order_info.get('order_side'),
-                    order_type=order_info.get('order_type'),
-                    time_in_force=order_info.get('time_in_force'),
-                    order_status=order_info.get('order_status', OrderStatus.INITIALIZED),
-                    quantity=order_info.get('quantity'),
-                    filled_qty=order_info.get('filled_qty', Quantity.zero()),
-                    avg_px=order_info.get('avg_px'),
-                    last_px=order_info.get('last_px'),
-                    currency=order_info.get('currency'),
-                    report_id=UUID4(),
-                    ts_accepted=order_info.get('ts_accepted'),
-                    ts_triggered=order_info.get('ts_triggered'),
-                    ts_last=order_info.get('ts_last'),
-                    ts_init=self._clock.timestamp_ns(),
-                )
-                reports.append(report)
-            except Exception as e:
-                logger.error(f"生成订单状态报告失败 {client_order_id}: {e}")
+        try:
+            logger.info("=" * 80)
+            logger.info("📊 【对账】开始查询交易所委托订单...")
+            logger.info("=" * 80)
+            
+            # ✅ 查询交易所的实际委托（而不是本地缓存）
+            exchange_orders = await self._check_orders()
+            
+            if not exchange_orders:
+                logger.info("交易所当前没有委托订单")
+                return reports
+            
+            logger.info(f"查询到交易所委托订单: {len(exchange_orders)} 个")
+            
+            # 遍历交易所返回的订单，转换为OrderStatusReport
+            for order in exchange_orders:
+                try:
+                    # 提取订单信息
+                    code = order.get('code', '159506')
+                    order_id = order.get('order_id')
+                    status = order.get('status', '未知')
+                    order_type = order.get('type', '')  # "证券买入" 或 "证券卖出"
+                    
+                    logger.info(f"  订单: {order_id} | {code} | {order_type} | 状态={status}")
+                    
+                    # ✅ 只对账当前工具的订单
+                    if code != '159506':
+                        continue
+                    
+                    # ✅ 转换订单状态
+                    nautilus_status = self._convert_order_status(status)
+                    
+                    # ✅ 转换订单方向
+                    if '买入' in order_type or order_type == 'buy':
+                        nautilus_side = OrderSide.BUY
+                    elif '卖出' in order_type or order_type == 'sale':
+                        nautilus_side = OrderSide.SELL
+                    else:
+                        logger.warning(f"未知订单类型: {order_type}, 跳过")
+                        continue
+                    
+                    # ✅ 提取价格和数量
+                    order_price = float(order.get('order_price', 0))
+                    order_volume = int(order.get('order_volume', 0))
+                    deal_price = float(order.get('deal_price', 0))
+                    deal_volume = int(order.get('deal_volume', 0))
+                    
+                    # ✅ 构建 InstrumentId
+                    instrument_id = InstrumentId(Symbol(code), Venue("SZSE"))
+                    
+                    report = OrderStatusReport(
+                        account_id=command.account_id,
+                        instrument_id=instrument_id,
+                        client_order_id=None,  # 交易所订单没有client_order_id（外部订单）
+                        venue_order_id=VenueOrderId(order_id),
+                        order_side=nautilus_side,
+                        order_type=OrderType.LIMIT,  # 假设都是限价单
+                        time_in_force=TimeInForce.GTC,
+                        order_status=nautilus_status,
+                        quantity=Quantity.from_int(order_volume),
+                        filled_qty=Quantity.from_int(deal_volume),
+                        avg_px=Price.from_str(str(deal_price)) if deal_volume > 0 else None,
+                        report_id=UUID4(),
+                        ts_accepted=self._clock.timestamp_ns(),
+                        ts_last=self._clock.timestamp_ns(),
+                        ts_init=self._clock.timestamp_ns(),
+                    )
+                    
+                    reports.append(report)
+                    logger.info(f"    ✅ 生成报告: {order_id} | {nautilus_side} | {nautilus_status}")
+                    
+                except Exception as e:
+                    logger.error(f"处理订单报告失败: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    continue
+            
+            logger.info(f"✅ 对账完成: 生成 {len(reports)} 个订单报告")
+            logger.info("=" * 80)
+            
+        except Exception as e:
+            logger.error(f"❌ 生成订单状态报告失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
                 
         return reports
     
@@ -3400,7 +3480,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         """
         try:
             instrument_id = command.instrument_id
-            logger.info(f"取消所有订单: {instrument_id}")
+            logger.info("=" * 80)
+            logger.info(f"🔔 【ADAPTER】收到撤销所有订单命令: {instrument_id}")
+            logger.info("=" * 80)
             
             # 检查连接状态
             if not self.is_connected:

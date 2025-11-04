@@ -25,3 +25,6 @@ config.json
 # 邮件配置文件（包含邮箱授权码）
 email_config.py
 email_config.json
+etf_159506_realtime_extremes.png
+etf_159506_realtime_kline.png
+etf_159506_realtime_trade_points.png
