@@ -311,11 +311,13 @@ class ETF159506Strategy(Strategy):
     
     def on_stop(self):
         """策略停止时调用"""
-        # current_position = self.get_current_position()
-        # if current_position is not None:
-        #     self.close_all_positions(self.config.instrument_id)
-        #     self._log.info(f"策略停止时关闭持仓: {current_position.quantity.as_double()} 股")
+        
+        # 取消订阅实时数据和事件
         self.unsubscribe_bars(self.config.bar_type)
+        
+        # ✅ 取消订阅订单成交事件 - 策略停止时清理订阅
+        self.unsubscribe_order_fills(self.config.instrument_id)
+        self._log.info(f"已取消订阅订单成交事件: {self.config.instrument_id}")
         
         # 保存交易信号到策略实例变量中，供回测系统获取
         if hasattr(self, 'trade_signals') and self.trade_signals:
