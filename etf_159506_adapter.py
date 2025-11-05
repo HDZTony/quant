@@ -1989,10 +1989,10 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                 logger.info(f"从本地catalog加载了 {len(bars)} 条历史K线数据")
                 
                 # ✅ 只有当有数据时才调用 _handle_bars（避免NautilusTrader框架警告）
+                # ✅ 新版本API：移除了 partial 参数
                 self._handle_bars(
                     bar_type=bar_type,
                     bars=bars,
-                    partial=None,
                     correlation_id=request.id,
                     start=start,
                     end=end,
@@ -3281,7 +3281,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     instrument_id = InstrumentId(Symbol(code), Venue("SZSE"))
                     
                     report = OrderStatusReport(
-                        account_id=command.account_id,
+                        account_id=self.account_id,  # ✅ 使用执行客户端的 account_id 属性
                         instrument_id=instrument_id,
                         client_order_id=None,  # 交易所订单没有client_order_id（外部订单）
                         venue_order_id=VenueOrderId(order_id),
@@ -3642,7 +3642,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     # ✅ 创建成交报告
                     report = FillReport(
-                        account_id=command.account_id,  # ✅ 使用 command 中的 account_id
+                        account_id=self.account_id,  # ✅ 使用执行客户端的 account_id 属性
                         instrument_id=instrument_id,
                         venue_order_id=VenueOrderId(order_id),
                         trade_id=TradeId(order_id),  # JVQuant 没有单独的成交ID，使用订单ID
