@@ -1077,7 +1077,12 @@ class ETF159506Strategy(Strategy):
                 # 计算成交量比值
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
                 # rank_ratio 已经通过 > 0.9 条件判断，直接使用
-                top_signal_contribution = -(10/volume_ratio+rank_ratio*30)
+                # 避免除零错误：当volume_ratio为0时使用最大贡献值
+                if volume_ratio > 0:
+                    top_signal_contribution = -(10/volume_ratio+rank_ratio*30)
+                else:
+                    # 成交量为0时，给予较大的顶部信号贡献（相当于volume_ratio极小的情况）
+                    top_signal_contribution = -(100 + rank_ratio*30)
                 self.technical_signal += top_signal_contribution
                 self.technical_signal_steps.append({
                     'description': f'顶部信号(成交量比值={volume_ratio:.4f}, 排名比例={rank_ratio:.3f})',
@@ -1146,7 +1151,12 @@ class ETF159506Strategy(Strategy):
                 # 计算成交量比值
                 volume_ratio = self.calculate_volume_ratio(start_index, bar)
                 # rank_ratio 已经通过 > 0.9 条件判断，直接使用
-                bottom_signal_contribution = 10/volume_ratio+rank_ratio*30
+                # 避免除零错误：当volume_ratio为0时使用最大贡献值
+                if volume_ratio > 0:
+                    bottom_signal_contribution = 10/volume_ratio+rank_ratio*30
+                else:
+                    # 成交量为0时，给予较大的底部信号贡献（相当于volume_ratio极小的情况）
+                    bottom_signal_contribution = 100 + rank_ratio*30
                 self.technical_signal += bottom_signal_contribution
                 self.technical_signal_steps.append({
                     'description': f'底部信号(成交量比值={volume_ratio:.4f}, 排名比例={rank_ratio:.3f})',
