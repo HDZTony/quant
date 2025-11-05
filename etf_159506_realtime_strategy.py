@@ -156,6 +156,12 @@ class ETF159506Strategy(Strategy):
         
         # MACD极值点时间差属性
         self.time_diff_minutes_from_latest_extreme = None  # 距离最近极值点的分钟数
+        
+        # 死叉卖出后的买入监控
+        self.first_death_cross_triggered = False  # 标记第一个死叉信号已触发
+        self.first_death_cross_sold = False  # 标记第一个死叉已实际卖出
+        self.monitor_histogram_shrink = False  # 是否开始监控柱状图缩小
+        self._log.info("死叉卖出后买入监控已初始化: MACD柱连续2分钟缩小将增加+300技术信号")
 
     def _check_existing_positions(self):
         """
@@ -359,6 +365,9 @@ class ETF159506Strategy(Strategy):
         self.check_macd_signals(bar)
         self.check_macd_top_signals(bar)
         self.check_macd_bottom_signals(bar)
+        
+        # 🆕 检测死叉后MACD柱连续缩小（买入信号）
+        self.check_histogram_shrink_for_rebuy()
         
         # 保存当前信号值
         current_technical_signal = self.technical_signal
@@ -639,7 +648,7 @@ class ETF159506Strategy(Strategy):
         if self.rsi.initialized:
             self._log.info(f"RSI状态: RSI={self.rsi.value * 100:.2f}")
         
-        # 调用统一的信号处理方法
+        # 调用统一的信号处理方法（包含MACD柱缩小检测）
         current_technical_signal = self._process_technical_signals(last_bar, beijing_time_str, is_historical=False)
         
         # ========== 统一判断买入/卖出阈值 ==========
@@ -1377,6 +1386,12 @@ class ETF159506Strategy(Strategy):
             # 如果是第一个死叉技术信号，使用40000系数，否则使用20000
             is_first_death_cross = not any(signal.get('signal_type') == 'death_cross' for signal in self.technical_signals)
             signal_coefficient = 40000 if is_first_death_cross else 20000
+            
+            # 🆕 标记第一个死叉信号已触发（待确认卖出）
+            if is_first_death_cross:
+                self.first_death_cross_triggered = True
+                self._log.info("✅ 第一个死叉信号已触发（待在on_bar中确认卖出）")
+            
             macd_contribution = -signal_coefficient*current_macd_abs
             self.technical_signal += macd_contribution
             self.technical_signal_steps.append({
@@ -2004,6 +2019,11 @@ class ETF159506Strategy(Strategy):
         
         基于技术指标信号执行买入操作。
         """
+        # 🆕 如果正在监控MACD柱缩小，买入后重置监控状态
+        if self.monitor_histogram_shrink:
+            self._reset_histogram_monitor()
+            self._log.info("买入信号执行，重置MACD柱监控状态")
+        
         self._execute_buy_order(
             bar=bar,
             signal_type=signal_type,
@@ -2125,6 +2145,12 @@ class ETF159506Strategy(Strategy):
         基于技术指标信号执行卖出操作。
         不按strategy_id过滤持仓，以便处理策略重启后的持仓。
         """
+        # 🆕 检测第一个死叉实际卖出
+        if self.first_death_cross_triggered and not self.first_death_cross_sold:
+            self.first_death_cross_sold = True
+            self.monitor_histogram_shrink = True
+            self._log.info("✅ 确认第一个死叉信号触发实际卖出，激活MACD柱缩小监控")
+        
         self._execute_sell_order(
             bar=bar,
             signal_type=signal_type,
@@ -2156,6 +2182,68 @@ class ETF159506Strategy(Strategy):
             signal_value=self.technical_signal,
             filter_by_strategy_id=True  # 按strategy_id过滤持仓
         )
+    
+    def check_histogram_shrink_for_rebuy(self):
+        """检测MACD柱连续两分钟缩小（往前判断2分钟）
+        
+        判断逻辑：|histogram[n-2]| > |histogram[n-1]| > |histogram[n]|
+        满足条件时增加+300技术信号值
+        
+        Parameters:
+        -----------
+        
+        """
+        if not self.monitor_histogram_shrink:
+            return  # 未激活监控，直接返回
+        
+        # 需要至少3个历史值才能判断（n-2, n-1, n）
+        if len(self.histogram_history) < 3:
+            self._log.info(
+                f"收集MACD柱值 [{len(self.histogram_history)}/3]"
+            )
+            return
+        
+        # 直接从历史记录中取最后3个值
+        hist_n_minus_2 = abs(self.histogram_history[-3])
+        hist_n_minus_1 = abs(self.histogram_history[-2])
+        hist_n = abs(self.histogram_history[-1])
+        
+        # 检测连续缩小：|histogram[n-2]| > |histogram[n-1]| > |histogram[n]|
+        is_shrinking = (hist_n_minus_2 > hist_n_minus_1) and (hist_n_minus_1 > hist_n)
+        
+        if is_shrinking:
+            self._log.info(
+                f"🎯 检测到MACD柱连续2分钟缩小: "
+                f"{hist_n_minus_2:.6f} > {hist_n_minus_1:.6f} > {hist_n:.6f}"
+            )
+            self._trigger_rebuy_signal_after_death_cross()
+            self._reset_histogram_monitor()
+        else:
+            self._log.debug(
+                f"MACD柱未连续缩小: {hist_n_minus_2:.6f}, {hist_n_minus_1:.6f}, {hist_n:.6f}"
+            )
+    
+    def _trigger_rebuy_signal_after_death_cross(self):
+        """死叉卖出后，MACD柱连续缩小触发的买入信号（+300技术信号值）"""
+        rebuy_contribution = 300  # 增加300技术信号值，而非直接买入
+        self.technical_signal += rebuy_contribution
+        
+        self.technical_signal_steps.append({
+            'description': '死叉后MACD柱连续2分钟缩小买入信号(+300)',
+            'delta': rebuy_contribution
+        })
+        
+        self._log.info(
+            f"🔔 触发死叉后买入信号：MACD柱连续2分钟缩小，"
+            f"增加技术信号+300，当前信号值={self.technical_signal}"
+        )
+    
+    def _reset_histogram_monitor(self):
+        """重置柱状图监控状态"""
+        self.first_death_cross_triggered = False
+        self.first_death_cross_sold = False
+        self.monitor_histogram_shrink = False
+        self._log.info("重置MACD柱监控状态")
 
     def get_current_position(self):
         """获取当前持仓状态 - 回测环境优化版本"""
