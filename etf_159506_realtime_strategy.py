@@ -259,6 +259,11 @@ class ETF159506Strategy(Strategy):
         # Subscribe to real-time data - will be processed by on_bar() handler
         # 订阅实时数据
         self.subscribe_bars(bar_type)
+        
+        # ✅ 订阅订单成交事件 - 必须订阅才能接收 OrderFilled 事件
+        self.subscribe_order_fills(self.config.instrument_id)
+        self._log.info(f"已订阅订单成交事件: {self.config.instrument_id}")
+        
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
         
 
@@ -677,37 +682,10 @@ class ETF159506Strategy(Strategy):
         """处理所有事件"""
         pass  # 通用事件处理，具体事件由专门方法处理
     
-    def on_position_opened(self, event: PositionOpened) -> None:
-        """持仓开启事件处理"""
-        self.position = self.cache.position(event.position_id)
-        if self.position:
-            self._log.info(f"持仓已开启: {self.position.quantity.as_double()} 股, 方向: {self.position.side}")
-        else:
-            self._log.info("持仓开启事件：无法获取持仓信息")
-    
-    def on_position_changed(self, event: PositionChanged) -> None:
-        """持仓变化事件处理"""
-        self.position = self.cache.position(event.position_id)
-        if self.position:
-            self._log.info(f"持仓已变化: {self.position.quantity.as_double()} 股, 方向: {self.position.side}")
-        else:
-            self._log.info("持仓变化事件：无法获取持仓信息")
-    
-    def on_position_closed(self, event: PositionClosed) -> None:
-        """持仓关闭事件处理"""
-        self._log.info(f"持仓关闭事件触发: position_id={event.position_id}")
-        self.position = None
-        self._log.info("持仓已关闭，实例变量已清空")
-    
     def on_order_filled(self, event: OrderFilled) -> None:
         """订单成交事件处理"""
         self._log.info(f"订单成交: {event.client_order_id}, 数量: {event.last_qty}, 价格: {event.last_px}")
         # 订单成交后，持仓状态会在下一个持仓事件中更新
-    
-    def setup_initial_position(self, bar: Bar):
-        """设置初始持仓 - 已禁用，策略始终空仓开始"""
-        self._log.info("初始持仓设置已禁用，策略始终空仓开始")
-        return
     
     def update_history_data(self, bar: Bar):
         """更新历史数据 - 记录MACD指标到历史队列（用于回溯分析）
