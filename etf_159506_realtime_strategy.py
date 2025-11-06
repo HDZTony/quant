@@ -219,8 +219,13 @@ class ETF159506Strategy(Strategy):
             raise RuntimeError(f"Instrument {self.config.instrument_id} not found in cache")
         self._log.info(f"已获取 instrument: {self.instrument.id}, 价格精度: {self.instrument.price_precision}")
         
-        # ✅ 第一步：检查现有持仓（启动时必须先检查！）
+        # ✅ 检查现有持仓
         self._check_existing_positions()
+        
+        # 📝 官方做法：不在 on_start 中撤销对账认领的订单
+        # 说明：external_order_claims 配置认领的订单会由策略管理
+        # 撤单由交易逻辑处理（每次买卖前都会撤销未成交委托）
+        # 参考：nautilus_trader/test_kit/strategies/tester_exec.py
         
         # 请求历史数据用于初始化指标
         self._log.info(f"正在请求历史数据: {bar_type}")
@@ -1875,9 +1880,10 @@ class ETF159506Strategy(Strategy):
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
-        # ✅ 撤销所有未成交的委托
-        # 注意：框架会先查询缓存，如果缓存中没有订单会跳过执行
-        # 但交易所可能还有实际未成交的委托，需要定期对账
+        # ✅ 撤销所有未成交的委托（官方方法）
+        # 说明：external_order_claims 配置会在对账时认领外部订单到缓存
+        # 然后使用官方 cancel_all_orders 方法即可撤销
+        # 参考：https://nautilustrader.io/docs/latest/concepts/live/#execution-reconciliation
         self._log.info("检查并撤销未成交委托...")
         self.cancel_all_orders(self.config.instrument_id)
         
@@ -2044,9 +2050,10 @@ class ETF159506Strategy(Strategy):
         Returns:
             bool: True表示订单成功提交，False表示执行失败
         """
-        # ✅ 撤销所有未成交的委托
-        # 注意：框架会先查询缓存，如果缓存中没有订单会跳过执行
-        # 但交易所可能还有实际未成交的委托，需要定期对账
+        # ✅ 撤销所有未成交的委托（官方方法）
+        # 说明：external_order_claims 配置会在对账时认领外部订单到缓存
+        # 然后使用官方 cancel_all_orders 方法即可撤销
+        # 参考：https://nautilustrader.io/docs/latest/concepts/live/#execution-reconciliation
         self._log.info("检查并撤销未成交委托...")
         self.cancel_all_orders(self.config.instrument_id)
         
@@ -2377,22 +2384,6 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"已标记日期: {current_date}，今天不会再次添加定时买入信号")
         else:
             self._log.info(f"还未到达定时买入时间，当前时间: {current_time_only.strftime('%H:%M:%S')}, 目标时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}")
-
-    def execute_scheduled_buy(self, bar: Bar) -> bool:
-        """执行定时买入
-        
-        每天定时（2:50分）执行买入操作，使用所有可用余额。
-        
-        Returns:
-            bool: True表示订单成功提交，False表示执行失败
-        """
-        return self._execute_buy_order(
-            bar=bar,
-            signal_type='scheduled_buy',
-            signal_value=0,  # 定时买入不依赖技术指标信号
-            log_detailed_balance=True,  # 定时买入记录详细余额信息
-            log_time_info=True  # 定时买入记录时间信息
-        )
         
     def is_after_scheduled_time(self, bar: Bar) -> bool:
         """检查当前时间是否在定时买入时间（2:50分）之后"""

@@ -3289,6 +3289,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         order_type=OrderType.LIMIT,  # 假设都是限价单
                         time_in_force=TimeInForce.GTC,
                         order_status=nautilus_status,
+                        price=Price.from_str(str(order_price)),  # ✅ 限价单必需：委托价格
                         quantity=Quantity.from_int(order_volume),
                         filled_qty=Quantity.from_int(deal_volume),
                         avg_px=Price.from_str(str(deal_price)) if deal_volume > 0 else None,
@@ -3344,7 +3345,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             # 提取订单参数
             order_type = jvquant_order.get('type')  # 'buy' 或 'sale'（报单类别）
             code = jvquant_order.get('code', '159506')
-            name = jvquant_order.get('name', '华夏中证500ETF')
+            name = jvquant_order.get('name', '恒生医疗')
             price = jvquant_order.get('price', 0.0)
             volume = jvquant_order.get('volume', 0)
             
@@ -3653,6 +3654,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                         ts_event=self._clock.timestamp_ns(),
                         report_id=UUID4(),
+                        ts_init=self._clock.timestamp_ns(),  # ✅ 必需：初始化时间戳
                     )
                     
                     fill_reports.append(report)

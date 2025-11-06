@@ -110,9 +110,16 @@ class ETF159506LiveTradingSystem:
                     "bar_type": str(self.bar_type),
                     "venue": "SZSE",
                     "trade_size": 0,  # 0表示使用全部可用资金买入（全仓）
+                    
+                    # === 对账配置（官方推荐） ===
+                    "external_order_claims": [str(instrument.id)],  # ✅ 认领对账发现的外部订单
+                    
+                    # === 技术指标参数 ===
                     "fast_ema_period": 12,
                     "slow_ema_period": 26,
                     "volume_threshold": 500000,
+                    
+                    # === 风险参数 ===
                     "stop_loss_pct": 0.02,
                     "take_profit_pct": 0.25,
                     "max_daily_trades": 100,
@@ -120,7 +127,8 @@ class ETF159506LiveTradingSystem:
                     "price_threshold": 0.001,
                     "emulation_trigger": "NO_TRIGGER",
                     "initial_position_quantity": 0,
-                    # 背离检测参数
+                    
+                    # === 背离检测参数 ===
                     "dea_trend_period": 3,
                     "advance_trading_bars": 1,
                     "confirmation_bars": 1,
@@ -152,12 +160,39 @@ class ETF159506LiveTradingSystem:
             data_client_config = create_etf_159506_data_client_config()
             exec_client_config = create_etf_159506_exec_client_config()
             
-            # ✅ 创建执行引擎配置（启用对账功能）
+            # ✅ 创建执行引擎配置（启用对账功能 - 官方推荐配置）
+            # 参考: https://nautilustrader.io/docs/latest/concepts/live/#execution-reconciliation
             exec_engine_config = LiveExecEngineConfig(
-                reconciliation=True,  # ✅ 启用对账，同步交易所订单到缓存
-                reconciliation_lookback_mins=1440,  # 对账回溯24小时
-                inflight_check_interval_ms=5000,  # 5秒检查未响应订单
-                inflight_check_threshold_ms=10000,  # 10秒超时阈值
+                # === 启动对账配置 ===
+                reconciliation=True,  # 启用对账，启动时同步交易所状态到缓存
+                reconciliation_lookback_mins=1440,  # 对账回溯24小时（官方建议不设置None使用最大历史，但24小时更安全）
+                reconciliation_instrument_ids=[instrument.id],  # ✅ 关键：指定需要对账的工具
+                reconciliation_startup_delay_secs=5.0,  # 启动对账完成后等待5秒再开始连续对账
+                
+                # === 订单过滤配置 ===
+                filter_unclaimed_external_orders=False,  # False: 允许外部订单（如果其他系统也在交易）
+                generate_missing_orders=True,  # ✅ 生成缺失订单以对齐持仓差异（默认True，显式设置）
+                
+                # === 连续对账配置 ===
+                # 订单检查
+                open_check_interval_secs=5.0,  # ✅ 每5秒检查交易所未成交订单
+                open_check_open_only=False,  # False: 检查所有订单历史（不仅限于未成交）
+                open_check_lookback_mins=60,  # 检查最近60分钟的订单
+                open_check_threshold_ms=5000,  # 订单最后更新超过5秒才检查（防止竞争条件）
+                open_check_missing_retries=5,  # ✅ 订单丢失时的重试次数（防止快速解决导致的竞争条件）
+                
+                # 持仓检查
+                position_check_interval_secs=30.0,  # ✅ 每30秒检查持仓差异
+                position_check_lookback_mins=60,  # 持仓差异时查询最近60分钟的成交
+                position_check_threshold_ms=5000,  # 持仓最后活动超过5秒才检查（防止竞争条件）
+                
+                # === 订单飞行中检查 ===
+                inflight_check_interval_ms=2000,  # 每2秒检查飞行中订单
+                inflight_check_threshold_ms=5000,  # 订单飞行超过5秒触发检查
+                inflight_check_retries=5,  # 检查失败重试5次
+                
+                # === 订单簿审计（可选但推荐） ===
+                # own_books_audit_interval_secs=300.0,  # 每5分钟审计订单簿（可选，用于检测订单状态不一致）
             )
             
             # 创建TradingNode配置
@@ -169,6 +204,14 @@ class ETF159506LiveTradingSystem:
                 data_clients={"SZSE": data_client_config},
                 exec_clients={"SZSE": exec_client_config},
                 catalogs=[catalog_config],
+                
+                # === 超时配置（官方推荐） ===
+                timeout_connection=30.0,  # 连接超时（秒）
+                timeout_reconciliation=60.0,  # ✅ 对账超时（秒）- 对账可能需要较长时间
+                timeout_portfolio=10.0,  # 投资组合初始化超时（秒）
+                timeout_disconnection=10.0,  # 断开连接超时（秒）
+                timeout_post_stop=5.0,  # 停止后清理超时（秒）
+                
                 logging=LoggingConfig(
                     log_level="INFO",
                     log_file_name="etf_159506_live_trading.log",
