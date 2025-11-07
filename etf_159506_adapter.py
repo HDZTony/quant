@@ -57,6 +57,7 @@ from nautilus_trader.live.factories import LiveExecClientFactory
 from nautilus_trader.common.component import MessageBus, LiveClock
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import ClientOrderId
 import pyarrow as pa
 
 logger = logging.getLogger(__name__)
@@ -2370,11 +2371,13 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         
         self._set_connected(False)
         
-        # ✅ 改进3: 订单ID映射也使用deque限制
-        # 活跃映射字典（当前未完成的订单映射）
-        self._order_id_mapping = {}
-        # 历史映射队列（已完成订单的映射，限制10000条）
-        self._completed_order_id_mapping = deque(maxlen=10000)
+        # ✅ 改进3: 维护订单ID映射，确保对账时能还原client_order_id
+        # 活跃映射：Nautilus client_order_id -> 交易所 order_id
+        self._order_id_mapping: Dict[str, str] = {}
+        # 活跃映射：交易所 order_id -> Nautilus client_order_id
+        self._venue_order_id_mapping: Dict[str, str] = {}
+        # 历史映射队列（已完成/已撤销订单映射，限制10000条）
+        self._completed_order_id_mapping: deque[tuple[str, str]] = deque(maxlen=10000)
         
         # 订单清理相关
         self._order_cleanup_count = 0
@@ -2403,6 +2406,97 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         # 凭证持久化文件路径
         self._ticket_cache_file = Path("./data_catalog/.jvquant_ticket_cache.json")
     
+    # ========== 订单ID映射辅助方法 ==========
+
+    def _record_order_mapping(self, client_order_id: str | None, venue_order_id: str | None) -> None:
+        """记录订单ID映射，确保后续对账能还原客户端订单号。"""
+        if not client_order_id or not venue_order_id:
+            return
+
+        self._order_id_mapping[client_order_id] = venue_order_id
+        self._venue_order_id_mapping[venue_order_id] = client_order_id
+
+    def _archive_order_mapping(self, client_order_id: str | None, venue_order_id: str | None) -> None:
+        """将已完成/撤销的订单映射移入历史队列，防止持续增长。"""
+        removed = False
+        if client_order_id:
+            removed_value = self._order_id_mapping.pop(client_order_id, None)
+            removed = removed or removed_value is not None
+        if venue_order_id:
+            removed_value = self._venue_order_id_mapping.pop(venue_order_id, None)
+            removed = removed or removed_value is not None
+
+        if client_order_id and venue_order_id and removed:
+            self._completed_order_id_mapping.append((client_order_id, venue_order_id))
+
+    def _resolve_client_order_id(self, venue_order_id: str | None) -> Optional[ClientOrderId]:
+        """通过交易所订单号查找对应的ClientOrderId。"""
+        if not venue_order_id:
+            return None
+
+        client_order_id = self._venue_order_id_mapping.get(venue_order_id)
+        if client_order_id is None:
+            for archived_client_id, archived_venue_id in reversed(self._completed_order_id_mapping):
+                if archived_venue_id == venue_order_id:
+                    client_order_id = archived_client_id
+                    break
+
+        if not client_order_id:
+            return None
+
+        try:
+            return ClientOrderId(client_order_id)
+        except Exception as exc:  # pragma: no cover - 守护异常，防止映射污染影响流程
+            self.logger.warning(
+                "无法解析client_order_id，保持为None: venue_order_id=%s, reason=%s",
+                venue_order_id,
+                exc,
+            )
+            return None
+
+    def _restore_order_mappings_from_cache(self) -> None:
+        """从缓存中恢复订单ID映射，确保历史订单参与对账。"""
+        restored = 0
+        try:
+            cached_orders = self.cache.orders()
+        except Exception as exc:  # pragma: no cover - Cython 层异常
+            self.logger.warning("无法从缓存恢复订单映射: %s", exc)
+            return
+
+        for order in cached_orders:
+            client_order_id_obj = getattr(order, "client_order_id", None)
+            venue_order_id_obj = getattr(order, "venue_order_id", None)
+
+            if not client_order_id_obj or not venue_order_id_obj:
+                continue
+
+            client_order_id = str(client_order_id_obj)
+            venue_order_id = str(venue_order_id_obj)
+
+            if not client_order_id or not venue_order_id:
+                continue
+
+            # 当前映射中已有且一致则跳过
+            mapped = self._order_id_mapping.get(client_order_id)
+            if mapped == venue_order_id:
+                pass
+            else:
+                # 如果存在不一致的旧映射，先归档再写入
+                if mapped and mapped != venue_order_id:
+                    self._archive_order_mapping(client_order_id, mapped)
+
+                self._record_order_mapping(client_order_id, venue_order_id)
+                restored += 1
+
+            # 终态订单保留在归档映射中，避免占用活跃映射空间
+            if getattr(order, "is_closed", False):
+                self._archive_order_mapping(client_order_id, venue_order_id)
+
+        if restored:
+            self.logger.info("🔄 从缓存恢复 %d 个订单ID映射", restored)
+        else:
+            self.logger.info("🔄 缓存中没有需要恢复的订单ID映射")
+
     # ========== 凭证管理方法 ==========
     
     def _save_ticket_to_file(self) -> None:
@@ -3151,6 +3245,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 self._account_update_task = self.create_task(
                     self._periodic_account_update()
                 )
+
+                # ✅ 启动阶段恢复历史订单映射，确保对账能识别内部订单
+                self.logger.info("🔄 恢复历史订单ID映射...")
+                self._restore_order_mappings_from_cache()
             else:
                 logger.error("❌ 交易柜台登录失败，执行客户端无法使用")
                 logger.warning("提示: 请检查trade_account和trade_password配置是否正确")
@@ -3250,6 +3348,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     # 提取订单信息
                     code = order.get('code', '159506')
                     order_id = order.get('order_id')
+                    if not order_id:
+                        logger.warning("跳过缺少order_id的订单: %s", order)
+                        continue
                     status = order.get('status', '未知')
                     order_type = order.get('type', '')  # "证券买入" 或 "证券卖出"
                     
@@ -3279,12 +3380,20 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     # ✅ 构建 InstrumentId
                     instrument_id = InstrumentId(Symbol(code), Venue("SZSE"))
+
+                    venue_order_id = str(order_id) if order_id is not None else None
+                    client_order_id_obj = self._resolve_client_order_id(venue_order_id)
+                    if client_order_id_obj is None:
+                        logger.warning(
+                            "未找到client_order_id映射，订单将标记为外部订单: venue_order_id=%s",
+                            venue_order_id,
+                        )
                     
                     report = OrderStatusReport(
                         account_id=self.account_id,  # ✅ 使用执行客户端的 account_id 属性
                         instrument_id=instrument_id,
-                        client_order_id=None,  # 交易所订单没有client_order_id（外部订单）
-                        venue_order_id=VenueOrderId(order_id),
+                        client_order_id=client_order_id_obj,
+                        venue_order_id=VenueOrderId(venue_order_id),
                         order_side=nautilus_side,
                         order_type=OrderType.LIMIT,  # 假设都是限价单
                         time_in_force=TimeInForce.GTC,
@@ -3301,6 +3410,13 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     reports.append(report)
                     logger.info(f"    ✅ 生成报告: {order_id} | {nautilus_side} | {nautilus_status}")
+
+                    # ✅ 若订单处于终态，回收映射避免内存泄露
+                    if nautilus_status in {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}:
+                        client_order_id_str = (
+                            client_order_id_obj.value if client_order_id_obj else self._venue_order_id_mapping.get(venue_order_id)
+                        )
+                        self._archive_order_mapping(client_order_id_str, venue_order_id)
                     
                 except Exception as e:
                     logger.error(f"处理订单报告失败: {e}")
@@ -3367,8 +3483,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 
                 # 建立订单ID映射
                 nautilus_order_id = str(command.order.client_order_id)
-                self._order_id_mapping[nautilus_order_id] = jvquant_order_id
-                logger.info(f"订单ID映射: {nautilus_order_id} -> {jvquant_order_id}")
+                venue_order_id = str(jvquant_order_id)
+                self._record_order_mapping(nautilus_order_id, venue_order_id)
+                logger.info(f"订单ID映射: {nautilus_order_id} -> {venue_order_id}")
                 
                 # 发送综合邮件通知（订单 + 账户信息）
                 if self.email_notifier:
@@ -3464,8 +3581,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             if success:
                 logger.info(f"订单取消成功! jvquant订单ID: {jvquant_order_id}")
-                # 从映射中移除已取消的订单
-                self._order_id_mapping.pop(nautilus_order_id, None)
+                # 将映射移入历史记录
+                self._archive_order_mapping(nautilus_order_id, jvquant_order_id)
             else:
                 logger.error(f"订单取消失败! jvquant订单ID: {jvquant_order_id}")
             
@@ -3610,6 +3727,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     # 提取订单信息
                     code = order.get('code', '159506')
                     order_id = order.get('order_id')
+                    if not order_id:
+                        logger.warning("跳过缺少order_id的成交记录: %s", order)
+                        continue
                     order_type = order.get('type', '')  # "证券买入" 或 "证券卖出"
                     deal_volume = int(order.get('deal_volume', 0))
                     deal_price = float(order.get('deal_price', 0))
@@ -3640,12 +3760,20 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     # ✅ 构建 InstrumentId
                     instrument_id = InstrumentId(Symbol(code), Venue("SZSE"))
+
+                    venue_order_id = str(order_id) if order_id is not None else None
+                    client_order_id_obj = self._resolve_client_order_id(venue_order_id)
+                    if client_order_id_obj is None:
+                        logger.warning(
+                            "未找到client_order_id映射的成交，将标记为外部订单: venue_order_id=%s",
+                            venue_order_id,
+                        )
                     
                     # ✅ 创建成交报告
                     report = FillReport(
                         account_id=self.account_id,  # ✅ 使用执行客户端的 account_id 属性
                         instrument_id=instrument_id,
-                        venue_order_id=VenueOrderId(order_id),
+                        venue_order_id=VenueOrderId(venue_order_id),
                         trade_id=TradeId(order_id),  # JVQuant 没有单独的成交ID，使用订单ID
                         order_side=order_side,
                         last_qty=Quantity.from_int(deal_volume),
@@ -3655,10 +3783,17 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         ts_event=self._clock.timestamp_ns(),
                         report_id=UUID4(),
                         ts_init=self._clock.timestamp_ns(),  # ✅ 必需：初始化时间戳
+                        client_order_id=client_order_id_obj,
                     )
                     
                     fill_reports.append(report)
                     logger.info(f"    ✅ 生成成交报告: {order_id} | {order_side} | {deal_volume}@{deal_price}")
+                    
+                    # ✅ 成交后该订单可能进入终态，归档映射
+                    client_order_id_str = (
+                        client_order_id_obj.value if client_order_id_obj else self._venue_order_id_mapping.get(venue_order_id)
+                    )
+                    self._archive_order_mapping(client_order_id_str, venue_order_id)
                     
                 except Exception as e:
                     logger.error(f"处理成交报告失败: {e}")

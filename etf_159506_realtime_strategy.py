@@ -377,19 +377,19 @@ class ETF159506Strategy(Strategy):
         self.check_macd_signals(bar)
         self.check_macd_top_signals(bar)
         self.check_macd_bottom_signals(bar)
-        
+
         # 🆕 检测死叉后MACD柱连续缩小（买入信号）
         self.check_histogram_shrink_for_rebuy()
-        
+
         # 保存当前信号值
         current_technical_signal = self.technical_signal
-        
+
         # ========== 输出本分钟 technical_signal 的详细计算过程 ==========
         data_type = "历史数据" if is_historical else ""
         self._log.info("=" * 80)
         self._log.info(f"【{data_type} {beijing_time_str}】technical_signal 计算过程{'汇总' if not is_historical else ''}")
         self._log.info("=" * 80)
-        
+
         # 显示计算步骤
         if self.technical_signal_steps:
             self._log.info("计算步骤明细:")
@@ -400,11 +400,11 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"         变化值: {step['delta']:+.2f}, 累积值: {cumulative_value:.2f}")
         else:
             self._log.info("本分钟无信号计算步骤")
-        
+
         self._log.info("-" * 80)
         self._log.info(f"最终信号值: {current_technical_signal:.2f}")
         self._log.info(f"买入阈值: {self.buy_threshold}, 卖出阈值: {self.sell_threshold}")
-        
+
         # 显示当前MACD相关指标（仅实时数据）
         if not is_historical:
             if len(self.dif_history) > 0 and len(self.signal_history) > 0:
@@ -412,14 +412,14 @@ class ETF159506Strategy(Strategy):
                 current_signal = self.signal_history[-1]
                 current_histogram = current_macd - current_signal
                 self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
-            
+
             # 显示RSI
             if self.rsi.initialized:
                 rsi_value = self.rsi.value * 100
                 self._log.info(f"RSI指标: {rsi_value:.2f}")
             else:
                 self._log.info("RSI指标: 未初始化")
-            
+
             # 显示KDJ
             if self.kdj.initialized:
                 kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
@@ -427,13 +427,13 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"KDJ指标: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}, 最大差值={kdj_max_diff:.2f}")
             else:
                 self._log.info("KDJ指标: 未初始化")
-            
+
             # 显示极值点信息
             if hasattr(self, 'latest_extreme_type') and self.latest_extreme_type:
                 self._log.info(f"最近极值点类型: {self.latest_extreme_type}")
                 if self.time_diff_minutes_from_latest_extreme is not None:
                     self._log.info(f"距离最近极值点: {self.time_diff_minutes_from_latest_extreme:.2f}分钟")
-            
+
             # 显示本分钟触发的信号类型
             if current_technical_signal > 0:
                 self._log.info("信号方向: 【买入】")
@@ -441,10 +441,10 @@ class ETF159506Strategy(Strategy):
                 self._log.info("信号方向: 【卖出】")
             else:
                 self._log.info("信号方向: 【无信号】")
-        
+
         self._log.info("=" * 80)
         # ========== 计算过程汇总结束 ==========
-        
+
         return current_technical_signal
     
     def on_historical_data(self, data):
@@ -1386,7 +1386,11 @@ class ETF159506Strategy(Strategy):
             if is_first_death_cross:
                 self.first_death_cross_triggered = True
                 self._log.info("✅ 第一个死叉信号已触发（待在on_bar中确认卖出）")
-            
+            else:
+                if self.monitor_histogram_shrink:
+                    self.monitor_histogram_shrink = False
+                    self._log.info("检测到非首个死叉，关闭MACD柱缩小监控，避免重复买入")
+                self.first_death_cross_triggered = False
             macd_contribution = -signal_coefficient*current_macd_abs
             self.technical_signal += macd_contribution
             self.technical_signal_steps.append({
@@ -2190,6 +2194,9 @@ class ETF159506Strategy(Strategy):
         -----------
         
         """
+        if not self.first_death_cross_triggered:
+            return
+
         if not self.monitor_histogram_shrink:
             return  # 未激活监控，直接返回
         
@@ -2604,12 +2611,28 @@ class ETF159506Strategy(Strategy):
             mapped_df.index = mapped_times
             mapped_df = mapped_df.sort_index()
             
+            # 固定X轴范围为完整交易日，确保时间轴覆盖全天
+            if len(mapped_df) > 0:
+                base_date = mapped_df.index[0].date()
+                tz_info = mapped_df.index[0].tzinfo
+            else:
+                base_date = data_date
+                import pytz
+                tz_info = pytz.timezone('Asia/Shanghai')
+
+            x_min = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day,
+                                 hour=9, minute=30, second=0, tz=tz_info)
+            x_max = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day,
+                                 hour=13, minute=30, second=0, tz=tz_info)
+
             self._log.info(f"映射后数据时间范围: {mapped_df.index.min()} 到 {mapped_df.index.max()}")
-            self._log.info(f"映射后数据条数: {len(mapped_df)}")
             
             # 创建图表
             fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 12), height_ratios=[3, 1, 2])
             fig.suptitle(chart_title, fontsize=16, fontweight='bold')
+
+            for axis in (ax1, ax2, ax3):
+                axis.set_xlim(x_min, x_max)
             
             # ====== ax1主图（价格走势 + 极值点） ======
             # 绘制价格走势（使用更清晰的线条，设置较高的zorder确保在极值点之上）
@@ -2683,12 +2706,14 @@ class ETF159506Strategy(Strategy):
             # 设置主图属性
             ax1.set_title('价格走势与极值点', fontsize=14)
             ax1.set_ylabel('价格', fontsize=12)
-            ax1.grid(True, alpha=0.3)
+            ax1.grid(True, alpha=0.3, which='major')
+            ax1.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
             ax1.legend(loc='upper left')
-            
+
             # 设置x轴格式
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax1.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
             # ====== ax2成交量（按分钟聚合） ======
@@ -2735,12 +2760,14 @@ class ETF159506Strategy(Strategy):
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
                 self._log.warning("无法计算分钟成交量数据")
-            
+
             ax2.set_title('成交量', fontsize=12)
             ax2.set_ylabel('成交量', fontsize=10)
-            ax2.grid(True, alpha=0.3)
+            ax2.grid(True, alpha=0.3, which='major')
+            ax2.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
             ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax2.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
             # ====== ax3 MACD副图 ======
@@ -2824,11 +2851,10 @@ class ETF159506Strategy(Strategy):
             
             ax3.set_title('MACD指标与DIF极值点', fontsize=12)
             ax3.set_ylabel('MACD', fontsize=10)
-            ax3.set_xlabel('时间 (北京时间)', fontsize=12)
-            ax3.grid(True, alpha=0.3)
-            ax3.legend(loc='upper left')
+            ax3.set_xlabel('时间 (北京时间)', fontsize=13)
             ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax3.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
             
             # 调整布局
@@ -2965,13 +2991,22 @@ class ETF159506Strategy(Strategy):
             mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
             mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
             
-            # 设置x轴范围
-            x_min = new_index.min()
-            x_max = new_index.max()
-            
-            # 为每个子图设置相同的x轴范围
-            for ax in [ax1, ax2, ax3]:
-                ax.set_xlim(x_min, x_max)
+            # 固定X轴范围为完整交易日，并确保时区匹配
+            if len(mapped_df) > 0:
+                base_date = mapped_df.index[0].date()
+                tz_info = mapped_df.index[0].tzinfo
+            else:
+                base_date = data_date
+                import pytz
+                tz_info = pytz.timezone('Asia/Shanghai')
+
+            x_min = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day,
+                                 hour=9, minute=30, second=0, tz=tz_info)
+            x_max = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day,
+                                 hour=13, minute=30, second=0, tz=tz_info)
+
+            for axis in (ax1, ax2, ax3):
+                axis.set_xlim(x_min, x_max)
 
             # ====== ax1主图（价格走势 + 买卖点） ======
             # 绘制价格走势（使用较细的线条）
@@ -3012,8 +3047,9 @@ class ETF159506Strategy(Strategy):
             
             ax1.set_title(chart_title, fontsize=16, fontweight='bold')
             ax1.set_ylabel('价格', fontsize=12)
-            ax1.grid(True, alpha=0.3)
-            
+            ax1.grid(True, alpha=0.3, which='major')
+            ax1.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
+
             # 添加买卖点标记
             if trade_signals and len(trade_signals) > 0:
                 buy_signals = []
@@ -3241,14 +3277,15 @@ class ETF159506Strategy(Strategy):
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
                 self._log.warning("无法计算分钟成交量数据")
-                ax2.set_title('成交量', fontsize=12)
-                ax2.set_ylabel('成交量', fontsize=10)
-                ax2.grid(True, alpha=0.3)
-                
-                # 设置x轴格式
-                ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-                ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
-                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
+
+            ax2.set_title('成交量', fontsize=12)
+            ax2.set_ylabel('成交量', fontsize=10)
+            ax2.grid(True, alpha=0.3, which='major')
+            ax2.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
+            ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax2.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
+            plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
             # ====== ax3 MACD指标 ======
             # 生成1分钟K线收盘价序列，用于技术指标
@@ -3262,19 +3299,22 @@ class ETF159506Strategy(Strategy):
                 dea = dif.ewm(span=9, adjust=False).mean()  # DEA
                 macd_hist = 2 * (dif - dea) # MACD柱子
                 macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
-                
+
                 ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
                 ax3.plot(minute_index, dif, color='orange', linewidth=1.5, label='DIF线')
                 ax3.plot(minute_index, dea, color='deepskyblue', linewidth=1.5, label='DEA线')
+
                 ax3.set_title('MACD指标 (12,26,9)', fontsize=12)
                 ax3.set_ylabel('MACD', fontsize=10)
                 ax3.set_xlabel('时间 (北京时间)', fontsize=13)
                 ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
                 ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+                ax3.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
                 plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
                 ax3.legend(loc='upper right')
-                ax3.grid(True, alpha=0.3)
-            
+                ax3.grid(True, alpha=0.3, which='major')
+                ax3.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
+
             # 调整布局
             plt.tight_layout()
             
@@ -3521,6 +3561,7 @@ class ETF159506Strategy(Strategy):
             # 设置x轴格式 - 显示北京时间
             ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax1.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
+            ax1.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
             
             # 设置y轴格式 - 价格三位小数
@@ -3830,63 +3871,53 @@ class ETF159506Strategy(Strategy):
                 # 创建时间映射，与主图保持一致
                 minute_volume_filtered = minute_volume_stats[minute_volume_stats['minute_time'].dt.time < datetime_time(11, 30)]
                 minute_volume_afternoon = minute_volume_stats[minute_volume_stats['minute_time'].dt.time > datetime_time(13, 0)]
-                
-                # 合并上午和下午数据
                 minute_volume_trading = pd.concat([minute_volume_filtered, minute_volume_afternoon])
-                
+
                 if len(minute_volume_trading) > 0:
-                    # 应用时间映射
                     minute_volume_mapped = minute_volume_trading.copy()
                     minute_volume_mapped['mapped_time'] = minute_volume_mapped['minute_time'].apply(
                         lambda x: x if x.time() < datetime_time(11, 30) else x - timedelta(hours=1, minutes=30)
                     )
-                    
-                    # 计算涨跌颜色（基于开盘价和收盘价）
+
                     colors = np.where(
-                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'], 
-                        'red', 
+                        minute_volume_mapped['收盘价'] > minute_volume_mapped['开盘价'],
+                        'red',
                         np.where(minute_volume_mapped['收盘价'] < minute_volume_mapped['开盘价'], 'green', 'gray')
                     )
-                    
-                    # 计算一分钟在时间轴上的宽度
+
                     if len(minute_volume_mapped) > 1:
-                        # 计算相邻时间点的平均间隔
                         time_diffs = minute_volume_mapped['mapped_time'].diff().dropna()
                         avg_time_diff = time_diffs.mean()
-                        bar_width = avg_time_diff.total_seconds() / 86400  # 转换为天为单位
+                        bar_width = avg_time_diff.total_seconds() / 86400
                     else:
-                        bar_width = 1/1440  # 默认一分钟的宽度（1/1440天）
-                    
-                    # 绘制每分钟成交量柱状图
-                    ax2.bar(minute_volume_mapped['mapped_time'], minute_volume_mapped['总成交量'], 
-                           alpha=0.7, color=colors, width=bar_width, label='每分钟成交量')
-                    
-                    # self._log.info(f"绘制了 {len(minute_volume_mapped)} 分钟的成交量数据")
+                        bar_width = 1 / 1440
+
+                    ax2.bar(
+                        minute_volume_mapped['mapped_time'],
+                        minute_volume_mapped['总成交量'],
+                        alpha=0.7,
+                        color=colors,
+                        width=bar_width,
+                        label='每分钟成交量'
+                    )
                 else:
                     self._log.warning("没有交易时间内的分钟成交量数据")
             else:
                 self._log.warning("无法计算分钟成交量数据")
-            
-            if target_date:
-                ax2.set_title(f'每分钟成交量 {target_date} (北京时间)')
-            else:
-                ax2.set_title(f'每分钟成交量 {data_date} (北京时间)')
-            ax2.set_ylabel('成交量')
-            ax2.set_xlabel('时间 (北京时间)', fontsize=13)
-            ax2.annotate('每个柱子代表一分钟的总成交量', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
-            ax2.grid(True, alpha=0.3)
-            
-            # 设置x轴格式 - 显示北京时间
+
+            ax2.set_title('成交量', fontsize=12)
+            ax2.set_ylabel('成交量', fontsize=10)
+            ax2.grid(True, alpha=0.3, which='major')
+            ax2.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
             ax2.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))  # 每10分钟一个刻度
+            ax2.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax2.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
-            
-            # ====== 生成1分钟K线收盘价序列，用于技术指标 ======
-            # 使用映射后的数据重新采样，上午和下午数据直接连接
+
+            # ====== ax3 MACD副图（用1分钟K线收盘价） ======
             minute_close = mapped_df['price'].resample('1min').last().dropna()
             minute_index = minute_close.index
 
-            # ====== ax3 MACD副图（用1分钟K线收盘价） ======
             ema12 = minute_close.ewm(span=12, adjust=False).mean()
             ema26 = minute_close.ewm(span=26, adjust=False).mean()
             dif = ema12 - ema26  # DIF
@@ -3905,9 +3936,11 @@ class ETF159506Strategy(Strategy):
             ax3.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax3.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
             ax3.legend(loc='upper right')
-            ax3.grid(True, alpha=0.3)
+            ax3.grid(True, alpha=0.3, which='major')
+            ax3.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
 
             # ====== 计算RSI(6), RSI(12), RSI(24)（用1分钟K线收盘价） ======
             def calc_rsi(series, period):
@@ -3973,10 +4006,12 @@ class ETF159506Strategy(Strategy):
             ax4.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax4.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax4.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax4.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
             ax4.set_ylim(0, 100)
             ax4.legend(loc='upper right')
-            ax4.grid(True, alpha=0.3)
+            ax4.grid(True, alpha=0.3, which='major')
+            ax4.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
 
             # ====== 计算KDJ(9,3,3)（用1分钟K线收盘价） ======
             def calc_kdj(close, n=9, k_period=3, d_period=3):
@@ -4012,9 +4047,11 @@ class ETF159506Strategy(Strategy):
             ax5.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax5.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax5.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
+            ax5.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax5.xaxis.get_majorticklabels(), rotation=45)
             ax5.legend(loc='upper right')
-            ax5.grid(True, alpha=0.3)
+            ax5.grid(True, alpha=0.3, which='major')
+            ax5.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
 
             # ====== ax6 技术信号累积值副图 ======
             if self.technical_signal_history and len(self.technical_signal_history) > 0:
