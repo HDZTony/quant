@@ -175,14 +175,14 @@ class ETF159506LiveTradingSystem:
                 
                 # === 连续对账配置 ===
                 # 订单检查
-                open_check_interval_secs=5.0,  # ✅ 每5秒检查交易所未成交订单
+                open_check_interval_secs=30.0,  # ✅ 每30秒检查交易所未成交订单（适配器内部节流）
                 open_check_open_only=False,  # False: 检查所有订单历史（不仅限于未成交）
                 open_check_lookback_mins=60,  # 检查最近60分钟的订单
                 open_check_threshold_ms=5000,  # 订单最后更新超过5秒才检查（防止竞争条件）
                 open_check_missing_retries=5,  # ✅ 订单丢失时的重试次数（防止快速解决导致的竞争条件）
                 
                 # 持仓检查
-                position_check_interval_secs=30.0,  # ✅ 每30秒检查持仓差异
+                position_check_interval_secs=30.0,  # ✅ 每30秒检查持仓差异（仅在标记时触发）
                 position_check_lookback_mins=60,  # 持仓差异时查询最近60分钟的成交
                 position_check_threshold_ms=5000,  # 持仓最后活动超过5秒才检查（防止竞争条件）
                 

@@ -316,7 +316,8 @@ class ETF159506Strategy(Strategy):
     
     def on_stop(self):
         """策略停止时调用"""
-        
+        self.update_realtime_charts_async(self.last_bar)
+
         # 取消订阅实时数据和事件
         self.unsubscribe_bars(self.config.bar_type)
         
@@ -408,10 +409,10 @@ class ETF159506Strategy(Strategy):
         # 显示当前MACD相关指标（仅实时数据）
         if not is_historical:
             if len(self.dif_history) > 0 and len(self.signal_history) > 0:
-                current_macd = self.dif_history[-1]
+                current_dif = self.dif_history[-1]
                 current_signal = self.signal_history[-1]
-                current_histogram = current_macd - current_signal
-                self._log.info(f"MACD指标: DIF={current_macd:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
+                current_histogram = (current_dif - current_signal) * 2
+                self._log.info(f"MACD指标: DIF={current_dif:.6f}, DEA={current_signal:.6f}, 柱状图={current_histogram:.6f}")
 
             # 显示RSI
             if self.rsi.initialized:
@@ -457,7 +458,7 @@ class ETF159506Strategy(Strategy):
             
             # 清空本分钟的计算步骤记录
             self.technical_signal_steps = []
-            
+            self.last_bar = data
             self._process_bar(data)
             
             # 转换为北京时间用于日志
@@ -475,7 +476,7 @@ class ETF159506Strategy(Strategy):
                 
                 # 历史数据处理：信号归零但不执行交易
                 self.technical_signal = 0
-    
+
     def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""
         
@@ -649,6 +650,7 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"Current bar:  {bar}")
         self._log.info(f"Last bar:  {last_bar}")
         self._log.info(f"Previous bar: {previous_bar}")
+        self.last_bar = last_bar
         # 添加调试信息
         # 转换为北京时间格式
         utc_time = pd.to_datetime(last_bar.ts_event, unit='ns')
@@ -682,8 +684,8 @@ class ETF159506Strategy(Strategy):
         self.technical_signal_history.append(signal_record)
         self._log.info(f"记录技术信号历史: 时间={beijing_time_str}, 信号值={current_technical_signal:.2f}")
         
-        # ✅ 使用异步方式更新图表，不阻塞订单提交
-        self.update_realtime_charts_async(last_bar, current_technical_signal)
+        # ✅ 使用异步方式更新图表，不阻塞订单提交（从technical_signal_history读取信号值）
+        self.update_realtime_charts_async(last_bar)
         self.technical_signal = 0
     def on_event(self, event: Event):
         """处理所有事件"""
@@ -712,7 +714,7 @@ class ETF159506Strategy(Strategy):
         # 只有在信号线初始化后才记录完整MACD指标（DEA和柱状图）
         if self.macd_signal.initialized:
             dea = self.macd_signal.value
-            histogram = dif - dea
+            histogram = (dif - dea) * 2
             
             # 添加到历史数据队列（用于回溯分析）
             self.signal_history.append(dea)
@@ -731,7 +733,7 @@ class ETF159506Strategy(Strategy):
                 dif_series = pd.Series(list(self.dif_history))
                 span = min(9, len(dif_series))
                 temp_dea = dif_series.ewm(span=span, adjust=False).mean().iloc[-1]
-                temp_histogram = dif - temp_dea
+                temp_histogram = (dif - temp_dea) * 2
                 
                 # 添加临时数据（供金叉死叉检测使用）
                 self.signal_history.append(temp_dea)
@@ -762,7 +764,7 @@ class ETF159506Strategy(Strategy):
             return {
                 'macd': dif,  # DIF
                 'signal': dea,  # DEA
-                'histogram': dif - dea  # MACD柱
+                'histogram': (dif - dea) * 2  # MACD柱
             }
         
         # 如果MACD指标未初始化，使用图表方法计算
@@ -797,7 +799,7 @@ class ETF159506Strategy(Strategy):
             dea = dif
         
         # 计算MACD柱
-        histogram = 2 * (dif - dea)
+        histogram = (dif - dea) * 2
         
         # 记录图表MACD计算
         self._log.info(f"图表MACD计算: 价格={current_price:.4f}, DIF={dif:.6f}, DEA={dea:.6f}, MACD柱={histogram:.6f}")
@@ -1152,10 +1154,10 @@ class ETF159506Strategy(Strategy):
                  # 检查RSI条件
                 if self.rsi.initialized:
                     rsi_value = self.rsi.value * 100
-                    rsi_contribution = 80 - rsi_value
+                    rsi_contribution = 60 - rsi_value
                     self.technical_signal += rsi_contribution
                     self.technical_signal_steps.append({
-                        'description': f'底部信号RSI调整(RSI={rsi_value:.2f}, 贡献=80-RSI)',
+                        'description': f'底部信号RSI调整(RSI={rsi_value:.2f}, 贡献=60-RSI)',
                         'delta': rsi_contribution
                     })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
@@ -1169,11 +1171,10 @@ class ETF159506Strategy(Strategy):
                 
                 self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
                 
-                # 如果KDJ三个值最大差值小于10且都小于20，增强信号
-                kdj_contribution = 60-self.kdj.value_k
+                kdj_contribution = 60-self.kdj.value_k - kdj_max_diff
                 self.technical_signal += kdj_contribution
                 self.technical_signal_steps.append({
-                    'description': f'底部信号KDJ调整(K={self.kdj.value_k:.2f}, 贡献=60-K)',
+                    'description': f'底部信号KDJ调整(K={self.kdj.value_k:.2f}, 贡献=60-K-差值)',
                     'delta': kdj_contribution
                 })
                 
@@ -2091,53 +2092,56 @@ class ETF159506Strategy(Strategy):
                     f"成本价={pos.avg_px_open}, 策略ID={pos.strategy_id}"
                 )
         
-        # 获取第一个持仓（通常只有一个）
-        position = positions[0]
+        any_submitted = False
         
-        # 验证持仓方向（只处理多头持仓的卖出）
-        if position.side != PositionSide.LONG:
-            self._log.warning(f"持仓方向不是LONG而是{position.side}，跳过卖出")
+        for position in positions:
+            if position.side != PositionSide.LONG:
+                self._log.info(f"跳过非多头持仓: {position.id} side={position.side}")
+                continue
+            
+            quantity = position.quantity
+            if quantity.as_double() <= 0:
+                self._log.info(f"跳过数量<=0的持仓: {position.id}")
+                continue
+            
+            self._log.info(
+                f"准备卖出: 持仓ID={position.id}, 数量={quantity}, "
+                f"价格={bar.close.as_double():.4f}"
+            )
+            
+            sell_price = self.instrument.make_price(bar.close.as_double() - 0.001)
+            order = self.order_factory.limit(
+                instrument_id=self.config.instrument_id,
+                order_side=OrderSide.SELL,
+                quantity=quantity,
+                price=sell_price,
+                reduce_only=True,
+                tags=["EXIT", signal_type]
+            )
+            
+            self.submit_order(order, position_id=position.id)
+            
+            trade_signal = {
+                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                'price': sell_price.as_double(),
+                'side': 'SELL',
+                'quantity': quantity.as_double(),
+                'order_id': str(order.client_order_id),
+                'signal_type': signal_type,
+                'signal_value': signal_value
+            }
+            self.trade_signals.append(trade_signal)
+            
+            self._log.info(
+                f"执行SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, "
+                f"订单ID={order.client_order_id}, 类型={signal_type}"
+            )
+            any_submitted = True
+        
+        if not any_submitted:
+            self._log.info("未提交任何卖单（没有多头持仓或数量为0）")
             return False
         
-        # 获取持仓数量
-        quantity = position.quantity
-        
-        self._log.info(
-            f"准备卖出: 持仓ID={position.id}, 数量={quantity}, "
-            f"价格={bar.close.as_double():.4f}"
-        )
-        
-        # ✅ 使用限价单（JVQuant 不支持市价单）
-        # 卖出价格 -0.001 提高成交概率
-        sell_price = self.instrument.make_price(bar.close.as_double() - 0.001)
-        order = self.order_factory.limit(
-            instrument_id=self.config.instrument_id,
-            order_side=OrderSide.SELL,  # 显式指定SELL方向
-            quantity=quantity,
-            price=sell_price,
-            reduce_only=True,  # 只减仓，不开新仓
-            tags=["EXIT", signal_type]
-        )
-        
-        # 提交订单
-        self.submit_order(order, position_id=position.id)
-        
-        # 记录实际交易信号
-        trade_signal = {
-            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-            'price': sell_price.as_double(),
-            'side': 'SELL',
-            'quantity': quantity.as_double(),
-            'order_id': str(order.client_order_id),
-            'signal_type': signal_type,
-            'signal_value': signal_value
-        }
-        self.trade_signals.append(trade_signal)
-        
-        self._log.info(
-            f"执行SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, "
-            f"订单ID={order.client_order_id}, 类型={signal_type}"
-        )
         return True
     
     def execute_sell_signal(self, bar: Bar, signal_type: str = 'executed_sell'):
@@ -2365,10 +2369,10 @@ class ETF159506Strategy(Strategy):
         current_time_only = current_time_beijing.time()
         
         # 添加调试信息
-        self._log.info(f"定时买入检查: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
+        # self._log.info(f"定时买入检查: UTC时间={current_time_utc.strftime('%Y-%m-%d %H:%M:%S')}, 北京时间={current_time_beijing.strftime('%Y-%m-%d %H:%M:%S')}")
         # 转换为北京时间格式显示
         beijing_time_str = current_time_beijing.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-        self._log.info(f"目标买入时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}, 当前北京时间: {beijing_time_str}")
+        # self._log.info(f"目标买入时间: {self.scheduled_buy_time.strftime('%H:%M:%S')}, 当前北京时间: {beijing_time_str}")
         
         # 检查是否已经在该日期执行过定时买入
         if self.last_scheduled_buy_date == current_date:
@@ -2404,8 +2408,8 @@ class ETF159506Strategy(Strategy):
         # 检查是否在2:50分之后
         return current_time_only >= self.scheduled_buy_time
     
-    def update_realtime_charts_async(self, bar: Bar, technical_signal: float = 0):
-        """异步更新实时图表（不阻塞订单提交）"""
+    def update_realtime_charts_async(self, bar: Bar):
+        """异步更新实时图表（不阻塞订单提交，从technical_signal_history读取信号值）"""
         # 如果上一个图表更新线程还在运行，跳过本次更新
         if self._chart_update_thread and self._chart_update_thread.is_alive():
             self._log.warning("上一次图表更新还未完成，跳过本次更新")
@@ -2414,27 +2418,36 @@ class ETF159506Strategy(Strategy):
         # 创建新线程进行图表更新
         self._chart_update_thread = threading.Thread(
             target=self._update_realtime_charts_internal,
-            args=(bar, technical_signal),
+            args=(bar,),
             daemon=True  # 守护线程，主程序退出时自动结束
         )
         self._chart_update_thread.start()
         self._log.info("✅ 已启动异步图表更新线程（不阻塞订单提交）")
     
-    def _update_realtime_charts_internal(self, bar: Bar, technical_signal: float = 0):
+    def _update_realtime_charts_internal(self, bar: Bar):
         """内部图表更新方法（在独立线程中运行）"""
         try:
             with self._chart_update_lock:  # 使用锁保护共享数据
-                self.update_realtime_charts(bar, technical_signal)
+                self.update_realtime_charts(bar)
         except Exception as e:
             self._log.error(f"异步图表更新失败: {e}")
             import traceback
             self._log.error(f"错误详情: {traceback.format_exc()}")
     
-    def update_realtime_charts(self, bar: Bar, technical_signal: float = 0):
-        """每分钟更新实时图表（同步方法，由异步包装调用）"""
+    def update_realtime_charts(self, bar: Bar):
+        """每分钟更新实时图表（同步方法，由异步包装调用，从technical_signal_history读取信号值）"""
         try:
             # 抑制字体警告（显式静默已知的无害警告）
             warnings.filterwarnings('ignore', category=UserWarning, message='.*Glyph.*missing from font.*')
+            
+            # 从technical_signal_history读取最新的技术信号值
+            technical_signal = 0.0
+            if self.technical_signal_history and len(self.technical_signal_history) > 0:
+                # 获取最后一个记录的信号值
+                technical_signal = self.technical_signal_history[-1].get('signal_value', 0.0)
+                self._log.info(f"从technical_signal_history读取最新信号值: {technical_signal:.2f}")
+            else:
+                self._log.warning("technical_signal_history为空，使用默认信号值0")
             
             # 获取当前时间（北京时间）
             current_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
@@ -2544,8 +2557,8 @@ class ETF159506Strategy(Strategy):
             start_time = df['timestamp'].min()
             end_time = df['timestamp'].max()
             data_date = start_time.date()
-            self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
-            self._log.info(f"数据条数: {len(df)}")
+            # self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
+            # self._log.info(f"数据条数: {len(df)}")
             
             # 确定图表标题
             if target_date:
@@ -2770,25 +2783,21 @@ class ETF159506Strategy(Strategy):
             ax2.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45)
             
-            # ====== ax3 MACD副图 ======
-            # 生成1分钟K线收盘价序列，用于技术指标
+            # ====== ax3 MACD副图（用1分钟K线收盘价） ======
             minute_close = mapped_df['price'].resample('1min').last().dropna()
             minute_index = minute_close.index
 
-            # 计算MACD
             ema12 = minute_close.ewm(span=12, adjust=False).mean()
             ema26 = minute_close.ewm(span=26, adjust=False).mean()
             dif = ema12 - ema26  # DIF
             dea = dif.ewm(span=9, adjust=False).mean()  # DEA
             macd_hist = 2 * (dif - dea) # MACD柱子
-            
-            # 绘制MACD
             macd_colors = np.where(macd_hist > 0, 'red', np.where(macd_hist < 0, 'green', 'gray'))
             ax3.bar(minute_index, macd_hist, color=macd_colors, width=0.0005, alpha=0.7, label='MACD柱')
-            ax3.plot(minute_index, dif, color='orange', label='DIF线')
-            ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线')
+            ax3.plot(minute_index, dif, color='orange', label='DIF线')      # DIF橙色
+            ax3.plot(minute_index, dea, color='deepskyblue', label='DEA线') # DEA天蓝色
             
-            # 添加DIF极值点
+            # 添加DIF极值点（极值图特有）
             if extremes_data and len(extremes_data) > 0:
                 # 处理MACD极值点
                 if 'macd_extremes_history' in extremes_data and extremes_data['macd_extremes_history']:
@@ -2849,13 +2858,20 @@ class ETF159506Strategy(Strategy):
                 else:
                     self._log.info("没有MACD极值点数据")
             
-            ax3.set_title('MACD指标与DIF极值点', fontsize=12)
-            ax3.set_ylabel('MACD', fontsize=10)
+            if target_date:
+                ax3.set_title(f'MACD指标 {target_date} (12,26,9)')
+            else:
+                ax3.set_title(f'MACD指标 {data_date} (12,26,9)')
+            ax3.set_ylabel('MACD')
             ax3.set_xlabel('时间 (北京时间)', fontsize=13)
+            ax3.annotate('所有横轴时间均为北京时间', xy=(1, 0), xycoords='axes fraction', fontsize=11, color='gray', ha='right', va='top')
             ax3.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
             ax3.xaxis.set_major_locator(plt.matplotlib.dates.MinuteLocator(interval=10))
             ax3.xaxis.set_minor_locator(plt.matplotlib.dates.MinuteLocator(interval=1))
             plt.setp(ax3.xaxis.get_majorticklabels(), rotation=45)
+            ax3.legend(loc='upper right')
+            ax3.grid(True, alpha=0.3, which='major')
+            ax3.grid(True, alpha=0.1, which='minor', linestyle=':', linewidth=0.5)
             
             # 调整布局
             plt.tight_layout()
@@ -2908,8 +2924,8 @@ class ETF159506Strategy(Strategy):
             start_time = df['timestamp'].min()
             end_time = df['timestamp'].max()
             data_date = start_time.date()
-            self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
-            self._log.info(f"数据条数: {len(df)}")
+            # self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
+            # self._log.info(f"数据条数: {len(df)}")
             
             # 确定图表标题
             if target_date:
@@ -3365,8 +3381,8 @@ class ETF159506Strategy(Strategy):
             start_time = df['timestamp'].min()
             end_time = df['timestamp'].max()
             data_date = start_time.date()
-            self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
-            self._log.info(f"数据条数: {len(df)}")
+            # self._log.info(f"数据时间范围: {start_time} 到 {end_time}")
+            # self._log.info(f"数据条数: {len(df)}")
             
             # 确定图表标题
             if target_date:

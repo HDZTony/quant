@@ -2382,6 +2382,13 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         # 订单清理相关
         self._order_cleanup_count = 0
         self._order_cleanup_threshold = 100  # 每100个订单检查一次清理
+        self._order_log_interval_secs = 30 * 60  # 委托日志输出间隔（秒）
+        self._last_orders_log_ts = 0.0
+        self._pending_reconciliation = False  # 控制订单/成交对账调用频率
+        self._pending_position_sync = False  # 控制持仓对账调用频率
+        self._cached_exchange_orders: list[Dict] | None = None
+        self._cached_exchange_orders_ts = 0.0
+        self._reconciliation_cache_ttl = 1.0  # 秒
         
         # 股票代码到名称的映射（可从配置读取）
         default_names = {
@@ -2494,8 +2501,34 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
 
         if restored:
             self.logger.info("🔄 从缓存恢复 %d 个订单ID映射", restored)
+            self._mark_reconciliation_required()
         else:
             self.logger.info("🔄 缓存中没有需要恢复的订单ID映射")
+
+    def _mark_reconciliation_required(self) -> None:
+        """标记需要进行一次对账查询。"""
+        self._pending_reconciliation = True
+        self._pending_position_sync = True
+
+    def _should_query_exchange(self) -> bool:
+        """判断是否需要访问交易所获取最新委托。"""
+        return self._pending_reconciliation
+
+    async def _get_exchange_orders(self, *, use_cache: bool = True) -> list[Dict]:
+        """读取交易所委托，带有简单缓存以复用同一次查询结果。"""
+        now = time.time()
+        if (
+            use_cache
+            and self._cached_exchange_orders is not None
+            and now - self._cached_exchange_orders_ts <= self._reconciliation_cache_ttl
+        ):
+            return self._cached_exchange_orders
+
+        orders = await self._check_orders() or []
+        if use_cache:
+            self._cached_exchange_orders = orders
+            self._cached_exchange_orders_ts = now
+        return orders
 
     # ========== 凭证管理方法 ==========
     
@@ -2902,13 +2935,13 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 'ticket': self.ticket,      # 交易凭证
             }
             
-            logger.info("查询委托列表...")
+            # logger.info("查询委托列表...")
             response = requests.get(url, params=params, timeout=10)
             data = response.json()
             
             if data.get("code") == "0":
                 order_list = data.get('list', [])
-                logger.info(f"查询到 {len(order_list)} 条委托记录")
+                # logger.info(f"查询到 {len(order_list)} 条委托记录")
                 
                 # 更新本地订单缓存
                 for order_info in order_list:
@@ -3033,42 +3066,37 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             if not account_info:
                 self.logger.warning("无法获取账户信息，跳过账户状态更新")
                 return
-            
-            # 2. 提取账户余额信息
-            total = account_info['total']        # 总资产
-            usable = account_info['usable']      # 可用资金
-            locked = total - usable              # 冻结资金 = 总资产 - 可用资金
-            
-            # 3. 构建AccountBalance对象
-            # 关键：free字段必须设置为usable（可用资金），这是策略中balance_free()返回的值
-            balances = [
-                AccountBalance(
-                    total=Money(total, CNY),      # 总余额
-                    locked=Money(locked, CNY),    # 冻结余额
-                    free=Money(usable, CNY),      # ✅ 可用余额（最重要！）
-                )
-            ]
-            
-            # 4. 调用generate_account_state更新Cache
-            self.generate_account_state(
-                balances=balances,
-                margins=[],                        # 现金账户，无保证金
-                reported=True,                     # 数据来自券商API
-                ts_event=self._clock.timestamp_ns(),
-            )
-            
-            # 5. 记录日志
-            self.logger.info(
-                f"✅ 账户状态已更新: "
-                f"总资产={total:.2f} CNY, "
-                f"可用={usable:.2f} CNY, "
-                f"冻结={locked:.2f} CNY"
-            )
+            self._apply_account_info_to_cache(account_info)
             
         except Exception as e:
             self.logger.error(f"❌ 更新账户状态失败: {e}")
             import traceback
             traceback.print_exc()
+    
+    def _apply_account_info_to_cache(self, account_info: Dict) -> None:
+        """将券商返回的账户信息写入Nautilus缓存。"""
+        total = float(account_info.get('total', 0.0))
+        usable = float(account_info.get('usable', 0.0))
+        locked = max(total - usable, 0.0)
+        
+        balances = [
+            AccountBalance(
+                total=Money(total, CNY),
+                locked=Money(locked, CNY),
+                free=Money(usable, CNY),
+            )
+        ]
+        
+        self.generate_account_state(
+            balances=balances,
+            margins=[],
+            reported=True,
+            ts_event=self._clock.timestamp_ns(),
+        )
+        
+        self.logger.info(
+            f"✅ 账户余额同步: total={total:.2f} CNY, usable={usable:.2f} CNY, locked={locked:.2f} CNY"
+        )
     
     async def _periodic_account_update(self) -> None:
         """
@@ -3329,18 +3357,29 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         reports = []
         
         try:
-            logger.info("=" * 80)
-            logger.info("📊 【对账】开始查询交易所委托订单...")
-            logger.info("=" * 80)
-            
-            # ✅ 查询交易所的实际委托（而不是本地缓存）
-            exchange_orders = await self._check_orders()
-            
-            if not exchange_orders:
-                logger.info("交易所当前没有委托订单")
+            if not self._should_query_exchange():
                 return reports
             
-            logger.info(f"查询到交易所委托订单: {len(exchange_orders)} 个")
+            exchange_orders = await self._get_exchange_orders()
+            current_time = time.time()
+            has_orders = bool(exchange_orders)
+            should_log = has_orders or (current_time - self._last_orders_log_ts >= self._order_log_interval_secs)
+
+            if should_log:
+                self._last_orders_log_ts = current_time
+                logger.info("=" * 80)
+                logger.info("📊 【对账】开始查询交易所委托订单...")
+                logger.info("=" * 80)
+            
+            if not has_orders:
+                if should_log:
+                    logger.info("交易所当前没有委托订单")
+                self._pending_reconciliation = False
+                self._cached_exchange_orders = None
+                return reports
+            
+            if should_log:
+                logger.info(f"查询到交易所委托订单: {len(exchange_orders)} 个")
             
             # 遍历交易所返回的订单，转换为OrderStatusReport
             for order in exchange_orders:
@@ -3409,7 +3448,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     )
                     
                     reports.append(report)
-                    logger.info(f"    ✅ 生成报告: {order_id} | {nautilus_side} | {nautilus_status}")
+                    if should_log:
+                        logger.info(f"    ✅ 生成报告: {order_id} | {nautilus_side} | {nautilus_status}")
 
                     # ✅ 若订单处于终态，回收映射避免内存泄露
                     if nautilus_status in {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}:
@@ -3424,8 +3464,9 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     logger.error(traceback.format_exc())
                     continue
             
-            logger.info(f"✅ 对账完成: 生成 {len(reports)} 个订单报告")
-            logger.info("=" * 80)
+            if should_log:
+                logger.info(f"✅ 对账完成: 生成 {len(reports)} 个订单报告")
+                logger.info("=" * 80)
             
         except Exception as e:
             logger.error(f"❌ 生成订单状态报告失败: {e}")
@@ -3444,11 +3485,17 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.error("执行客户端未连接，无法提交订单")
                 return
             
+            # 下单前触发一次对账
+            self._mark_reconciliation_required()
+            
             # ✅ 确保登录状态有效（Pythonic: 错误不应该悄悄发生）
             if not await self._ensure_login():
                 logger.error("❌ 登录状态无效，无法提交订单")
                 # TODO: 生成订单拒绝事件通知策略
                 return
+
+            # 下单前主动拉取一次交易所委托，避免下单后才对账
+            await self._get_exchange_orders(use_cache=False)
             
             # 将NautilusTrader订单转换为jvquant格式
             jvquant_order = self._convert_nautilus_order_to_jvquant(command.order)
@@ -3565,6 +3612,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             if not self.is_connected:
                 logger.error("执行客户端未连接，无法取消订单")
                 return
+
+            self._mark_reconciliation_required()
             
             # 获取订单ID映射
             nautilus_order_id = str(command.order.client_order_id)
@@ -3606,6 +3655,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             if not self.is_connected:
                 logger.error("执行客户端未连接，无法取消订单")
                 return
+
+            self._mark_reconciliation_required()
             
             # 查询当前所有委托订单
             orders = await self._check_orders()
@@ -3708,15 +3759,19 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         fill_reports = []
         
         try:
+            if not self._should_query_exchange():
+                return fill_reports
+
             logger.info("=" * 80)
             logger.info("📊 【对账】开始查询交易所成交订单...")
             logger.info("=" * 80)
             
             # ✅ 查询交易所的实际委托（而不是本地缓存）
-            exchange_orders = await self._check_orders()
+            exchange_orders = await self._get_exchange_orders()
             
             if not exchange_orders:
                 logger.info("交易所当前没有委托订单")
+                self._pending_reconciliation = False
                 return fill_reports
             
             logger.info(f"查询到交易所委托订单: {len(exchange_orders)} 个")
@@ -3769,6 +3824,20 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                             venue_order_id,
                         )
                     
+                    # ✅ 从缓存中查找订单，获取position_id（避免执行引擎错误分配为EXTERNAL）
+                    venue_position_id = None
+                    if client_order_id_obj:
+                        try:
+                            cached_order = self.cache.order(client_order_id_obj)
+                            if cached_order and cached_order.position_id:
+                                venue_position_id = cached_order.position_id
+                                logger.debug(
+                                    f"从缓存订单获取position_id: {venue_position_id} for {client_order_id_obj}"
+                                )
+                        except Exception as e:
+                            # 缓存中可能还没有订单，这是正常的（订单可能刚提交）
+                            logger.debug(f"无法从缓存获取订单的position_id: {e}")
+                    
                     # ✅ 创建成交报告
                     report = FillReport(
                         account_id=self.account_id,  # ✅ 使用执行客户端的 account_id 属性
@@ -3784,6 +3853,7 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         report_id=UUID4(),
                         ts_init=self._clock.timestamp_ns(),  # ✅ 必需：初始化时间戳
                         client_order_id=client_order_id_obj,
+                        venue_position_id=venue_position_id,  # ✅ 显式设置position_id，避免执行引擎错误分配为EXTERNAL
                     )
                     
                     fill_reports.append(report)
@@ -3803,6 +3873,8 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             logger.info(f"✅ 对账完成: 生成 {len(fill_reports)} 个成交报告")
             logger.info("=" * 80)
+            self._pending_reconciliation = False
+            self._cached_exchange_orders = None
             
         except Exception as e:
             logger.error(f"❌ 生成成交报告失败: {e}")
@@ -3821,13 +3893,23 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         查询持仓信息，生成持仓状态报告
         """
         try:
+            if not self._pending_position_sync:
+                logger.debug("跳过持仓对账，本轮无需访问券商持仓接口")
+                return []
+            
             logger.info(f"生成持仓状态报告: {command}")
             
             # 查询持仓信息
             account_info = await self._check_positions()
             if not account_info or not account_info.get('hold_list'):
                 logger.info("没有持仓")
+                if account_info:
+                    self._apply_account_info_to_cache(account_info)
+                self._pending_position_sync = False
                 return []
+            
+            # 同步账户余额到缓存，确保后续策略读取到最新可用资金
+            self._apply_account_info_to_cache(account_info)
             
             position_reports = []
             
@@ -3900,12 +3982,14 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     continue
             
             logger.info(f"✅ 生成了 {len(position_reports)} 个持仓报告")
+            self._pending_position_sync = False
             return position_reports
             
         except Exception as e:
             logger.error(f"生成持仓状态报告失败: {e}")
             import traceback
             traceback.print_exc()
+            self._pending_position_sync = False
             return []
 
 
