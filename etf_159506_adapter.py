@@ -3277,6 +3277,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 # ✅ 启动阶段恢复历史订单映射，确保对账能识别内部订单
                 self.logger.info("🔄 恢复历史订单ID映射...")
                 self._restore_order_mappings_from_cache()
+                
+                # ✅ 启动时触发持仓对账，让执行引擎加载现有持仓
+                logger.info("🔄 标记需要持仓对账，等待执行引擎加载...")
+                self._pending_position_sync = True
             else:
                 logger.error("❌ 交易柜台登录失败，执行客户端无法使用")
                 logger.warning("提示: 请检查trade_account和trade_password配置是否正确")
@@ -3927,54 +3931,81 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     # 构建instrument_id
                     instrument_id = InstrumentId.from_str(f"{code}.SZSE")
                     
-                    # ✅ 尝试通过持仓盈亏计算平均开仓价格
+                    # ✅ 尝试从缓存中查找现有持仓，获取 position_id 和 avg_px_open
+                    # 根据官方文档：对于 NETTING OMS，每个 instrument 只有一个 position
+                    venue_position_id = None
+                    avg_px_open = None
+                    
+                    try:
+                        # 查找缓存中的现有持仓（NETTING OMS 模式下每个 instrument 只有一个）
+                        cached_positions = self._cache.positions(instrument_id=instrument_id)
+                        if cached_positions:
+                            # 找到匹配的持仓（LONG 且数量相近）
+                            for cached_pos in cached_positions:
+                                if cached_pos.side == PositionSide.LONG and cached_pos.is_open:
+                                    venue_position_id = cached_pos.id
+                                    # 优先使用缓存中的 avg_px_open（更准确）
+                                    if cached_pos.avg_px_open:
+                                        avg_px_open = cached_pos.avg_px_open
+                                    logger.info(
+                                        f"✅ 从缓存找到现有持仓: {venue_position_id}, "
+                                        f"数量={cached_pos.quantity}, avg_px_open={avg_px_open}"
+                                    )
+                                    break
+                    except Exception as e:
+                        logger.debug(f"查找缓存持仓时出错（将创建新持仓）: {e}")
+                    
+                    # ✅ 如果缓存中没有 avg_px_open，尝试通过持仓盈亏计算
                     # 公式: 平均成本价 = 当前价格 - (持仓盈亏 / 持仓数量)
                     # 注意：启动时Cache中可能还没有QuoteTick，avg_px_open会为None
                     #      这是正常的，ExecutionEngine会生成推断的OrderFilled来reconcile
-                    avg_px_open = None
-                    try:
-                        # 从Cache获取当前价格（启动时可能为None）
-                        quote = self._cache.quote_tick(instrument_id)
-                        
-                        if quote and hold_vol > 0:
-                            current_price = (quote.bid_price.as_double() + quote.ask_price.as_double()) / 2
-                            # 反推平均成本价
-                            avg_cost_price = current_price - (hold_earn / hold_vol)
-                            avg_px_open = Decimal(str(avg_cost_price))
-                            logger.info(
-                                f"✅ 计算avg_px_open成功: 当前价={current_price:.3f}, "
-                                f"持仓盈亏={hold_earn:.2f}, 持仓量={hold_vol}, "
-                                f"平均成本价={avg_px_open}"
-                            )
-                        else:
-                            logger.info(
-                                f"ℹ️  启动时无法计算avg_px_open (Cache中暂无QuoteTick)，"
-                                f"将在reconciliation时由ExecutionEngine推断。"
-                                f"持仓: {code}, 数量: {hold_vol}, 盈亏: {hold_earn}"
-                            )
-                    except Exception as e:
-                        logger.warning(f"计算平均开仓价时出错: {e}")
-                        import traceback
-                        logger.debug(f"错误详情: {traceback.format_exc()}")
+                    if avg_px_open is None:
+                        try:
+                            # 从Cache获取当前价格（启动时可能为None）
+                            quote = self._cache.quote_tick(instrument_id)
+                            
+                            if quote and hold_vol > 0:
+                                current_price = (quote.bid_price.as_double() + quote.ask_price.as_double()) / 2
+                                # 反推平均成本价
+                                avg_cost_price = current_price - (hold_earn / hold_vol)
+                                avg_px_open = Decimal(str(avg_cost_price))
+                                logger.info(
+                                    f"✅ 通过持仓盈亏计算avg_px_open: 当前价={current_price:.3f}, "
+                                    f"持仓盈亏={hold_earn:.2f}, 持仓量={hold_vol}, "
+                                    f"平均成本价={avg_px_open}"
+                                )
+                            else:
+                                logger.info(
+                                    f"ℹ️  无法计算avg_px_open (Cache中暂无QuoteTick)，"
+                                    f"ExecutionEngine将在reconciliation时推断。"
+                                    f"持仓: {code}, 数量: {hold_vol}, 盈亏: {hold_earn}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"计算平均开仓价时出错: {e}")
+                            import traceback
+                            logger.debug(f"错误详情: {traceback.format_exc()}")
                     
                     # 构建持仓状态报告
-                    # 现金账户使用FLAT position_side
+                    # 根据官方文档：股票/ETF现金账户买入后持有使用LONG
+                    # 对于 NETTING OMS，venue_position_id 可以帮助执行引擎匹配现有持仓
                     report = PositionStatusReport(
                         account_id=self.account_id,
                         instrument_id=instrument_id,
-                        position_side=PositionSide.FLAT,  # 现金账户使用FLAT
+                        position_side=PositionSide.LONG,  # 股票买入后持有是LONG
                         quantity=Quantity.from_int(hold_vol),
                         report_id=UUID4(),
                         ts_last=self._clock.timestamp_ns(),
                         ts_init=self._clock.timestamp_ns(),
-                        avg_px_open=avg_px_open,  # ✅ 添加平均开仓价
+                        venue_position_id=venue_position_id,  # ✅ 如果找到现有持仓，设置其ID
+                        avg_px_open=avg_px_open,  # ✅ 平均开仓价（优先从缓存，其次计算）
                     )
                     
                     position_reports.append(report)
-                    logger.debug(
-                        f"生成持仓报告: {code} 持仓量={hold_vol}, "
+                    logger.info(
+                        f"✅ 生成持仓报告: {code} 持仓量={hold_vol}, "
                         f"可用量={position.get('usable_vol', 0)}, "
-                        f"估算平均价={avg_px_open}"
+                        f"avg_px_open={avg_px_open}, "
+                        f"venue_position_id={venue_position_id}"
                     )
                     
                 except Exception as e:

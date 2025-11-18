@@ -150,8 +150,6 @@ class ETF159506Strategy(Strategy):
         self.minute_volume_data = deque(maxlen=1000)  # 存储每分钟成交量数据 [(minute_key, volume), ...]
         
         # 异步图表更新相关
-        self._chart_update_thread = None  # 图表更新线程
-        self._chart_update_lock = threading.Lock()  # 线程锁，保护共享数据
         self._log.info("每分钟成交量记录功能已启用")
         
         # MACD极值点时间差属性
@@ -316,7 +314,6 @@ class ETF159506Strategy(Strategy):
     
     def on_stop(self):
         """策略停止时调用"""
-        self.update_realtime_charts_async(self.last_bar)
 
         # 取消订阅实时数据和事件
         self.unsubscribe_bars(self.config.bar_type)
@@ -476,6 +473,7 @@ class ETF159506Strategy(Strategy):
                 
                 # 历史数据处理：信号归零但不执行交易
                 self.technical_signal = 0
+            # self.update_realtime_charts(self.last_bar)
 
     def _process_bar(self, bar: Bar):
         """处理单条历史K线数据"""
@@ -684,8 +682,8 @@ class ETF159506Strategy(Strategy):
         self.technical_signal_history.append(signal_record)
         self._log.info(f"记录技术信号历史: 时间={beijing_time_str}, 信号值={current_technical_signal:.2f}")
         
-        # ✅ 使用异步方式更新图表，不阻塞订单提交（从technical_signal_history读取信号值）
-        self.update_realtime_charts_async(last_bar)
+        # ✅ 更新实时图表（同步执行，保证与其他图一致）
+        self.update_realtime_charts(last_bar)
         self.technical_signal = 0
     def on_event(self, event: Event):
         """处理所有事件"""
@@ -950,7 +948,7 @@ class ETF159506Strategy(Strategy):
             return 0.01
         
         # 获取当前MACD值
-        current_macd = self.dif_history[-1] if self.dif_history else 0
+        current_dif = self.dif_history[-1] if self.dif_history else 0
         
         # 根据极值类型筛选对应的极值点
         filtered_extremes = [extreme for extreme in self.macd_extremes_history if extreme[2] == extreme_type]
@@ -971,18 +969,18 @@ class ETF159506Strategy(Strategy):
             return 0.01
         
         # 计算有多少个值小于当前值
-        values_below_current = sum(1 for val in sorted_macd_values if val < current_macd)
+        values_below_current = sum(1 for val in sorted_macd_values if val < current_dif)
         
         # 根据极值类型调整排名逻辑
         if extreme_type == 'trough':
             # 极小值：MACD值越小，排名越高（越接近1）
             rank_ratio = 1 - (values_below_current / total_count)
-            self._log.info(f"MACD极小值排序分析: 总极小值点数={total_count}, 当前MACD={current_macd:.6f}")
+            self._log.info(f"MACD极小值排序分析: 总极小值点数={total_count}, 当前MACD={current_dif:.6f}")
             self._log.info(f"排名比例={rank_ratio:.3f} (值越小排名越高，1=最小值)")
         else:  # extreme_type == 'peak'
             # 极大值：MACD值越大，排名越高（越接近1）
             rank_ratio = values_below_current / total_count
-            self._log.info(f"MACD极大值排序分析: 总极大值点数={total_count}, 当前MACD={current_macd:.6f}")
+            self._log.info(f"MACD极大值排序分析: 总极大值点数={total_count}, 当前MACD={current_dif:.6f}")
             self._log.info(f"排名比例={rank_ratio:.3f} (值越大排名越高，1=最大值)")
         
         return rank_ratio
@@ -1204,23 +1202,22 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"历史数据不足，跳过信号检测: macd_history={len(self.dif_history)}, signal_history={len(self.signal_history)}, 需要至少2个数据点")
             return
         
-        current_macd = self.dif_history[-1]
+        current_dif = self.dif_history[-1]
         previous_macd = self.dif_history[-2]
         current_signal = self.signal_history[-1]
         previous_signal = self.signal_history[-2]
         
         # 计算当前histogram值
-        current_histogram = current_macd - current_signal
+        current_histogram = current_dif - current_signal
         
         # 检查histogram模式
         histogram_result = self.check_negative_positive_histogram(bar, lookback_minutes=5)
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_macd < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
+        if current_dif < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
             # 获取前5个DIF值（不包括当前值）
             last_five_dif = list(self.dif_history)[-6:-1]  # 前5个值
-            current_dif = current_macd
             
             # 检查是否单调递减（从历史到当前，即从旧到新）
             is_monotonic_decreasing = True
@@ -1282,22 +1279,22 @@ class ETF159506Strategy(Strategy):
         
         
         # 检测金叉：MACD线从下方向上穿越信号线
-        golden_cross = (previous_macd < previous_signal and current_macd > current_signal)
+        golden_cross = (previous_macd < previous_signal and current_dif > current_signal)
         
         # 检测死叉：MACD线从上方向下穿越信号线
-        death_cross = (previous_macd > previous_signal and current_macd < current_signal)
+        death_cross = (previous_macd > previous_signal and current_dif < current_signal)
         
         # 检查MACD值是否足够大（过滤小波动）
         macd_threshold = abs(self.divergence_threshold)
-        current_macd_abs = abs(current_macd)
+        current_dif_abs = abs(current_dif)
         
         # 记录信号
         if golden_cross:
-            self._log.info(f"检测到金叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
+            self._log.info(f"检测到金叉信号: MACD={current_dif:.6f}, Signal={current_signal:.6f}")
             
             # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
-            if current_macd_abs < macd_threshold:
-                self._log.info(f"金叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
+            if current_dif_abs < macd_threshold:
+                self._log.info(f"金叉信号被过滤: MACD绝对值{current_dif_abs:.6f} < 阈值{macd_threshold:.6f}")
                 return
             
             self.last_signal = "golden_cross"
@@ -1306,13 +1303,13 @@ class ETF159506Strategy(Strategy):
             # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
             is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
             signal_coefficient = 40000 if is_first_golden_cross else 20000
-            macd_contribution = signal_coefficient*current_macd_abs
+            macd_contribution = signal_coefficient*current_dif_abs
             self.technical_signal += macd_contribution
             self.technical_signal_steps.append({
-                'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f})',
+                'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
                 'delta': macd_contribution
             })
-            self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
+            self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
 
             # 检查RSI条件
             if self.rsi.initialized:
@@ -1357,7 +1354,7 @@ class ETF159506Strategy(Strategy):
                 'price': bar.close.as_double(),
                 'signal_type': 'golden_cross',
                 'signal_value': self.technical_signal,
-                'macd_value': current_macd,
+                'macd_value': current_dif,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
                 'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
@@ -1369,11 +1366,11 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"记录金叉技术信号: {technical_signal}")
         
         elif death_cross:
-            self._log.info(f"检测到死叉信号: MACD={current_macd:.6f}, Signal={current_signal:.6f}")
+            self._log.info(f"检测到死叉信号: MACD={current_dif:.6f}, Signal={current_signal:.6f}")
             
             # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
-            if current_macd_abs < macd_threshold:
-                self._log.info(f"死叉信号被过滤: MACD绝对值{current_macd_abs:.6f} < 阈值{macd_threshold:.6f}")
+            if current_dif_abs < macd_threshold:
+                self._log.info(f"死叉信号被过滤: MACD绝对值{current_dif_abs:.6f} < 阈值{macd_threshold:.6f}")
                 return
             
             self.last_signal = "death_cross"
@@ -1392,13 +1389,13 @@ class ETF159506Strategy(Strategy):
                     self.monitor_histogram_shrink = False
                     self._log.info("检测到非首个死叉，关闭MACD柱缩小监控，避免重复买入")
                 self.first_death_cross_triggered = False
-            macd_contribution = -signal_coefficient*current_macd_abs
+            macd_contribution = -signal_coefficient*current_dif_abs
             self.technical_signal += macd_contribution
             self.technical_signal_steps.append({
-                'description': f'死叉信号(系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f})',
+                'description': f'死叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
                 'delta': macd_contribution
             })
-            self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_macd_abs:.6f}, 当前信号值={self.technical_signal}")
+            self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
             if self.rsi.initialized:
@@ -1443,7 +1440,7 @@ class ETF159506Strategy(Strategy):
                 'price': bar.close.as_double(),
                 'signal_type': 'death_cross',
                 'signal_value': self.technical_signal,
-                'macd_value': current_macd,
+                'macd_value': current_dif,
                 'signal_value_macd': current_signal,
                 'histogram': current_histogram,
                 'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
@@ -1647,7 +1644,7 @@ class ETF159506Strategy(Strategy):
         
         current_timestamp = bar.ts_event
         current_price = self.price_history[-1]
-        current_macd = self.dif_history[-1]
+        current_dif = self.dif_history[-1]
         
         # 检测上一个价格点的极值（延迟检测）
         if len(self.price_history) >= 2:
@@ -2407,32 +2404,6 @@ class ETF159506Strategy(Strategy):
         
         # 检查是否在2:50分之后
         return current_time_only >= self.scheduled_buy_time
-    
-    def update_realtime_charts_async(self, bar: Bar):
-        """异步更新实时图表（不阻塞订单提交，从technical_signal_history读取信号值）"""
-        # 如果上一个图表更新线程还在运行，跳过本次更新
-        if self._chart_update_thread and self._chart_update_thread.is_alive():
-            self._log.warning("上一次图表更新还未完成，跳过本次更新")
-            return
-        
-        # 创建新线程进行图表更新
-        self._chart_update_thread = threading.Thread(
-            target=self._update_realtime_charts_internal,
-            args=(bar,),
-            daemon=True  # 守护线程，主程序退出时自动结束
-        )
-        self._chart_update_thread.start()
-        self._log.info("✅ 已启动异步图表更新线程（不阻塞订单提交）")
-    
-    def _update_realtime_charts_internal(self, bar: Bar):
-        """内部图表更新方法（在独立线程中运行）"""
-        try:
-            with self._chart_update_lock:  # 使用锁保护共享数据
-                self.update_realtime_charts(bar)
-        except Exception as e:
-            self._log.error(f"异步图表更新失败: {e}")
-            import traceback
-            self._log.error(f"错误详情: {traceback.format_exc()}")
     
     def update_realtime_charts(self, bar: Bar):
         """每分钟更新实时图表（同步方法，由异步包装调用，从technical_signal_history读取信号值）"""
@@ -3464,6 +3435,28 @@ class ETF159506Strategy(Strategy):
             mapped_df = complete_df[complete_df.index.isin(time_mapping.keys())].copy()
             mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
             
+            # 数据验证和调试信息
+            self._log.info(f"[K线图] complete_df列: {list(complete_df.columns)}")
+            self._log.info(f"[K线图] complete_df行数: {len(complete_df)}")
+            self._log.info(f"[K线图] time_mapping键数量: {len(time_mapping)}")
+            self._log.info(f"[K线图] mapped_df列: {list(mapped_df.columns)}")
+            self._log.info(f"[K线图] mapped_df行数: {len(mapped_df)}")
+            
+            # 检查mapped_df是否有price列
+            if 'price' not in mapped_df.columns:
+                self._log.error(f"[K线图] mapped_df缺少'price'列，可用列: {list(mapped_df.columns)}")
+                # 尝试使用close列
+                if 'close' in mapped_df.columns:
+                    mapped_df['price'] = mapped_df['close']
+                    self._log.info("[K线图] 使用'close'列作为'price'")
+                else:
+                    self._log.error("[K线图] mapped_df既没有'price'也没有'close'列，无法绘制")
+                    return
+            
+            if len(mapped_df) == 0:
+                self._log.error("[K线图] mapped_df为空，无法绘制")
+                return
+            
             # 固定X轴范围为完整交易日（不随数据量变化）
             # 获取基准日期和时区（从数据中取第一个有效时间）
             if len(mapped_df) > 0:
@@ -3484,15 +3477,67 @@ class ETF159506Strategy(Strategy):
             x_max = pd.Timestamp(year=base_date.year, month=base_date.month, day=base_date.day, 
                                 hour=13, minute=30, second=0, tz=tz_info)  # 映射后的下午15:00
             
+            # 验证price数据
+            price_data = mapped_df['price'].dropna()
+            self._log.info(f"[K线图] price数据条数: {len(price_data)}")
+            if len(price_data) > 0:
+                self._log.info(f"[K线图] price数据时间范围: {price_data.index.min()} 到 {price_data.index.max()}")
+                # 确保x轴范围包含数据范围
+                data_min = price_data.index.min()
+                data_max = price_data.index.max()
+                if data_min < x_min:
+                    x_min = data_min - pd.Timedelta(minutes=5)  # 留出一些边距
+                    self._log.info(f"[K线图] 调整x_min以包含数据: {x_min}")
+                if data_max > x_max:
+                    x_max = data_max + pd.Timedelta(minutes=5)  # 留出一些边距
+                    self._log.info(f"[K线图] 调整x_max以包含数据: {x_max}")
+            self._log.info(f"[K线图] 最终x轴范围: {x_min} 到 {x_max}")
+            
             # 为每个子图设置相同的固定x轴范围
             for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
                 ax.set_xlim(x_min, x_max)
-            
 
 
             # ====== ax1主图（价格走势） ======
             # 绘制价格走势
-            ax1.plot(mapped_df.index, mapped_df['price'], linewidth=1, color='blue', alpha=0.8, label='成交价')
+            if len(price_data) > 0:
+                if len(price_data) >= 2:
+                    # 多个数据点时绘制线
+                    ax1.plot(price_data.index, price_data.values, linewidth=1, color='blue', alpha=0.8, label='成交价', zorder=1)
+                    self._log.info(f"[K线图] 已绘制价格线，数据点: {len(price_data)}")
+                else:
+                    # 单个数据点时使用scatter显示
+                    ax1.scatter(price_data.index, price_data.values, s=50, color='blue', alpha=0.8, label='成交价', zorder=1)
+                    self._log.info(f"[K线图] 已绘制价格点（单点），数据点: {len(price_data)}")
+                
+                # 如果有OHLC数据，绘制K线（蜡烛图）
+                if all(col in mapped_df.columns for col in ['open', 'high', 'low', 'price']):
+                    ohlc_data = mapped_df[['open', 'high', 'low', 'price']].dropna()
+                    if len(ohlc_data) > 0:
+                        # 绘制K线（简单的OHLC柱状图）
+                        for idx, row in ohlc_data.iterrows():
+                            open_val = row['open']
+                            high_val = row['high']
+                            low_val = row['low']
+                            close_val = row['price']  # price就是close
+                            
+                            # 确定颜色：收盘价>开盘价为红色（涨），否则为绿色（跌）
+                            color = 'red' if close_val >= open_val else 'green'
+                            
+                            # 绘制上下影线
+                            ax1.plot([idx, idx], [low_val, high_val], color='black', linewidth=0.5, alpha=0.5, zorder=2)
+                            
+                            # 绘制实体（开盘价到收盘价）
+                            body_height = abs(close_val - open_val)
+                            body_bottom = min(open_val, close_val)
+                            # 使用bar绘制实体，宽度很小
+                            bar_width = pd.Timedelta(minutes=0.5).total_seconds() / 86400  # 转换为天为单位
+                            ax1.bar(idx, body_height, bottom=body_bottom, width=bar_width, 
+                                   color=color, alpha=0.7, edgecolor='black', linewidth=0.5, zorder=3)
+                        
+                        self._log.info(f"[K线图] 已绘制K线，数据点: {len(ohlc_data)}")
+            else:
+                self._log.warning("[K线图] price数据为空，无法绘制价格线")
             
             # 标记关键价格点
             valid_prices = mapped_df['price'].dropna()
