@@ -592,18 +592,23 @@ class ETF159506Strategy(Strategy):
             # 如果没有历史成交量数据，返回1.0
             if not self.minute_volume_data:
                 self._log.info(f"无历史成交量数据，成交量比值设为1.0")
-                return 0
+                return 1.0
             
         
             
-            # 筛选从index到当前时间前一分钟的数据
+            # 筛选从index到当前时间前一分钟的数据（不包括当前分钟）
             filtered_volumes = []
-            for i in range(index, len(self.minute_volume_data)):
+            # 排除最后一个数据（当前分钟），只计算历史数据
+            end_index = len(self.minute_volume_data) - 1 if len(self.minute_volume_data) > 0 else 0
+            for i in range(index, end_index):
                 volume_value = self.minute_volume_data[i]['volume']
                 filtered_volumes.append(volume_value)
                 self._log.info(f"成交量对比计算: 历史成交量={volume_value:.2f}")
             
-
+            # 如果没有历史数据，返回1.0
+            if len(filtered_volumes) == 0:
+                self._log.info(f"无历史成交量数据用于对比，成交量比值设为1.0")
+                return 1.0
             
             # 计算历史平均成交量
             avg_historical_volume = sum(filtered_volumes) / len(filtered_volumes)
@@ -808,7 +813,7 @@ class ETF159506Strategy(Strategy):
             'histogram': histogram  # MACD柱
         }
     
-    def check_negative_positive_histogram(self, bar: Bar, lookback_minutes: int = 5):
+    def check_negative_positive_histogram(self, bar: Bar):
         """
         循环计算前几个分钟的histogram值，检测histogram由正到负再到正的模式
         
@@ -816,19 +821,11 @@ class ETF159506Strategy(Strategy):
         -----------
         bar : Bar
             当前K线数据
-        lookback_minutes : int
-            回看分钟数，默认5分钟
-            
         Returns:
         --------
         dict or None
             如果检测到模式，返回包含时间点信息的字典；否则返回None
         """
-        # 需要足够的历史数据
-        if len(self.dif_history) < lookback_minutes or len(self.signal_history) < lookback_minutes:
-            self._log.info(f"历史数据不足，需要至少{lookback_minutes}个数据点")
-            return 
-        
         # # 检查DIF值是否由负转正
         if len(self.dif_history) >= 2:
             current_dif = self.dif_history[-1]
@@ -842,95 +839,132 @@ class ETF159506Strategy(Strategy):
             self._log.info("DIF历史数据不足，无法判断由负转正")
             return 
         
-        # 计算每个时间点的histogram值（从当前到过去）
-        negative_point = False
-        positive_index = None
-        min_trough_info = None
+        # 从当前时间点往前查找三个histogram交替点（从正到负或从负到正）
+        # 从第三个交替点到当前时间点，找出这段区间的最大值和最小值（保存为绝对值）
+        max_histogram_abs = 0.0  # 从第三个交替点到当前时间点的最大histogram值（保存绝对值）
+        min_histogram_abs = 0.0  # 从第三个交替点到当前时间点的最小histogram值（保存绝对值）
         
-        for i, histogram in enumerate(reversed(self.histogram_history)):
-            if histogram < 0:
-                negative_point = True
-            if histogram > 0 and negative_point:
-                # 计算实际索引（从最新开始反向）
-                actual_index = len(self.histogram_history) - 1 - i
-                positive_index = actual_index
-                self._log.info(f"找到histogram为正的时间点: 索引={actual_index}, histogram值={histogram:.6f}")
+        if len(self.histogram_history) < 2:
+            self._log.info("histogram历史数据不足，无法计算")
+            return
+        
+        current_index = len(self.histogram_history) - 1
+        
+        # 往前查找三个交替点（从正到负或从负到正）
+        # 交替点定义：histogram[i-1] 和 histogram[i] 符号不同
+        alternating_points = []  # 存储交替点的索引
+        
+        for i in range(current_index, 0, -1):  # 从当前点往前查找
+            if i >= len(self.histogram_history) or i < 1:
+                continue
+            current_hist = self.histogram_history[i]
+            previous_hist = self.histogram_history[i - 1]
+            
+            # 检查是否是交替点（符号变化）
+            if (current_hist > 0 and previous_hist < 0) or (current_hist < 0 and previous_hist > 0):
+                alternating_points.append(i)
+                if len(alternating_points) >= 3:
+                    break
+        
+        # 如果找到了至少3个交替点，从第三个交替点到当前时间点找出最大值和最小值
+        if len(alternating_points) >= 3:
+            third_alternating_index = alternating_points[2]  # 第三个交替点（最旧的那个）
+            
+            self._log.info(f"找到3个交替点: {alternating_points}, 第三个交替点索引={third_alternating_index}")
+            
+            # 从第三个交替点到当前时间点，找出最大值和最小值
+            max_value = None
+            min_value = None
+            
+            for i in range(third_alternating_index, current_index + 1):
+                hist_value = self.histogram_history[i]
+                if max_value is None or hist_value > max_value:
+                    max_value = hist_value
+                if min_value is None or hist_value < min_value:
+                    min_value = hist_value
+            
+            # 保存为绝对值
+            if max_value is not None:
+                max_histogram_abs = abs(max_value)
+            if min_value is not None:
+                min_histogram_abs = abs(min_value)
+            
+            self._log.info(f"从第三个交替点到当前时间点: 最大值={max_value:.6f}, 最小值={min_value:.6f}, "
+                          f"最大值绝对值={max_histogram_abs:.6f}, 最小值绝对值={min_histogram_abs:.6f}")
+        
+        # 如果找到了值，计算信号强度
+        if max_histogram_abs > 0 or min_histogram_abs > 0:
+            # 获取当前时间戳
+            if current_index < len(self.timestamps):
                 
-                # 获取对应的时间戳
-                if actual_index < len(self.timestamps):
-                    timestamp = self.timestamps[actual_index]
-                    # 转换为北京时间
-                    utc_time = pd.to_datetime(timestamp, unit='ns')
-                    beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                    time_str = beijing_time.strftime('%H:%M:%S')
-                    self._log.info(f"对应时间: {time_str}")
-                    
-                    # 在macd_extremes_history中找到从该时间戳到当前时间中最小的极小值
-                    min_trough_value = None
-                    min_trough_timestamp = None
-                    
-                    for extreme_timestamp, extreme_value, extreme_type in self.macd_extremes_history:
-                        # 只考虑极小值（trough）
-                        if extreme_type == 'trough' and extreme_timestamp >= timestamp:
-                            if min_trough_value is None or extreme_value < min_trough_value:
-                                min_trough_value = extreme_value
-                                min_trough_timestamp = extreme_timestamp
-                    
-                    if min_trough_value is not None:
-                        # 转换为北京时间
-                        utc_trough_time = pd.to_datetime(min_trough_timestamp, unit='ns')
-                        beijing_trough_time = utc_trough_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
-                        min_trough_time_str = beijing_trough_time.strftime('%H:%M:%S')
-                        self._log.info(f"从{time_str}到当前时间中最小的极小值: {min_trough_value:.6f}, 时间: {min_trough_time_str}")
-                        
-                        # 保存最小极小值信息
-                        min_trough_info = {
-                            'value': min_trough_value,
-                            'timestamp': min_trough_timestamp,
-                            'time_str': min_trough_time_str,
-                            'start_time': time_str,
-                            'start_timestamp': timestamp
-                        }
-                         # 计算成交量对比
-                        volume_ratio = self.calculate_volume_ratio(actual_index, bar)
-                        # 动态计算信号强度：min_trough_value越小，信号强度越大
-                        # 使用指数函数：signal_strength = base_signal * (1 + abs(min_trough_value) / threshold)^power
-                        base_signal = 10000  # 基础信号强度
-                        power = 1.5  # 指数幂，控制增长曲线
-                        
-                        # 计算动态信号强度
-                        signal_strength = (base_signal * abs(min_trough_value)) ** power * volume_ratio
-                        
-                        self.technical_signal += signal_strength
-                        self.technical_signal_steps.append({
-                            'description': f'极小值信号(min_trough={min_trough_value:.6f}, 成交量比值={volume_ratio:.4f})',
-                            'delta': signal_strength
-                        })
-                        self._log.info(f"极小值信号触发: min_trough_value={min_trough_value:.6f}, 动态信号强度={signal_strength:.1f}, 当前信号值={self.technical_signal}")
-                       
-                        # 记录极小值技术指标信号
-                        technical_signal = {
-                            'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                            'price': bar.close.as_double(),
-                            'signal_type': 'n2p',
-                            'signal_value': self.technical_signal,
-                            'min_trough_value': min_trough_value,
-                            'min_trough_time': min_trough_time_str,
-                            'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
-                            'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
-                            'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
-                            'kdj_j': self.kdj.value_j if self.kdj.initialized else None,
-                            'volume_ratio': volume_ratio
-                        }
-                        
-                        
-                        self.technical_signals.append(technical_signal)
-                        self._log.info(f"记录极小值技术信号: {technical_signal}")
-                            
-                    else:
-                        self._log.info(f"从{time_str}到当前时间中未找到极小值")
                 
-                break
+                # 记录histogram值信息（已经是绝对值）
+                if max_histogram_abs > 0:
+                    self._log.info(f"从第三个交替点到当前时间点的最大histogram绝对值: {max_histogram_abs:.6f}")
+                if min_histogram_abs > 0:
+                    self._log.info(f"从第三个交替点到当前时间点的最小histogram绝对值: {min_histogram_abs:.6f}")
+                
+                # 计算成交量对比：使用前5分钟的成交量数据
+                # 计算前5分钟的平均成交量（不包括当前分钟）
+                if len(self.minute_volume_data) >= 5:
+                    # 从倒数第6个数据开始到倒数第1个数据（不包括当前）
+                    volume_start_index = len(self.minute_volume_data) - 6
+                    volume_ratio = self.calculate_volume_ratio(volume_start_index, bar)
+                else:
+                    # 如果数据不足5个，使用所有可用数据
+                    volume_ratio = self.calculate_volume_ratio(0, bar)
+                
+                # 计算动态信号强度（放弃min_trough_value，只使用histogram值）
+                base_signal = 50000  # 基础信号强度
+                
+                # 新的信号强度公式：只使用histogram值和成交量
+                signal_strength = base_signal * (max_histogram_abs + min_histogram_abs) * volume_ratio
+                
+                self.technical_signal += signal_strength
+                
+                # 构建描述信息
+                desc_parts = [f'histogram信号(成交量比值={volume_ratio:.4f})']
+                if max_histogram_abs > 0:
+                    desc_parts.append(f'从第三个交替点到当前时间点最大histogram绝对值={max_histogram_abs:.6f}')
+                if min_histogram_abs > 0:
+                    desc_parts.append(f'从第三个交替点到当前时间点最小histogram绝对值={min_histogram_abs:.6f}')
+                
+                self.technical_signal_steps.append({
+                    'description': ', '.join(desc_parts),
+                    'delta': signal_strength
+                })
+                
+                log_msg = (f"histogram信号触发: 动态信号强度={signal_strength:.1f}, 当前信号值={self.technical_signal}")
+                if max_histogram_abs > 0:
+                    log_msg += f", 从第三个交替点到当前时间点最大histogram绝对值={max_histogram_abs:.6f}"
+                if min_histogram_abs > 0:
+                    log_msg += f", 从第三个交替点到当前时间点最小histogram绝对值={min_histogram_abs:.6f}"
+                self._log.info(log_msg)
+               
+                # 记录技术指标信号
+                technical_signal = {
+                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                    'price': bar.close.as_double(),
+                    'signal_type': 'n2p',
+                    'signal_value': self.technical_signal,
+                    'max_histogram_abs': max_histogram_abs,  # 从第三个交替点到当前时间点的最大histogram值（保存绝对值）
+                    'min_histogram_abs': min_histogram_abs,  # 从第三个交替点到当前时间点的最小histogram值（保存绝对值）
+                    'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
+                    'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                    'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                    'kdj_j': self.kdj.value_j if self.kdj.initialized else None,
+                    'volume_ratio': volume_ratio
+                }
+                
+                self.technical_signals.append(technical_signal)
+                self._log.info(f"记录histogram技术信号: {technical_signal}")
+        else:
+            self._log.info("未找到三个交替点或未找到有效的histogram值，直接增加技术信号300")
+            self.technical_signal += 300
+            self.technical_signal_steps.append({
+                'description': '未找到三个交替点或未找到有效的histogram值',
+                'delta': 300
+            })
         
 
     def check_macd_rank(self, extreme_type):
@@ -1211,7 +1245,7 @@ class ETF159506Strategy(Strategy):
         current_histogram = current_dif - current_signal
         
         # 检查histogram模式
-        histogram_result = self.check_negative_positive_histogram(bar, lookback_minutes=5)
+        histogram_result = self.check_negative_positive_histogram(bar)
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
@@ -1257,8 +1291,8 @@ class ETF159506Strategy(Strategy):
                     min_dif = min(dif_values)
                     max_dif_diff = max_dif - min_dif
                     self._log.info(f"最近三个MACD极值点DIF值: {dif_values}, 最大差值: {max_dif_diff:.6f}")
-                    if max_dif_diff < 0.0005:
-                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值小于0.0005，跳过卖出信号")
+                    if max_dif_diff < 0.0002:
+                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值小于0.0002，跳过卖出信号")
                         return
                 else:
                     self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")

@@ -356,10 +356,31 @@ class ETF159506DataSaver:
             logger.debug(f"   - QuoteTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
             
             # 保存QuoteTick数据
-            self.catalog.write_data(self.quote_buffer)
-            saved_count = len(self.quote_buffer)
-            logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
-            logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
+            try:
+                self.catalog.write_data(self.quote_buffer)
+                saved_count = len(self.quote_buffer)
+                logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
+                logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
+            except AssertionError as e:
+                # ✅ 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
+                if "Intervals are not disjoint" in str(e):
+                    logger.warning(f"⚠️  QuoteTick时间间隔重叠，尝试去重后保存...")
+                    # 按时间戳去重
+                    seen_ts = set()
+                    unique_ticks = []
+                    for tick in self.quote_buffer:
+                        ts_key = (tick.ts_event, tick.ts_init)
+                        if ts_key not in seen_ts:
+                            seen_ts.add(ts_key)
+                            unique_ticks.append(tick)
+                    
+                    if unique_ticks:
+                        self.catalog.write_data(unique_ticks)
+                        logger.info(f"💾 QuoteTick去重后保存: {len(unique_ticks)} 条（去除了 {len(self.quote_buffer) - len(unique_ticks)} 条重复）")
+                    else:
+                        logger.warning("⚠️  所有QuoteTick都是重复的，跳过保存")
+                else:
+                    raise
             
             # 清空QuoteTick缓冲区
             self.quote_buffer.clear()
@@ -385,10 +406,31 @@ class ETF159506DataSaver:
             logger.debug(f"   - TradeTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
             
             # 保存TradeTick数据
-            self.catalog.write_data(self.trade_buffer)
-            saved_count = len(self.trade_buffer)
-            logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
-            logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
+            try:
+                self.catalog.write_data(self.trade_buffer)
+                saved_count = len(self.trade_buffer)
+                logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
+                logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
+            except AssertionError as e:
+                # ✅ 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
+                if "Intervals are not disjoint" in str(e):
+                    logger.warning(f"⚠️  TradeTick时间间隔重叠，尝试去重后保存...")
+                    # 按时间戳去重
+                    seen_ts = set()
+                    unique_ticks = []
+                    for tick in self.trade_buffer:
+                        ts_key = (tick.ts_event, tick.ts_init)
+                        if ts_key not in seen_ts:
+                            seen_ts.add(ts_key)
+                            unique_ticks.append(tick)
+                    
+                    if unique_ticks:
+                        self.catalog.write_data(unique_ticks)
+                        logger.info(f"💾 TradeTick去重后保存: {len(unique_ticks)} 条（去除了 {len(self.trade_buffer) - len(unique_ticks)} 条重复）")
+                    else:
+                        logger.warning("⚠️  所有TradeTick都是重复的，跳过保存")
+                else:
+                    raise
             
             # 清空TradeTick缓冲区
             self.trade_buffer.clear()
@@ -2464,13 +2506,45 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
     def _restore_order_mappings_from_cache(self) -> None:
         """从缓存中恢复订单ID映射，确保历史订单参与对账。"""
         restored = 0
+        skipped_invalid = 0
+        fixed_account_id = 0
         try:
             cached_orders = self.cache.orders()
         except Exception as exc:  # pragma: no cover - Cython 层异常
             self.logger.warning("无法从缓存恢复订单映射: %s", exc)
             return
 
+        # ✅ 获取当前执行客户端的 account_id（用于修复旧订单）
+        current_account_id = getattr(self, "account_id", None)
+        
         for order in cached_orders:
+            account_id = getattr(order, "account_id", None)
+            
+            # ✅ 如果 account_id 为 None，尝试使用当前执行客户端的 account_id
+            # 这通常发生在：旧版本代码创建的订单被缓存，重启后恢复时 account_id 缺失
+            if account_id is None:
+                if current_account_id:
+                    # 尝试修复：使用当前 account_id（假设是同一个账户）
+                    try:
+                        # 注意：这里不能直接修改缓存的订单对象，但可以记录映射
+                        # 实际修复需要在执行引擎层面处理，这里只记录日志
+                        skipped_invalid += 1
+                        self.logger.warning(
+                            f"⚠️  发现 account_id 为 None 的旧订单: {getattr(order, 'client_order_id', 'Unknown')}, "
+                            f"当前 account_id={current_account_id}。"
+                            f"该订单将跳过对账，建议清理 Redis 缓存中的旧订单数据。"
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"处理旧订单时出错: {e}")
+                        skipped_invalid += 1
+                else:
+                    skipped_invalid += 1
+                    self.logger.warning(
+                        f"⚠️  发现 account_id 为 None 的订单，且当前执行客户端 account_id 也未设置: "
+                        f"{getattr(order, 'client_order_id', 'Unknown')}"
+                    )
+                continue
+            
             client_order_id_obj = getattr(order, "client_order_id", None)
             venue_order_id_obj = getattr(order, "venue_order_id", None)
 
@@ -2499,6 +2573,17 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             if getattr(order, "is_closed", False):
                 self._archive_order_mapping(client_order_id, venue_order_id)
 
+        if skipped_invalid > 0:
+            self.logger.warning(
+                f"⚠️  跳过了 {skipped_invalid} 个无效订单（account_id 为 None）\n"
+                f"   这些订单可能是旧版本代码创建的，重启后从 Redis 缓存恢复时 account_id 缺失。\n"
+                f"   建议清理 Redis 缓存中的旧订单数据：\n"
+                f"   1. 停止交易系统\n"
+                f"   2. 连接 Redis: redis-cli\n"
+                f"   3. 删除订单缓存: DEL ETF159506-LIVE-001:cache:orders:*\n"
+                f"   4. 或者清空整个缓存: FLUSHDB（谨慎使用，会删除所有数据）\n"
+                f"   5. 重启系统，新订单将正确设置 account_id"
+            )
         if restored:
             self.logger.info("🔄 从缓存恢复 %d 个订单ID映射", restored)
             self._mark_reconciliation_required()
@@ -3903,12 +3988,35 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
             
             logger.info(f"生成持仓状态报告: {command}")
             
+            # ✅ 先检查缓存中的持仓，用于诊断
+            try:
+                cached_positions = self._cache.positions(instrument_id=InstrumentId.from_str("159506.SZSE"))
+                if cached_positions:
+                    for pos in cached_positions:
+                        logger.info(
+                            f"📊 缓存中的持仓: {pos.id}, "
+                            f"数量={pos.quantity}, side={pos.side}, "
+                            f"is_open={pos.is_open}"
+                        )
+            except Exception as e:
+                logger.debug(f"检查缓存持仓时出错: {e}")
+            
             # 查询持仓信息
             account_info = await self._check_positions()
-            if not account_info or not account_info.get('hold_list'):
-                logger.info("没有持仓")
-                if account_info:
-                    self._apply_account_info_to_cache(account_info)
+            if not account_info:
+                logger.warning("⚠️  查询持仓信息失败，返回空列表")
+                self._pending_position_sync = False
+                return []
+            
+            hold_list = account_info.get('hold_list', [])
+            logger.info(f"📊 券商返回持仓列表: {len(hold_list)} 个")
+            for pos in hold_list:
+                logger.info(f"   - {pos.get('code')}: {pos.get('hold_vol')} 股")
+            
+            if not hold_list:
+                logger.info("券商返回的持仓列表为空")
+                # ✅ 即使没有持仓，也要同步账户余额
+                self._apply_account_info_to_cache(account_info)
                 self._pending_position_sync = False
                 return []
             
