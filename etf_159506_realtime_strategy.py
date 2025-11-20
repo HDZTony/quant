@@ -915,7 +915,7 @@ class ETF159506Strategy(Strategy):
                     volume_ratio = self.calculate_volume_ratio(0, bar)
                 
                 # 计算动态信号强度（放弃min_trough_value，只使用histogram值）
-                base_signal = 50000  # 基础信号强度
+                base_signal = 60000  # 基础信号强度
                 
                 # 新的信号强度公式：只使用histogram值和成交量
                 signal_strength = base_signal * (max_histogram_abs + min_histogram_abs) * volume_ratio
@@ -1237,7 +1237,7 @@ class ETF159506Strategy(Strategy):
             return
         
         current_dif = self.dif_history[-1]
-        previous_macd = self.dif_history[-2]
+        previous_dif = self.dif_history[-2]
         current_signal = self.signal_history[-1]
         previous_signal = self.signal_history[-2]
         
@@ -1249,7 +1249,7 @@ class ETF159506Strategy(Strategy):
         
         
         # 检查DIF<0且前五个DIF都是单调递减的情况
-        if current_dif < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
+        if previous_dif > 0 and current_dif < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
             # 获取前5个DIF值（不包括当前值）
             last_five_dif = list(self.dif_history)[-6:-1]  # 前5个值
             
@@ -1273,15 +1273,37 @@ class ETF159506Strategy(Strategy):
                 else:
                     self._log.info(f"最后一个交易是{last_signal.get('side')}，允许卖出操作")
             
+            # 计算过去5个histogram的平均值（有几个算几个）
+            avg_histogram = 0
+            last_histogram_values = []
+            histogram_count = 0
+            if len(self.histogram_history) > 0:
+                # 取最多5个，有几个算几个
+                histogram_count = min(len(self.histogram_history), 5)
+                last_histogram_values = list(self.histogram_history)[-histogram_count:]
+                avg_histogram = sum(last_histogram_values) / len(last_histogram_values)
+            else:
+                self._log.info(f"Histogram历史数据为空，无法计算平均值")
+            
             # 添加调试日志
             self._log.info(f"DIF单调递减检查: 前5个DIF值={last_five_dif}, 当前DIF={current_dif}, 是否单调递减={is_monotonic_decreasing}")
+            if last_histogram_values:
+                self._log.info(f"Histogram平均值检查: 过去{histogram_count}个histogram值={last_histogram_values}, 平均值={avg_histogram:.6f}")
             self._log.info(f"卖出操作检查: 当前时间={current_timestamp}, 是否有卖出操作={has_sell_operation}")
             
-            # 如果前5个DIF单调递减且当前DIF<0且最后一个交易不是SELL，添加卖出信号
-            if is_monotonic_decreasing and not has_sell_operation:
-                self._log.info(f"检测到DIF<0且前5个DIF单调递减且最后一个交易不是SELL")
+            # 如果(前5个DIF单调递减 或 过去N个histogram平均值<0.002)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
+            condition_met = is_monotonic_decreasing or avg_histogram < -0.002
+            if condition_met and not has_sell_operation:
+                condition_desc = []
+                if is_monotonic_decreasing:
+                    condition_desc.append("前5个DIF单调递减")
+                if avg_histogram < -0.002:
+                    condition_desc.append(f"过去{histogram_count}个histogram平均值<0.002(实际={avg_histogram:.6f})")
+                self._log.info(f"检测到DIF<0且({'或'.join(condition_desc)})且最后一个交易不是SELL")
                 self._log.info(f"前5个DIF值: {last_five_dif}")
                 self._log.info(f"当前DIF值: {current_dif}")
+                if last_histogram_values:
+                    self._log.info(f"过去{histogram_count}个histogram值: {last_histogram_values}, 平均值: {avg_histogram:.6f}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
                 # 计算最近三个MACD极值点的DIF值及其最大差值
                 if len(self.macd_extremes_history) >= 3:
@@ -1303,8 +1325,9 @@ class ETF159506Strategy(Strategy):
                 # 不再直接卖出，而是给 technical_signal 减 300
                 dif_decreasing_contribution = -300
                 self.technical_signal += dif_decreasing_contribution
+                description = f'DIF<0且({"或".join(condition_desc)})(固定贡献=-300)'
                 self.technical_signal_steps.append({
-                    'description': f'DIF<0且前五个DIF都是单调递减(固定贡献=-300)',
+                    'description': description,
                     'delta': dif_decreasing_contribution
                 })
                 self._log.info(f"DIF单调递减卖出信号：减少信号值 {dif_decreasing_contribution}，当前信号值={self.technical_signal:.2f}")
@@ -1313,10 +1336,10 @@ class ETF159506Strategy(Strategy):
         
         
         # 检测金叉：MACD线从下方向上穿越信号线
-        golden_cross = (previous_macd < previous_signal and current_dif > current_signal)
+        golden_cross = (previous_dif < previous_signal and current_dif > current_signal)
         
         # 检测死叉：MACD线从上方向下穿越信号线
-        death_cross = (previous_macd > previous_signal and current_dif < current_signal)
+        death_cross = (previous_dif > previous_signal and current_dif < current_signal)
         
         # 检查MACD值是否足够大（过滤小波动）
         macd_threshold = abs(self.divergence_threshold)

@@ -3982,15 +3982,19 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
         查询持仓信息，生成持仓状态报告
         """
         try:
-            if not self._pending_position_sync:
-                logger.debug("跳过持仓对账，本轮无需访问券商持仓接口")
-                return []
-            
             logger.info(f"生成持仓状态报告: {command}")
             
-            # ✅ 先检查缓存中的持仓，用于诊断
+            # ✅ 先检查缓存中的持仓
+            cached_positions = []
             try:
-                cached_positions = self._cache.positions(instrument_id=InstrumentId.from_str("159506.SZSE"))
+                # 如果指定了instrument_id，只查询该instrument的持仓
+                if command.instrument_id:
+                    cached_positions = self._cache.positions(instrument_id=command.instrument_id)
+                else:
+                    # 如果没有指定，查询159506.SZSE的持仓（当前唯一交易的标的）
+                    instrument_id = InstrumentId.from_str("159506.SZSE")
+                    cached_positions = self._cache.positions(instrument_id=instrument_id)
+                
                 if cached_positions:
                     for pos in cached_positions:
                         logger.info(
@@ -4000,6 +4004,35 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                         )
             except Exception as e:
                 logger.debug(f"检查缓存持仓时出错: {e}")
+            
+            # ✅ 如果 _pending_position_sync 为 False，基于缓存返回持仓报告（不调用API）
+            if not self._pending_position_sync:
+                if cached_positions:
+                    logger.debug("跳过券商接口查询，基于缓存生成持仓报告以减少API调用")
+                    position_reports = []
+                    for cached_pos in cached_positions:
+                        if cached_pos.is_open and cached_pos.quantity > 0:
+                            report = PositionStatusReport(
+                                account_id=self.account_id,
+                                instrument_id=cached_pos.instrument_id,
+                                position_side=cached_pos.side,
+                                quantity=cached_pos.quantity,
+                                report_id=UUID4(),
+                                ts_last=self._clock.timestamp_ns(),
+                                ts_init=self._clock.timestamp_ns(),
+                                venue_position_id=cached_pos.id,
+                                avg_px_open=cached_pos.avg_px_open,
+                            )
+                            position_reports.append(report)
+                            logger.debug(
+                                f"基于缓存生成持仓报告: {cached_pos.instrument_id} "
+                                f"持仓量={cached_pos.quantity}, venue_position_id={cached_pos.id}"
+                            )
+                    logger.info(f"✅ 基于缓存生成了 {len(position_reports)} 个持仓报告（未调用API）")
+                    return position_reports
+                else:
+                    logger.debug("跳过持仓对账，本轮无需访问券商持仓接口，且缓存中无持仓")
+                    return []
             
             # 查询持仓信息
             account_info = await self._check_positions()
