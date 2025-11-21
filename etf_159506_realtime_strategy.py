@@ -1247,18 +1247,38 @@ class ETF159506Strategy(Strategy):
         # 检查histogram模式
         histogram_result = self.check_negative_positive_histogram(bar)
         
-        
-        # 检查DIF<0且前五个DIF都是单调递减的情况
-        if previous_dif > 0 and current_dif < 0 and len(self.dif_history) >= 6 and current_histogram < 0:
-            # 获取前5个DIF值（不包括当前值）
-            last_five_dif = list(self.dif_history)[-6:-1]  # 前5个值
-            
-            # 检查是否单调递减（从历史到当前，即从旧到新）
-            is_monotonic_decreasing = True
-            for i in range(len(last_five_dif) - 1):
-                if last_five_dif[i] < last_five_dif[i + 1]:  # 如果从历史到当前不是递减（即后面的值比前面的大）
-                    is_monotonic_decreasing = False
-                    break
+        if len(self.dif_history) < 5 and current_dif < 0:
+            #如果开盘前5分钟，dif就小于0，则直接卖出
+            dif_decreasing_contribution = -300
+            self.technical_signal += dif_decreasing_contribution
+            description = f'DIF<0且开盘前5分钟(固定贡献=-300)'
+            self.technical_signal_steps.append({
+                'description': description,
+                'delta': dif_decreasing_contribution
+            })
+            self._log.info(f"如果开盘前5分钟，dif就小于0，则直接卖出")
+            return
+        elif previous_dif > 0 and current_dif < 0 and current_histogram < 0:
+            # 获取前N个DIF值（不包括当前值），最多5个，有几个算几个
+            dif_count = min(len(self.dif_history) - 1, 5)  # 不包括当前值，最多5个
+            if dif_count >= 1:
+                # 从历史中取前N个值（不包括当前值）
+                last_dif_values = list(self.dif_history)[-(dif_count + 1):-1]  # 前N个值
+                
+                # 检查是否单调递减（从历史到当前，即从旧到新）
+                is_monotonic_decreasing = True
+                if len(last_dif_values) >= 2:  # 至少需要2个值才能判断单调性
+                    for i in range(len(last_dif_values) - 1):
+                        if last_dif_values[i] < last_dif_values[i + 1]:  # 如果从历史到当前不是递减（即后面的值比前面的大）
+                            is_monotonic_decreasing = False
+                            break
+                else:
+                    # 只有1个值，数据不足，算作递减
+                    is_monotonic_decreasing = True
+            else:
+                # 没有足够的前值，数据不足，算作递减
+                is_monotonic_decreasing = True
+                last_dif_values = []
             
             # 检查前5分钟内是否有卖出操作（只检查最后一个卖出交易）
             has_sell_operation = False
@@ -1286,21 +1306,25 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"Histogram历史数据为空，无法计算平均值")
             
             # 添加调试日志
-            self._log.info(f"DIF单调递减检查: 前5个DIF值={last_five_dif}, 当前DIF={current_dif}, 是否单调递减={is_monotonic_decreasing}")
+            if dif_count >= 1 and last_dif_values:
+                self._log.info(f"DIF单调递减检查: 前{dif_count}个DIF值={last_dif_values}, 当前DIF={current_dif}, 是否单调递减={is_monotonic_decreasing}")
+            else:
+                self._log.info(f"DIF单调递减检查: 历史数据不足，无法判断单调性，当前DIF={current_dif}")
             if last_histogram_values:
                 self._log.info(f"Histogram平均值检查: 过去{histogram_count}个histogram值={last_histogram_values}, 平均值={avg_histogram:.6f}")
             self._log.info(f"卖出操作检查: 当前时间={current_timestamp}, 是否有卖出操作={has_sell_operation}")
             
-            # 如果(前5个DIF单调递减 或 过去N个histogram平均值<0.002)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
+            # 如果(前N个DIF单调递减 或 过去N个histogram平均值<-0.002)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
             condition_met = is_monotonic_decreasing or avg_histogram < -0.002
             if condition_met and not has_sell_operation:
                 condition_desc = []
                 if is_monotonic_decreasing:
-                    condition_desc.append("前5个DIF单调递减")
+                    condition_desc.append(f"前{dif_count}个DIF单调递减")
                 if avg_histogram < -0.002:
-                    condition_desc.append(f"过去{histogram_count}个histogram平均值<0.002(实际={avg_histogram:.6f})")
+                    condition_desc.append(f"过去{histogram_count}个histogram平均值<-0.002(实际={avg_histogram:.6f})")
                 self._log.info(f"检测到DIF<0且({'或'.join(condition_desc)})且最后一个交易不是SELL")
-                self._log.info(f"前5个DIF值: {last_five_dif}")
+                if last_dif_values:
+                    self._log.info(f"前{dif_count}个DIF值: {last_dif_values}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 if last_histogram_values:
                     self._log.info(f"过去{histogram_count}个histogram值: {last_histogram_values}, 平均值: {avg_histogram:.6f}")
