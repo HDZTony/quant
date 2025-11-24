@@ -165,7 +165,7 @@ class ETF159506LiveTradingSystem:
             exec_engine_config = LiveExecEngineConfig(
                 # === 启动对账配置 ===
                 reconciliation=True,  # 启用对账，启动时同步交易所状态到缓存
-                reconciliation_lookback_mins=1440,  # 对账回溯24小时（官方建议不设置None使用最大历史，但24小时更安全）
+                reconciliation_lookback_mins=10080,  # 对账回溯7天（10080分钟），以便找到更久之前的fills来调整持仓差异
                 reconciliation_instrument_ids=[instrument.id],  # ✅ 关键：指定需要对账的工具
                 reconciliation_startup_delay_secs=5.0,  # 启动对账完成后等待5秒再开始连续对账
                 
@@ -183,7 +183,7 @@ class ETF159506LiveTradingSystem:
                 
                 # 持仓检查
                 position_check_interval_secs=30.0,  # ✅ 每30秒检查持仓差异（仅在标记时触发）
-                position_check_lookback_mins=60,  # 持仓差异时查询最近60分钟的成交
+                position_check_lookback_mins=1440,  # 持仓差异时查询最近24小时（1440分钟）的成交
                 position_check_threshold_ms=5000,  # 持仓最后活动超过5秒才检查（防止竞争条件）
                 
                 # === 订单飞行中检查 ===

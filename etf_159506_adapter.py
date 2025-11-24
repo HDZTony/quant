@@ -4084,14 +4084,26 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                             # 找到匹配的持仓（LONG 且数量相近）
                             for cached_pos in cached_positions:
                                 if cached_pos.side == PositionSide.LONG and cached_pos.is_open:
-                                    venue_position_id = cached_pos.id
                                     # 优先使用缓存中的 avg_px_open（更准确）
                                     if cached_pos.avg_px_open:
                                         avg_px_open = cached_pos.avg_px_open
-                                    logger.info(
-                                        f"✅ 从缓存找到现有持仓: {venue_position_id}, "
-                                        f"数量={cached_pos.quantity}, avg_px_open={avg_px_open}"
-                                    )
+                                    
+                                    # ✅ 检测持仓差异：以券商API返回为准
+                                    cached_qty = int(cached_pos.quantity)
+                                    if cached_qty != hold_vol:
+                                        logger.warning(
+                                            f"⚠️  持仓差异检测: 缓存持仓={cached_qty}股, "
+                                            f"券商持仓={hold_vol}股, 差异={hold_vol - cached_qty}股. "
+                                            f"将以券商API返回的数量({hold_vol}股)为准，不设置venue_position_id让ExecEngine自动调整"
+                                        )
+                                        # ✅ 不设置venue_position_id，让ExecEngine使用券商数量创建新持仓或调整现有持仓
+                                        venue_position_id = None
+                                    else:
+                                        venue_position_id = cached_pos.id
+                                        logger.info(
+                                            f"✅ 从缓存找到现有持仓: {venue_position_id}, "
+                                            f"数量={cached_pos.quantity}, avg_px_open={avg_px_open}"
+                                        )
                                     break
                     except Exception as e:
                         logger.debug(f"查找缓存持仓时出错（将创建新持仓）: {e}")
