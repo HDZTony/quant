@@ -12,7 +12,7 @@ from nautilus_trader.indicators.momentum import RelativeStrengthIndex
 from nautilus_trader.indicators.averages import ExponentialMovingAverage
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Position
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderSide, OrderType
 from nautilus_trader.model.enums import PositionSide
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.events import PositionOpened, PositionChanged, PositionClosed, OrderFilled
@@ -636,6 +636,12 @@ class ETF159506Strategy(Strategy):
     def on_bar(self, bar: Bar):
         """处理K线数据"""
         # 注意：self.macd, self.kdj, self.rsi 已通过注册自动更新
+
+        # 🆕 每分钟开始先检查并自动处理未成交订单（按当前价格跟价重挂）
+        try:
+            self._refresh_open_orders(bar)
+        except Exception as e:
+            self._log.warning(f"自动刷新未成交订单失败（忽略并继续处理K线）: {e}")
         
         # 手动更新级联指标：MACD信号线（DEA）
         # 原因：self.macd_signal 需要 DIF 值作为输入，无法直接注册到 bar
@@ -690,6 +696,82 @@ class ETF159506Strategy(Strategy):
         # ✅ 更新实时图表（同步执行，保证与其他图一致）
         self.update_realtime_charts(last_bar)
         self.technical_signal = 0
+    
+    def _refresh_open_orders(self, bar: Bar) -> None:
+        """在每分钟开始时自动处理未成交订单：按当前价格撤单重下。
+        
+        逻辑：
+        1. 只处理当前标的 instrument_id 的限价单。
+        2. 使用当前 bar 的收盘价作为基准价（买单+tick，卖单-tick）。
+        3. 如果新价和旧价差距很小，则不改价，避免频繁撤单。
+        4. 撤销旧订单，再以相同数量、方向、标签重下新单（增加 'AUTO_REFRESH' 标记）。
+        """
+        instrument_id = self.config.instrument_id
+        
+        # 从 Portfolio 获取当前标的的所有未成交订单
+        try:
+            open_orders = self.portfolio.open_orders(instrument_id)
+        except Exception as e:
+            self._log.warning(f"获取未成交订单失败，跳过自动改价: {e}")
+            return
+        
+        if not open_orders:
+            # self._log.info("本分钟无未成交订单，无需自动改价")
+            return
+        
+        last_price = bar.close.as_double()
+        # 价格调整步长：固定使用 0.001，与核心买入/卖出逻辑保持一致
+        tick_value = 0.001
+        
+        self._log.info(f"本分钟检测到 {len(open_orders)} 个未成交订单，开始自动改价，当前价={last_price:.3f}")
+        
+        for order in open_orders:
+            try:
+                # 只处理限价单
+                if order.order_type is not OrderType.LIMIT:
+                    continue
+                
+                old_price = order.price.as_double()
+                side = order.side
+                qty = order.quantity
+                
+                # 计算新的跟价：在当前价格基础上 ±0.001
+                if side is OrderSide.BUY:
+                    new_price_value = last_price + tick_value
+                else:
+                    new_price_value = last_price - tick_value
+                
+                # 如果新价和旧价差别太小，跳过
+                if abs(new_price_value - old_price) < tick_value / 2:
+                    continue
+                
+                new_price = self.instrument.make_price(new_price_value)
+                
+                self._log.info(
+                    f"自动跟价: 取消旧订单 {order.client_order_id}, "
+                    f"{'BUY' if side is OrderSide.BUY else 'SELL'} {int(qty)} @ {old_price:.3f} -> {new_price_value:.3f}"
+                )
+                
+                # 1）取消旧订单
+                self.cancel_order(order.client_order_id)
+                
+                # 2）以同样数量、方向、标签重下一个新单，加上 AUTO_REFRESH 标记
+                new_tags = list(order.tags) if order.tags else []
+                if "AUTO_REFRESH" not in new_tags:
+                    new_tags.append("AUTO_REFRESH")
+                
+                new_order = self.order_factory.limit(
+                    instrument_id=instrument_id,
+                    order_side=side,
+                    quantity=qty,
+                    price=new_price,
+                    reduce_only=order.reduce_only,
+                    tags=new_tags,
+                )
+                self.submit_order(new_order)
+            
+            except Exception as e:
+                self._log.warning(f"自动改价处理订单 {getattr(order, 'client_order_id', None)} 失败: {e}")
     def on_event(self, event: Event):
         """处理所有事件"""
         pass  # 通用事件处理，具体事件由专门方法处理
