@@ -3095,9 +3095,10 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 'ticket': self.ticket,      # 交易凭证
             }
             
-            logger.info("查询持仓信息...")
+            logger.info("查询持仓信息... (GET /check_hold)")
             response = requests.get(url, params=params, timeout=10)
             data = response.json()
+            logger.info(f"/check_hold 原始返回数据: {data}")
             
             if data.get("code") == "0":
                 # 提取账户信息
@@ -3538,7 +3539,15 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                     
                     reports.append(report)
                     if should_log:
-                        logger.info(f"    ✅ 生成报告: {order_id} | {nautilus_side} | {nautilus_status}")
+                        logger.info(
+                            "    ✅ 生成报告: "
+                            f"venue_order_id={order_id}, "
+                            f"client_order_id={client_order_id_obj.value if client_order_id_obj else None}, "
+                            f"方向={nautilus_side.name}, 状态={nautilus_status.name}, "
+                            f"代码={code}, "
+                            f"委托价={order_price:.3f}, 委托量={order_volume}, "
+                            f"成交价={deal_price:.3f}, 成交量={deal_volume}"
+                        )
 
                     # ✅ 若订单处于终态，回收映射避免内存泄露
                     if nautilus_status in {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}:
@@ -3582,7 +3591,14 @@ class ETF159506NautilusExecClient(LiveExecutionClient):
                 logger.error("❌ 登录状态无效，无法提交订单")
                 # TODO: 生成订单拒绝事件通知策略
                 return
-
+            
+            # ✅ 下单前强制刷新一次账户状态（调用 /check_hold），以获取最新可用资金和持仓
+            try:
+                logger.info("下单前刷新账户状态: 调用 /check_hold 更新 total/usable/hold_list ...")
+                await self._update_account_state()
+            except Exception as e:
+                logger.warning(f"下单前刷新账户状态失败（继续尝试下单）: {e}")
+            
             # 下单前主动拉取一次交易所委托，避免下单后才对账
             await self._get_exchange_orders(use_cache=False)
             
