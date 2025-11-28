@@ -1347,14 +1347,14 @@ class ETF159506Strategy(Strategy):
                 # 从历史中取前N个值（不包括当前值）
                 last_dif_values = list(self.dif_history)[-(dif_count + 1):-1]  # 前N个值
                 
-                # 检查是否下降趋势（比较第一个值和最后一个值，允许中间波动）
+                # 检查是否单调递减（每个值都必须小于等于前一个值）
                 is_decreasing_trend = True
                 if len(last_dif_values) >= 2:  # 至少需要2个值才能判断趋势
-                    # 第一个值（最旧的）和最后一个值（最新的）比较
-                    first_value = last_dif_values[0]
-                    last_value = last_dif_values[-1]
-                    # 如果最后一个值小于第一个值，说明整体是下降趋势
-                    is_decreasing_trend = last_value < first_value
+                    # 检查是否单调递减：每个值都小于等于前一个值
+                    for i in range(1, len(last_dif_values)):
+                        if last_dif_values[i] > last_dif_values[i-1]:
+                            is_decreasing_trend = False
+                            break
                 else:
                     # 只有1个值，数据不足，算作下降趋势
                     is_decreasing_trend = True
@@ -1409,14 +1409,32 @@ class ETF159506Strategy(Strategy):
             histogram_threshold = max_histogram_abs * 0.2
             self._log.info(f"Histogram阈值计算: 历史最大值(绝对值)={max_histogram_abs:.6f}, 阈值(最大值*0.2)={histogram_threshold:.6f}, 历史数据点={len(self.histogram_history)}")
             
-            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值对应的值<相对阈值)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
-            condition_met = is_decreasing_trend or max_abs_histogram_value < histogram_threshold
+            # 先检查最近三个MACD极值点的DIF值及其最大差值（提前过滤）
+            if len(self.macd_extremes_history) >= 3:
+                last_three_extremes = self.macd_extremes_history[-3:]
+                dif_values = [extreme[1] for extreme in last_three_extremes]
+                max_dif = max(dif_values)
+                min_dif = min(dif_values)
+                max_dif_diff = max_dif - min_dif
+                self._log.info(f"最近三个MACD极值点DIF值: {dif_values}, 最大差值: {max_dif_diff:.6f}")
+                
+                # 使用基于价格的相对阈值（价格的0.015%）
+                current_price = bar.close.as_double()
+                dif_diff_threshold = current_price * 0.00015
+                if max_dif_diff < dif_diff_threshold:
+                    self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值({max_dif_diff:.6f})小于相对阈值({dif_diff_threshold:.6f})，跳过卖出信号")
+                    return
+            else:
+                self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")
+            
+            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值对应的值>相对阈值)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
+            condition_met = is_decreasing_trend or max_abs_histogram_value > histogram_threshold
             if condition_met and not has_sell_operation:
                 condition_desc = []
                 if is_decreasing_trend:
                     condition_desc.append(f"前{dif_count}个DIF下降趋势")
-                if max_abs_histogram_value < histogram_threshold:
-                    condition_desc.append(f"过去{histogram_count}个histogram最大绝对值对应的值<相对阈值{histogram_threshold:.6f}(实际={max_abs_histogram_value:.6f}, 最大绝对值={max_abs_histogram:.6f})")
+                if max_abs_histogram_value > histogram_threshold:
+                    condition_desc.append(f"过去{histogram_count}个histogram最大绝对值对应的值>相对阈值{histogram_threshold:.6f}(实际={max_abs_histogram_value:.6f}, 最大绝对值={max_abs_histogram:.6f})")
                 self._log.info(f"检测到DIF<0且({'或'.join(condition_desc)})且最后一个交易不是SELL")
                 if last_dif_values:
                     self._log.info(f"前{dif_count}个DIF值: {last_dif_values}")
@@ -1424,23 +1442,6 @@ class ETF159506Strategy(Strategy):
                 if last_histogram_values:
                     self._log.info(f"过去{histogram_count}个histogram值: {last_histogram_values}, 最大绝对值: {max_abs_histogram:.6f}, 对应值: {max_abs_histogram_value:.6f}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
-                # 计算最近三个MACD极值点的DIF值及其最大差值
-                if len(self.macd_extremes_history) >= 3:
-                    last_three_extremes = self.macd_extremes_history[-3:]
-                    dif_values = [extreme[1] for extreme in last_three_extremes]
-                    max_dif = max(dif_values)
-                    min_dif = min(dif_values)
-                    max_dif_diff = max_dif - min_dif
-                    self._log.info(f"最近三个MACD极值点DIF值: {dif_values}, 最大差值: {max_dif_diff:.6f}")
-                    
-                    # 使用基于价格的相对阈值（价格的0.02%）
-                    current_price = bar.close.as_double()
-                    dif_diff_threshold = current_price * 0.00015
-                    if max_dif_diff < dif_diff_threshold:
-                        self._log.info(f"当前DIF和最近三个MACD极值点DIF的最大差值({max_dif_diff:.6f})小于相对阈值({dif_diff_threshold:.6f})，跳过卖出信号")
-                        return
-                else:
-                    self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")
                 # 检查当前时间是否在2:50分之后，如果是则跳过卖出信号
                 if self.is_after_scheduled_time(bar):
                     self._log.info(f"当前时间已过2:50分，跳过卖出信号")
