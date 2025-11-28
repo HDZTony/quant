@@ -711,9 +711,11 @@ class ETF159506Strategy(Strategy):
         """
         instrument_id = self.config.instrument_id
         
-        # 从 Portfolio 获取当前标的的所有未成交订单
+        # 从 Cache 获取当前标的的所有未成交订单
         try:
-            open_orders = self.portfolio.open_orders(instrument_id)
+            # 获取所有未成交订单，然后过滤出当前标的的订单
+            all_open_orders = self.cache.orders_open()
+            open_orders = [order for order in all_open_orders if order.instrument_id == instrument_id]
         except Exception as e:
             self._log.warning(f"获取未成交订单失败，跳过自动改价: {e}")
             return
