@@ -469,13 +469,12 @@ class ETF159506Strategy(Strategy):
             self._log.debug(f"处理历史K线: 时间={beijing_time_str}, 价格={data.close.as_double():.4f}, "
                         f"MACD初始化状态={self.macd.initialized}, 历史数据长度={len(self.dif_history)}")
             
-            # 如果MACD已初始化，执行信号计算（但不执行交易）
-            if self.macd.initialized:
-                # 调用统一的信号处理方法
-                self._process_technical_signals(data, beijing_time_str, is_historical=True)
-                
-                # 历史数据处理：信号归零但不执行交易
-                self.technical_signal = 0
+            
+            # 调用统一的信号处理方法
+            self._process_technical_signals(data, beijing_time_str, is_historical=True)
+            
+            # 历史数据处理：信号归零但不执行交易
+            self.technical_signal = 0
             # self.update_realtime_charts(self.last_bar)
 
     def _process_bar(self, bar: Bar):
@@ -1334,6 +1333,13 @@ class ETF159506Strategy(Strategy):
         # 检查histogram模式
         histogram_result = self.check_negative_positive_histogram(bar)
         
+        # 添加调试日志：显示DIF从正到负的条件检查
+        self._log.info(f"DIF条件检查: previous_dif={previous_dif:.6f}, current_dif={current_dif:.6f}, current_histogram={current_histogram:.6f}, dif_history长度={len(self.dif_history)}")
+        
+        # 检查是否满足DIF从正到负的条件
+        dif_positive_to_negative = previous_dif > 0 and current_dif < 0 and current_histogram < 0
+        self._log.info(f"DIF从正到负条件检查: previous_dif>0={previous_dif > 0}, current_dif<0={current_dif < 0}, current_histogram<0={current_histogram < 0}, 全部满足={dif_positive_to_negative}")
+        
         if len(self.dif_history) < 5 and current_dif < 0:
             #如果开盘前5分钟，dif就小于0，则直接卖出
             dif_decreasing_contribution = -300
@@ -1346,6 +1352,7 @@ class ETF159506Strategy(Strategy):
             self._log.info(f"如果开盘前5分钟，dif就小于0，则直接卖出")
             return
         elif previous_dif > 0 and current_dif < 0 and current_histogram < 0:
+            self._log.info(f"✅ 进入DIF从正到负分支: previous_dif={previous_dif:.6f} > 0, current_dif={current_dif:.6f} < 0, current_histogram={current_histogram:.6f} < 0")
             # 获取前N个DIF值（不包括当前值），最多5个，有几个算几个
             dif_count = min(len(self.dif_history) - 1, 5)  # 不包括当前值，最多5个
             if dif_count >= 1:
@@ -1383,7 +1390,7 @@ class ETF159506Strategy(Strategy):
             
             # 计算过去5个histogram值的最大绝对值（有几个算几个）
             max_abs_histogram = 0
-            max_abs_histogram_value = 0
+            max_histogram_value = 0
             last_histogram_values = []
             histogram_count = 0
             if len(self.histogram_history) > 0:
@@ -1395,7 +1402,7 @@ class ETF159506Strategy(Strategy):
                 max_abs_histogram = max(abs_values)
                 # 找到对应的原始值（保持符号）
                 max_abs_idx = abs_values.index(max_abs_histogram)
-                max_abs_histogram_value = last_histogram_values[max_abs_idx]
+                max_histogram_value = last_histogram_values[max_abs_idx]
             else:
                 self._log.info(f"Histogram历史数据为空，无法计算最大绝对值")
             
@@ -1405,7 +1412,7 @@ class ETF159506Strategy(Strategy):
             else:
                 self._log.info(f"DIF下降趋势检查: 历史数据不足，无法判断趋势，当前DIF={current_dif}")
             if last_histogram_values:
-                self._log.info(f"Histogram最大绝对值检查: 过去{histogram_count}个histogram值={last_histogram_values}, 最大绝对值={max_abs_histogram:.6f}, 对应值={max_abs_histogram_value:.6f}")
+                self._log.info(f"Histogram最大绝对值检查: 过去{histogram_count}个histogram值={last_histogram_values}, 最大绝对值={max_abs_histogram:.6f}, 对应值={max_histogram_value:.6f}")
             self._log.info(f"卖出操作检查: 当前时间={current_timestamp}, 是否有卖出操作={has_sell_operation}")
             
             # 计算基于histogram历史最大值的阈值
@@ -1461,14 +1468,14 @@ class ETF159506Strategy(Strategy):
                 price_diff_condition = True
                 self._log.info(f"价格差值检查: 历史交易价格不足({len(self.trade_prices_history)}个)，跳过判断视为满足条件")
             
-            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值对应的值>相对阈值)且当前价格与过去两次交易价格差值>0.03且当前DIF<0且最后一个交易不是SELL，添加卖出信号
-            condition_met = (is_decreasing_trend or max_abs_histogram_value > histogram_threshold) and price_diff_condition
+            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值>相对阈值)且当前价格与过去两次交易价格差值>0.03且当前DIF<0且最后一个交易不是SELL，添加卖出信号
+            condition_met = (is_decreasing_trend or max_abs_histogram > histogram_threshold) and price_diff_condition
             if condition_met and not has_sell_operation:
                 condition_desc = []
                 if is_decreasing_trend:
                     condition_desc.append(f"前{dif_count}个DIF下降趋势")
-                if max_abs_histogram_value > histogram_threshold:
-                    condition_desc.append(f"过去{histogram_count}个histogram最大绝对值对应的值>相对阈值{histogram_threshold:.6f}(实际={max_abs_histogram_value:.6f}, 最大绝对值={max_abs_histogram:.6f})")
+                if max_abs_histogram > histogram_threshold:
+                    condition_desc.append(f"过去{histogram_count}个histogram最大绝对值>相对阈值{histogram_threshold:.6f}(实际绝对值={max_abs_histogram:.6f}, 对应值={max_histogram_value:.6f})")
                 if price_diff_condition:
                     if len(self.trade_prices_history) >= 3:
                         condition_desc.append(f"当前价格与过去三次交易价格差值>0.03(当前={bar.close.as_double():.4f}, 最近三次=[{self.trade_prices_history[-3]:.4f}, {self.trade_prices_history[-2]:.4f}, {self.trade_prices_history[-1]:.4f}])")
@@ -1481,7 +1488,7 @@ class ETF159506Strategy(Strategy):
                     self._log.info(f"前{dif_count}个DIF值: {last_dif_values}")
                 self._log.info(f"当前DIF值: {current_dif}")
                 if last_histogram_values:
-                    self._log.info(f"过去{histogram_count}个histogram值: {last_histogram_values}, 最大绝对值: {max_abs_histogram:.6f}, 对应值: {max_abs_histogram_value:.6f}")
+                    self._log.info(f"过去{histogram_count}个histogram值: {last_histogram_values}, 最大绝对值: {max_abs_histogram:.6f}, 对应值: {max_histogram_value:.6f}")
                 self._log.info(f"前5个DIF期间是否有卖出操作: {has_sell_operation}")
                 # 检查当前时间是否在2:50分之后，如果是则跳过卖出信号
                 if self.is_after_scheduled_time(bar):
@@ -1498,6 +1505,24 @@ class ETF159506Strategy(Strategy):
                 self._log.info(f"DIF下降趋势卖出信号：减少信号值 {dif_decreasing_contribution}，当前信号值={self.technical_signal:.2f}")
                 
                 return
+            else:
+                # 条件不满足，记录原因
+                if not (is_decreasing_trend or max_abs_histogram > histogram_threshold):
+                    self._log.info(f"❌ DIF从正到负但条件不满足: is_decreasing_trend={is_decreasing_trend}, max_abs_histogram={max_abs_histogram:.6f} <= histogram_threshold={histogram_threshold:.6f}")
+                if not price_diff_condition:
+                    self._log.info(f"❌ DIF从正到负但价格差值条件不满足: price_diff_condition={price_diff_condition}")
+                if has_sell_operation:
+                    self._log.info(f"❌ DIF从正到负但最后一个交易是SELL，阻止卖出操作")
+        else:
+            # 如果DIF从正到负的条件不满足，记录原因
+            if previous_dif > 0 and current_dif < 0:
+                # DIF确实从正到负了，但histogram条件不满足
+                if current_histogram >= 0:
+                    self._log.info(f"❌ DIF从正到负但histogram条件不满足: current_histogram={current_histogram:.6f} >= 0")
+            elif previous_dif <= 0:
+                self._log.debug(f"DIF从正到负条件不满足: previous_dif={previous_dif:.6f} <= 0")
+            elif current_dif >= 0:
+                self._log.debug(f"DIF从正到负条件不满足: current_dif={current_dif:.6f} >= 0")
         
         
         # 检测金叉：MACD线从下方向上穿越信号线
