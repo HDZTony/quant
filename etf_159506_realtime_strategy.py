@@ -1206,6 +1206,15 @@ class ETF159506Strategy(Strategy):
                     })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI=未初始化")
+                    rsi_contribution = top_signal_contribution
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'顶部信号RSI未初始化(贡献={rsi_contribution:.2f})',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"顶部信号RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
 
                 # 检查KDJ条件
                 # 计算KDJ三个值的最大差值
@@ -1280,6 +1289,15 @@ class ETF159506Strategy(Strategy):
                     })
                     self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
                     self._log.info(f"RSI技术信号: {self.technical_signal:.2f}")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI=未初始化")
+                    rsi_contribution = bottom_signal_contribution
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'底部信号RSI未初始化(贡献={rsi_contribution:.2f})',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"底部信号RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
 
                 # 检查KDJ条件
                 # 计算KDJ三个值的最大差值
@@ -1569,31 +1587,51 @@ class ETF159506Strategy(Strategy):
                 })
                 self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
             else:
-                rsi_status = f"{self.rsi.value * 100:.2f}" if self.rsi.initialized else "未初始化"
-                self._log.info(f"RSI条件不满足：RSI={rsi_status}")
-
-            # 检查KDJ条件
-            # 计算KDJ三个值的最大差值
-            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
-            kdj_max_diff = max(kdj_values) - min(kdj_values)
+                self._log.info(f"RSI条件不满足：RSI=未初始化")
+                rsi_contribution = macd_contribution
+                self.technical_signal += rsi_contribution
+                self.technical_signal_steps.append({
+                    'description': f'金叉RSI未初始化(贡献={rsi_contribution:.2f})',
+                    'delta': rsi_contribution
+                })
+                self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
             
-            # 检查KDJ三个值是否都小于20（超卖条件）
-            kdj_oversold = all(val < 25 for val in kdj_values)
-            
-            self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
-            self._log.info(f"KDJ最大差值={kdj_max_diff:.2f}, 超卖状态={kdj_oversold}")
-            
-            # 如果KDJ三个值最大差值小于10且都小于20，增强信号
-            if kdj_max_diff < 20 and kdj_oversold:
-                kdj_contribution = 40-kdj_max_diff
+            # KDJ平滑贡献计算（无条件跳变）
+            if self.kdj.initialized:
+                # 计算KDJ三个值的最大差值和均值
+                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                kdj_max_diff = max(kdj_values) - min(kdj_values)
+                kdj_avg = sum(kdj_values) / 3
+                
+                # 计算两个独立因子
+                oversold_factor = max(0, 40 - kdj_avg)  # 超卖程度 [0, 40]
+                convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
+                
+                # 线性加权：强调超卖（权重 0.8），弱化粘合（权重 0.4）
+                # 最大贡献 = 0.8 * 40 + 0.4 * 20 = 40
+                kdj_contribution = 0.8 * oversold_factor + 0.4 * convergence_factor
+                
+                self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
+                self._log.info(f"超卖因子={oversold_factor:.2f}(×0.8), 粘合因子={convergence_factor:.2f}(×0.4), 总贡献={kdj_contribution:.2f}")
+                
+                # 只要有贡献就记录（平滑过渡，无条件跳变）
+                if kdj_contribution > 0:
+                    self.technical_signal += kdj_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'KDJ调整(均值={kdj_avg:.2f}, 差值={kdj_max_diff:.2f}, 贡献={kdj_contribution:.2f})',
+                        'delta': kdj_contribution
+                    })
+            else:
+                # KDJ未初始化，使用MACD贡献替代
+                self._log.info(f"KDJ条件不满足：KDJ=未初始化")
+                kdj_contribution = macd_contribution
                 self.technical_signal += kdj_contribution
                 self.technical_signal_steps.append({
-                    'description': f'KDJ调整(最大差值={kdj_max_diff:.2f}, 超卖, 贡献=40-差值)',
+                    'description': f'金叉KDJ未初始化(贡献={kdj_contribution:.2f})',
                     'delta': kdj_contribution
                 })
-                self._log.info("KDJ条件满足：最大差值<20且超卖，增强买入信号")
-            else:
-                self._log.info("KDJ条件不满足，使用标准信号")
+                self._log.info(f"金叉KDJ未初始化={kdj_contribution:.2f}, 当前信号值={self.technical_signal}")
             
             # 记录技术指标信号（金叉）
             technical_signal = {
@@ -1636,51 +1674,81 @@ class ETF159506Strategy(Strategy):
                     self.monitor_histogram_shrink = False
                     self._log.info("检测到非首个死叉，关闭MACD柱缩小监控，避免重复买入")
                 self.first_death_cross_triggered = False
-            macd_contribution = -signal_coefficient*current_dif_abs
-            self.technical_signal += macd_contribution
-            self.technical_signal_steps.append({
-                'description': f'死叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
-                'delta': macd_contribution
-            })
-            self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
+            macd_contribution = 0
+            if current_dif < 0:
+                macd_contribution = -300
+                self.technical_signal += macd_contribution
+                self.technical_signal_steps.append({
+                    'description': f'死叉DIF<0卖出信号(固定贡献=-300)',
+                    'delta': macd_contribution
+                })
+                self._log.info(f"死叉DIF<0卖出信号累积: 固定贡献=-300, 当前信号值={self.technical_signal}")
+            else:
+                macd_contribution = -signal_coefficient*current_dif_abs
+                self.technical_signal += macd_contribution
+                self.technical_signal_steps.append({
+                    'description': f'死叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
+                    'delta': macd_contribution
+                })
+                self._log.info(f"死叉卖出信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
             
             # 检查RSI条件
             if self.rsi.initialized:
                 rsi_value = self.rsi.value * 100
-                if rsi_value < 50:
-                    rsi_contribution = -rsi_value
-                    self.technical_signal += rsi_contribution
-                    self.technical_signal_steps.append({
-                        'description': f'RSI调整(RSI={rsi_value:.2f} < 50, 贡献=-RSI)',
-                        'delta': rsi_contribution
-                    })
-                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强卖出信号")
-                else:
-                    self._log.info(f"RSI条件不满足：RSI={rsi_value:.2f}")
+                rsi_contribution = -rsi_value
+                self.technical_signal += rsi_contribution
+                self.technical_signal_steps.append({
+                    'description': f'RSI调整(RSI={rsi_value:.2f} < 50, 贡献=-RSI)',
+                    'delta': rsi_contribution
+                })
+                self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强卖出信号")
+                
             else:
                 self._log.info(f"RSI条件不满足：RSI=未初始化")
-            # 检查KDJ条件
-            # 计算KDJ三个值的最大差值
-            kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
-            kdj_max_diff = max(kdj_values) - min(kdj_values)
-            
-            # 检查KDJ三个值是否都大于80（超买条件）
-            kdj_oversold = all(val > 80 for val in kdj_values)
-            
-            self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
-            self._log.info(f"KDJ最大差值={kdj_max_diff:.2f}, 超买状态={kdj_oversold}")
-            
-            # 如果KDJ三个值最大差值小于10且都大于80，增强信号
-            if kdj_max_diff < 20 and kdj_oversold:
-                kdj_contribution = -(30-kdj_max_diff)
+                rsi_contribution = macd_contribution
+                self.technical_signal += rsi_contribution
+                self.technical_signal_steps.append({
+                    'description': f'RSI未初始化(贡献=-{rsi_contribution:.2f})',
+                    'delta': rsi_contribution
+                })
+                self._log.info(f"RSI未初始化=-{rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
+                
+            # KDJ平滑贡献计算（无条件跳变）- 超买信号
+            if self.kdj.initialized:
+                # 计算KDJ三个值的最大差值和均值
+                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                kdj_max_diff = max(kdj_values) - min(kdj_values)
+                kdj_avg = sum(kdj_values) / 3
+                
+                # 计算两个独立因子（超买方向）
+                overbought_factor = max(0, kdj_avg - 60)  # 超买程度 [0, 40]
+                convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
+                
+                # 线性加权：强调超买（权重 0.6），弱化粘合（权重 0.3）
+                # 最大负贡献 = -(0.6 * 40 + 0.3 * 20) = -30
+                kdj_contribution = -(0.6 * overbought_factor + 0.3 * convergence_factor)
+                
+                self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
+                self._log.info(f"超买因子={overbought_factor:.2f}(×0.6), 粘合因子={convergence_factor:.2f}(×0.3), 总贡献={kdj_contribution:.2f}")
+                
+                # 只要有负贡献就记录（平滑过渡，无条件跳变）
+                if kdj_contribution < 0:
+                    self.technical_signal += kdj_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'KDJ调整(均值={kdj_avg:.2f}, 差值={kdj_max_diff:.2f}, 贡献={kdj_contribution:.2f})',
+                        'delta': kdj_contribution
+                    })
+            else:
+                # KDJ未初始化，使用MACD贡献替代
+                self._log.info(f"KDJ条件不满足：KDJ=未初始化")
+                kdj_contribution = macd_contribution
                 self.technical_signal += kdj_contribution
                 self.technical_signal_steps.append({
-                    'description': f'KDJ调整(最大差值={kdj_max_diff:.2f}, 超买, 贡献=-(30-差值))',
+                    'description': f'死叉KDJ未初始化(贡献={kdj_contribution:.2f})',
                     'delta': kdj_contribution
                 })
-                self._log.info("KDJ条件满足：最大差值<20且超买，增强卖出信号")
-            else:
-                self._log.info("KDJ条件不满足，使用标准信号")
+                self._log.info(f"死叉KDJ未初始化={kdj_contribution:.2f}, 当前信号值={self.technical_signal}")
             # 记录技术指标信号（死叉）
             technical_signal = {
                 'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
