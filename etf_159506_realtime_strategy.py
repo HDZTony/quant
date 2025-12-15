@@ -163,6 +163,12 @@ class ETF159506Strategy(Strategy):
         self.first_death_cross_sold = False  # 标记第一个死叉已实际卖出
         self.monitor_histogram_shrink = False  # 是否开始监控柱状图缩小
         self._log.info("死叉卖出后买入监控已初始化: MACD柱连续2分钟缩小将增加+300技术信号")
+        
+        # 当日开盘价与涨跌幅记录
+        self.today_open_price: float | None = None
+        self.today_pct_change: float | None = None
+        self.today_date: date | None = None
+        self.today_pct_change_history: list[dict] = []  # [{'time': datetime, 'pct': float}]
 
     def _check_existing_positions(self):
         """
@@ -644,6 +650,22 @@ class ETF159506Strategy(Strategy):
             self._refresh_open_orders(bar)
         except Exception as e:
             self._log.warning(f"自动刷新未成交订单失败（忽略并继续处理K线）: {e}")
+        
+        # 记录开盘价并计算当日涨跌幅（使用首个bar开盘价对比当前收盘价）
+        bar_time_utc = pd.to_datetime(bar.ts_event, unit='ns')
+        bar_time_beijing = bar_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
+        if self.today_open_price is None:
+            self.today_open_price = bar.open.as_double()  # 第一个bar的开盘价
+            self.today_pct_change_history = []  # 初始化涨跌幅列表
+            self._log.info(f"开盘价记录: {self.today_open_price:.4f}")
+        if self.today_open_price:
+            current_price = bar.close.as_double()
+            self.today_pct_change = (current_price - self.today_open_price) / self.today_open_price
+            self.today_pct_change_history.append({
+                'time': bar_time_beijing,
+                'pct': self.today_pct_change,
+            })
+            self._log.info(f"今日涨跌幅: {self.today_pct_change:.4%} (当前价={current_price:.4f}, 开盘价={self.today_open_price:.4f})")
         
         # 手动更新级联指标：MACD信号线（DEA）
         # 原因：self.macd_signal 需要 DIF 值作为输入，无法直接注册到 bar
@@ -1556,100 +1578,197 @@ class ETF159506Strategy(Strategy):
         # 记录信号
         if golden_cross:
             self._log.info(f"检测到金叉信号: MACD={current_dif:.6f}, Signal={current_signal:.6f}")
-            
-            # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
-            if current_dif_abs < macd_threshold:
-                self._log.info(f"金叉信号被过滤: MACD绝对值{current_dif_abs:.6f} < 阈值{macd_threshold:.6f}")
-                return
-            
-            self.last_signal = "golden_cross"
-            
-            # 累积买入信号
-            # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
-            is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
-            signal_coefficient = 40000 if is_first_golden_cross else 20000
-            macd_contribution = signal_coefficient*current_dif_abs
-            self.technical_signal += macd_contribution
-            self.technical_signal_steps.append({
-                'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
-                'delta': macd_contribution
-            })
-            self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
+            if current_dif > 0:
+                # 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
+                if current_dif_abs < macd_threshold:
+                    self._log.info(f"金叉信号被过滤: MACD绝对值{current_dif_abs:.6f} < 阈值{macd_threshold:.6f}")
+                    return
+                
+                self.last_signal = "golden_cross"
+                
+                # 累积买入信号
+                # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
+                is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
+                signal_coefficient = 40000 if is_first_golden_cross else 20000
+                macd_contribution = signal_coefficient*current_dif_abs
+                self.technical_signal += macd_contribution
+                self.technical_signal_steps.append({
+                    'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
+                    'delta': macd_contribution
+                })
+                self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
 
-            # 检查RSI条件
-            if self.rsi.initialized:
-                rsi_value = self.rsi.value * 100
-                rsi_contribution = 50 - rsi_value
-                self.technical_signal += rsi_contribution
-                self.technical_signal_steps.append({
-                    'description': f'RSI调整(RSI={rsi_value:.2f}, 贡献=50-RSI)',
-                    'delta': rsi_contribution
-                })
-                self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
-            else:
-                self._log.info(f"RSI条件不满足：RSI=未初始化")
-                rsi_contribution = macd_contribution
-                self.technical_signal += rsi_contribution
-                self.technical_signal_steps.append({
-                    'description': f'金叉RSI未初始化(贡献={rsi_contribution:.2f})',
-                    'delta': rsi_contribution
-                })
-                self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
-            
-            # KDJ平滑贡献计算（无条件跳变）
-            if self.kdj.initialized:
-                # 计算KDJ三个值的最大差值和均值
-                kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
-                kdj_max_diff = max(kdj_values) - min(kdj_values)
-                kdj_avg = sum(kdj_values) / 3
+                # 检查RSI条件
+                if self.rsi.initialized:
+                    rsi_value = self.rsi.value * 100
+                    rsi_contribution = 50 - rsi_value
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'RSI调整(RSI={rsi_value:.2f}, 贡献=50-RSI)',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI=未初始化")
+                    rsi_contribution = macd_contribution
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'金叉RSI未初始化(贡献={rsi_contribution:.2f})',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
                 
-                # 计算两个独立因子
-                oversold_factor = max(0, 40 - kdj_avg)  # 超卖程度 [0, 40]
-                convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
-                
-                # 线性加权：强调超卖（权重 0.8），弱化粘合（权重 0.4）
-                # 最大贡献 = 0.8 * 40 + 0.4 * 20 = 40
-                kdj_contribution = 0.8 * oversold_factor + 0.4 * convergence_factor
-                
-                self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
-                self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
-                self._log.info(f"超卖因子={oversold_factor:.2f}(×0.8), 粘合因子={convergence_factor:.2f}(×0.4), 总贡献={kdj_contribution:.2f}")
-                
-                # 只要有贡献就记录（平滑过渡，无条件跳变）
-                if kdj_contribution > 0:
+                # KDJ平滑贡献计算（无条件跳变）
+                if self.kdj.initialized:
+                    # 计算KDJ三个值的最大差值和均值
+                    kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                    kdj_max_diff = max(kdj_values) - min(kdj_values)
+                    kdj_avg = sum(kdj_values) / 3
+                    
+                    # 计算两个独立因子
+                    oversold_factor = max(0, 40 - kdj_avg)  # 超卖程度 [0, 40]
+                    convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
+                    
+                    # 线性加权：强调超卖（权重 0.8），弱化粘合（权重 0.4）
+                    # 最大贡献 = 0.8 * 40 + 0.4 * 20 = 40
+                    kdj_contribution = 0.8 * oversold_factor + 0.4 * convergence_factor
+                    
+                    self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                    self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
+                    self._log.info(f"超卖因子={oversold_factor:.2f}(×0.8), 粘合因子={convergence_factor:.2f}(×0.4), 总贡献={kdj_contribution:.2f}")
+                    
+                    # 只要有贡献就记录（平滑过渡，无条件跳变）
+                    if kdj_contribution > 0:
+                        self.technical_signal += kdj_contribution
+                        self.technical_signal_steps.append({
+                            'description': f'KDJ调整(均值={kdj_avg:.2f}, 差值={kdj_max_diff:.2f}, 贡献={kdj_contribution:.2f})',
+                            'delta': kdj_contribution
+                        })
+                else:
+                    # KDJ未初始化，使用MACD贡献替代
+                    self._log.info(f"KDJ条件不满足：KDJ=未初始化")
+                    kdj_contribution = macd_contribution
                     self.technical_signal += kdj_contribution
                     self.technical_signal_steps.append({
-                        'description': f'KDJ调整(均值={kdj_avg:.2f}, 差值={kdj_max_diff:.2f}, 贡献={kdj_contribution:.2f})',
+                        'description': f'金叉KDJ未初始化(贡献={kdj_contribution:.2f})',
                         'delta': kdj_contribution
                     })
-            else:
-                # KDJ未初始化，使用MACD贡献替代
-                self._log.info(f"KDJ条件不满足：KDJ=未初始化")
-                kdj_contribution = macd_contribution
-                self.technical_signal += kdj_contribution
+                    self._log.info(f"金叉KDJ未初始化={kdj_contribution:.2f}, 当前信号值={self.technical_signal}")
+                
+                # 记录技术指标信号（金叉）
+                technical_signal = {
+                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                    'price': bar.close.as_double(),
+                    'signal_type': 'golden_cross',
+                    'signal_value': self.technical_signal,
+                    'macd_value': current_dif,
+                    'signal_value_macd': current_signal,
+                    'histogram': current_histogram,
+                    'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
+                    'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                    'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                    'kdj_j': self.kdj.value_j if self.kdj.initialized else None
+                }
+                self.technical_signals.append(technical_signal)
+                self._log.info(f"记录金叉技术信号: {technical_signal}")
+            else:#current_dif < 0
+# 检查MACD值是否足够大（可选：注释掉以下代码来禁用过滤）
+                if current_dif_abs < macd_threshold:
+                    self._log.info(f"金叉信号被过滤: MACD绝对值{current_dif_abs:.6f} < 阈值{macd_threshold:.6f}")
+                    return
+                bar
+                self.last_signal = "golden_cross"
+                
+                # 如果当日跌幅达到1%，直接退出不再累积买入信号
+                if self.today_pct_change is not None and self.today_pct_change <= -0.01:
+                    self._log.info(f"当日跌幅已达 {self.today_pct_change:.4%}，跳过金叉买入信号")
+                    return
+                
+                # 累积买入信号
+                # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
+                is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
+                signal_coefficient = 40000 if is_first_golden_cross else 20000
+                macd_contribution = signal_coefficient*current_dif_abs
+                self.technical_signal += macd_contribution
                 self.technical_signal_steps.append({
-                    'description': f'金叉KDJ未初始化(贡献={kdj_contribution:.2f})',
-                    'delta': kdj_contribution
+                    'description': f'金叉信号(系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f})',
+                    'delta': macd_contribution
                 })
-                self._log.info(f"金叉KDJ未初始化={kdj_contribution:.2f}, 当前信号值={self.technical_signal}")
-            
-            # 记录技术指标信号（金叉）
-            technical_signal = {
-                'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
-                'price': bar.close.as_double(),
-                'signal_type': 'golden_cross',
-                'signal_value': self.technical_signal,
-                'macd_value': current_dif,
-                'signal_value_macd': current_signal,
-                'histogram': current_histogram,
-                'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
-                'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
-                'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
-                'kdj_j': self.kdj.value_j if self.kdj.initialized else None
-            }
-            self.technical_signals.append(technical_signal)
-            self._log.info(f"记录金叉技术信号: {technical_signal}")
-        
+                self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
+
+                # 检查RSI条件
+                if self.rsi.initialized:
+                    rsi_value = self.rsi.value * 100
+                    rsi_contribution = 50 - rsi_value
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'RSI调整(RSI={rsi_value:.2f}, 贡献=50-RSI)',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"RSI条件满足：RSI={rsi_value:.2f} < 50，增强买入信号")
+                else:
+                    self._log.info(f"RSI条件不满足：RSI=未初始化")
+                    rsi_contribution = macd_contribution
+                    self.technical_signal += rsi_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'金叉RSI未初始化(贡献={rsi_contribution:.2f})',
+                        'delta': rsi_contribution
+                    })
+                    self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
+                
+                # KDJ平滑贡献计算（无条件跳变）
+                if self.kdj.initialized:
+                    # 计算KDJ三个值的最大差值和均值
+                    kdj_values = [self.kdj.value_k, self.kdj.value_d, self.kdj.value_j]
+                    kdj_max_diff = max(kdj_values) - min(kdj_values)
+                    kdj_avg = sum(kdj_values) / 3
+                    
+                    # 计算两个独立因子
+                    oversold_factor = max(0, 40 - kdj_avg)  # 超卖程度 [0, 40]
+                    convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
+                    
+                    # 线性加权：强调超卖（权重 0.8），弱化粘合（权重 0.4）
+                    # 最大贡献 = 0.8 * 40 + 0.4 * 20 = 40
+                    kdj_contribution = 0.8 * oversold_factor + 0.4 * convergence_factor
+                    
+                    self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
+                    self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
+                    self._log.info(f"超卖因子={oversold_factor:.2f}(×0.8), 粘合因子={convergence_factor:.2f}(×0.4), 总贡献={kdj_contribution:.2f}")
+                    
+                    # 只要有贡献就记录（平滑过渡，无条件跳变）
+                    if kdj_contribution > 0:
+                        self.technical_signal += kdj_contribution
+                        self.technical_signal_steps.append({
+                            'description': f'KDJ调整(均值={kdj_avg:.2f}, 差值={kdj_max_diff:.2f}, 贡献={kdj_contribution:.2f})',
+                            'delta': kdj_contribution
+                        })
+                else:
+                    # KDJ未初始化，使用MACD贡献替代
+                    self._log.info(f"KDJ条件不满足：KDJ=未初始化")
+                    kdj_contribution = macd_contribution
+                    self.technical_signal += kdj_contribution
+                    self.technical_signal_steps.append({
+                        'description': f'金叉KDJ未初始化(贡献={kdj_contribution:.2f})',
+                        'delta': kdj_contribution
+                    })
+                    self._log.info(f"金叉KDJ未初始化={kdj_contribution:.2f}, 当前信号值={self.technical_signal}")
+                
+                # 记录技术指标信号（金叉）
+                technical_signal = {
+                    'timestamp': pd.to_datetime(bar.ts_event, unit='ns'),
+                    'price': bar.close.as_double(),
+                    'signal_type': 'golden_cross',
+                    'signal_value': self.technical_signal,
+                    'macd_value': current_dif,
+                    'signal_value_macd': current_signal,
+                    'histogram': current_histogram,
+                    'rsi_value': self.rsi.value * 100 if self.rsi.initialized else None,
+                    'kdj_k': self.kdj.value_k if self.kdj.initialized else None,
+                    'kdj_d': self.kdj.value_d if self.kdj.initialized else None,
+                    'kdj_j': self.kdj.value_j if self.kdj.initialized else None
+                }
+                self.technical_signals.append(technical_signal)
+                self._log.info(f"记录金叉技术信号: {technical_signal}")
         elif death_cross:
             self._log.info(f"检测到死叉信号: MACD={current_dif:.6f}, Signal={current_signal:.6f}")
             

@@ -4,10 +4,13 @@
 			"path": "."
 		},
 		{
-			"path": "../../../Downloads/nautilus_trader-develop"
+			"path": "../../redis"
 		},
 		{
-			"path": "../../../Downloads/Redis-8.0.3-Windows-x64-msys2-with-Service"
+			"path": "../../nautilus_trader"
+		},
+		{
+			"path": "../../../Downloads/redis-8.4.0/redis-8.4.0"
 		}
 	],
 	"settings": {}

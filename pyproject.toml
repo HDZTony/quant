@@ -16,7 +16,7 @@ dependencies = [
     "matplotlib>=3.5.0",
     "mplfinance>=0.12.0",
     "python-dateutil>=2.8.0",
-    "nautilus-trader @ file:///C:/Users/hedz/Downloads/nautilus_trader-develop",
+    "nautilus-trader @ file:///C:/Users/hdz/Desktop/nautilus_trader",
     "seaborn>=0.13.2",
     "redis",
     "pyarrow>=20.0.0",
@@ -31,8 +31,11 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
-[tool.uv]
-dev-dependencies = [
+[tool.hatch.build.targets.wheel]
+packages = []
+
+[dependency-groups]
+dev = [
     "pytest>=7.0.0",
     "black>=22.0.0",
     "flake8>=5.0.0",
