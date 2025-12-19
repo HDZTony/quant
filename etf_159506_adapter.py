@@ -362,23 +362,9 @@ class ETF159506DataSaver:
                 logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
                 logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
             except AssertionError as e:
-                # ✅ 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
+                # 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
                 if "Intervals are not disjoint" in str(e):
-                    logger.warning(f"⚠️  QuoteTick时间间隔重叠，尝试去重后保存...")
-                    # 按时间戳去重
-                    seen_ts = set()
-                    unique_ticks = []
-                    for tick in self.quote_buffer:
-                        ts_key = (tick.ts_event, tick.ts_init)
-                        if ts_key not in seen_ts:
-                            seen_ts.add(ts_key)
-                            unique_ticks.append(tick)
-                    
-                    if unique_ticks:
-                        self.catalog.write_data(unique_ticks)
-                        logger.info(f"💾 QuoteTick去重后保存: {len(unique_ticks)} 条（去除了 {len(self.quote_buffer) - len(unique_ticks)} 条重复）")
-                    else:
-                        logger.warning("⚠️  所有QuoteTick都是重复的，跳过保存")
+                    logger.warning(f"⚠️  QuoteTick时间间隔重叠，跳过保存以避免阻塞websocket: {len(self.quote_buffer)} 条数据")
                 else:
                     raise
             
@@ -412,23 +398,9 @@ class ETF159506DataSaver:
                 logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
                 logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
             except AssertionError as e:
-                # ✅ 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
+                # 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
                 if "Intervals are not disjoint" in str(e):
-                    logger.warning(f"⚠️  TradeTick时间间隔重叠，尝试去重后保存...")
-                    # 按时间戳去重
-                    seen_ts = set()
-                    unique_ticks = []
-                    for tick in self.trade_buffer:
-                        ts_key = (tick.ts_event, tick.ts_init)
-                        if ts_key not in seen_ts:
-                            seen_ts.add(ts_key)
-                            unique_ticks.append(tick)
-                    
-                    if unique_ticks:
-                        self.catalog.write_data(unique_ticks)
-                        logger.info(f"💾 TradeTick去重后保存: {len(unique_ticks)} 条（去除了 {len(self.trade_buffer) - len(unique_ticks)} 条重复）")
-                    else:
-                        logger.warning("⚠️  所有TradeTick都是重复的，跳过保存")
+                    logger.warning(f"⚠️  TradeTick时间间隔重叠，跳过保存以避免阻塞websocket: {len(self.trade_buffer)} 条数据")
                 else:
                     raise
             

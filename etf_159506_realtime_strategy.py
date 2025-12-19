@@ -1493,51 +1493,15 @@ class ETF159506Strategy(Strategy):
             else:
                 self._log.info("MACD极值点历史不足3个，无法计算最大DIF差值")
             
-            # 检查当前价格和过去历史交易价格的差值是否大于0.03
-            # 如果历史交易价格不足（少于2个），跳过判断视为满足条件
-            price_diff_condition = True  # 默认满足条件
-            current_price = bar.close.as_double()
-            
-            if len(self.trade_prices_history) >= 3:
-                # 有三个或更多值，比较最近三个
-                last_trade_price_1 = self.trade_prices_history[-1]  # 最近一次交易价格
-                last_trade_price_2 = self.trade_prices_history[-2]  # 倒数第二次交易价格
-                last_trade_price_3 = self.trade_prices_history[-3]  # 倒数第三次交易价格
-                # 检查当前价格与过去三次交易价格的差值是否大于0.03
-                diff_1 = abs(current_price - last_trade_price_1)
-                diff_2 = abs(current_price - last_trade_price_2)
-                diff_3 = abs(current_price - last_trade_price_3)
-                price_diff_condition = diff_1 > 0.03 or diff_2 > 0.03 or diff_3 > 0.03
-                self._log.info(f"价格差值检查(3个值): 当前价格={current_price:.4f}, 最近三次交易价格=[{last_trade_price_3:.4f}, {last_trade_price_2:.4f}, {last_trade_price_1:.4f}], 差值=[{diff_3:.4f}, {diff_2:.4f}, {diff_1:.4f}], 满足条件={price_diff_condition}")
-            elif len(self.trade_prices_history) == 2:
-                # 只有两个值，比较这两个
-                last_trade_price_1 = self.trade_prices_history[-1]  # 最近一次交易价格
-                last_trade_price_2 = self.trade_prices_history[-2]  # 倒数第二次交易价格
-                diff_1 = abs(current_price - last_trade_price_1)
-                diff_2 = abs(current_price - last_trade_price_2)
-                price_diff_condition = diff_1 > 0.03 or diff_2 > 0.03
-                self._log.info(f"价格差值检查(2个值): 当前价格={current_price:.4f}, 最近两次交易价格=[{last_trade_price_2:.4f}, {last_trade_price_1:.4f}], 差值=[{diff_2:.4f}, {diff_1:.4f}], 满足条件={price_diff_condition}")
-            else:
-                # 历史交易价格不足（少于2个），跳过判断视为满足条件
-                price_diff_condition = True
-                self._log.info(f"价格差值检查: 历史交易价格不足({len(self.trade_prices_history)}个)，跳过判断视为满足条件")
-            
-            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值>相对阈值)且当前价格与过去两次交易价格差值>0.03且当前DIF<0且最后一个交易不是SELL，添加卖出信号
-            condition_met = (is_decreasing_trend or max_abs_histogram > histogram_threshold) and price_diff_condition
+            # 如果(前N个DIF下降趋势 或 过去N个histogram最大绝对值>相对阈值)且当前DIF<0且最后一个交易不是SELL，添加卖出信号
+            condition_met = (is_decreasing_trend or max_abs_histogram > histogram_threshold)
             if condition_met and not has_sell_operation:
                 condition_desc = []
                 if is_decreasing_trend:
                     condition_desc.append(f"前{dif_count}个DIF下降趋势")
                 if max_abs_histogram > histogram_threshold:
                     condition_desc.append(f"过去{histogram_count}个histogram最大绝对值>相对阈值{histogram_threshold:.6f}(实际绝对值={max_abs_histogram:.6f}, 对应值={max_histogram_value:.6f})")
-                if price_diff_condition:
-                    if len(self.trade_prices_history) >= 3:
-                        condition_desc.append(f"当前价格与过去三次交易价格差值>0.03(当前={bar.close.as_double():.4f}, 最近三次=[{self.trade_prices_history[-3]:.4f}, {self.trade_prices_history[-2]:.4f}, {self.trade_prices_history[-1]:.4f}])")
-                    elif len(self.trade_prices_history) == 2:
-                        condition_desc.append(f"当前价格与过去两次交易价格差值>0.03(当前={bar.close.as_double():.4f}, 最近两次=[{self.trade_prices_history[-2]:.4f}, {self.trade_prices_history[-1]:.4f}])")
-                    else:
-                        condition_desc.append(f"历史交易价格不足，跳过价格差值判断")
-                self._log.info(f"检测到DIF<0且({'或'.join(condition_desc)})且价格差值条件满足且最后一个交易不是SELL")
+                self._log.info(f"检测到DIF<0且({'或'.join(condition_desc)})且最后一个交易不是SELL")
                 if last_dif_values:
                     self._log.info(f"前{dif_count}个DIF值: {last_dif_values}")
                 self._log.info(f"当前DIF值: {current_dif}")
@@ -1563,8 +1527,6 @@ class ETF159506Strategy(Strategy):
                 # 条件不满足，记录原因
                 if not (is_decreasing_trend or max_abs_histogram > histogram_threshold):
                     self._log.info(f"❌ DIF从正到负但条件不满足: is_decreasing_trend={is_decreasing_trend}, max_abs_histogram={max_abs_histogram:.6f} <= histogram_threshold={histogram_threshold:.6f}")
-                if not price_diff_condition:
-                    self._log.info(f"❌ DIF从正到负但价格差值条件不满足: price_diff_condition={price_diff_condition}")
                 if has_sell_operation:
                     self._log.info(f"❌ DIF从正到负但最后一个交易是SELL，阻止卖出操作")
         else:
@@ -1603,7 +1565,7 @@ class ETF159506Strategy(Strategy):
                 # 累积买入信号
                 # 如果是第一个金叉技术信号，使用40000系数，否则使用20000
                 is_first_golden_cross = not any(signal.get('signal_type') == 'golden_cross' for signal in self.technical_signals)
-                signal_coefficient = 40000 if is_first_golden_cross else 20000
+                signal_coefficient = 40000 if is_first_golden_cross else 30000
                 macd_contribution = signal_coefficient*current_dif_abs
                 self.technical_signal += macd_contribution
                 self.technical_signal_steps.append({
@@ -1611,11 +1573,10 @@ class ETF159506Strategy(Strategy):
                     'delta': macd_contribution
                 })
                 self._log.info(f"金叉买入信号累积: 系数={signal_coefficient}, MACD绝对值={current_dif_abs:.6f}, 当前信号值={self.technical_signal}")
-
                 # 检查RSI条件
                 if self.rsi.initialized:
                     rsi_value = self.rsi.value * 100
-                    rsi_contribution = 50 - rsi_value
+                    rsi_contribution = 60 - rsi_value
                     self.technical_signal += rsi_contribution
                     self.technical_signal_steps.append({
                         'description': f'RSI调整(RSI={rsi_value:.2f}, 贡献=50-RSI)',
@@ -1630,8 +1591,7 @@ class ETF159506Strategy(Strategy):
                         'description': f'金叉RSI未初始化(贡献={rsi_contribution:.2f})',
                         'delta': rsi_contribution
                     })
-                    self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")
-                
+                    self._log.info(f"金叉RSI未初始化={rsi_contribution:.2f}, 当前信号值={self.technical_signal}")             
                 # KDJ平滑贡献计算（无条件跳变）
                 if self.kdj.initialized:
                     # 计算KDJ三个值的最大差值和均值
@@ -1796,7 +1756,7 @@ class ETF159506Strategy(Strategy):
             # 累积卖出信号
             # 如果是第一个死叉技术信号，使用40000系数，否则使用20000
             is_first_death_cross = not any(signal.get('signal_type') == 'death_cross' for signal in self.technical_signals)
-            signal_coefficient = 40000 if is_first_death_cross else 20000
+            signal_coefficient = 40000 if is_first_death_cross else 30000
             
             # 🆕 标记第一个死叉信号已触发（待确认卖出）
             if is_first_death_cross:
@@ -1827,7 +1787,7 @@ class ETF159506Strategy(Strategy):
             
             # 检查RSI条件
             if self.rsi.initialized:
-                rsi_value = self.rsi.value * 100
+                rsi_value = self.rsi.value * 140
                 rsi_contribution = -rsi_value
                 self.technical_signal += rsi_contribution
                 self.technical_signal_steps.append({
@@ -1854,12 +1814,12 @@ class ETF159506Strategy(Strategy):
                 kdj_avg = sum(kdj_values) / 3
                 
                 # 计算两个独立因子（超买方向）
-                overbought_factor = max(0, kdj_avg - 60)  # 超买程度 [0, 40]
-                convergence_factor = max(0, 20 - kdj_max_diff)  # 粘合程度 [0, 20]
+                overbought_factor = max(0, kdj_avg - 50)  # 超买程度 [0, 50]
+                convergence_factor = max(0, 35 - kdj_max_diff)  # 粘合程度 [0, 35]
                 
-                # 线性加权：强调超买（权重 0.6），弱化粘合（权重 0.3）
-                # 最大负贡献 = -(0.6 * 40 + 0.3 * 20) = -30
-                kdj_contribution = -(0.6 * overbought_factor + 0.3 * convergence_factor)
+                # 线性加权：强调超买（权重 0.6），弱化粘合（权重 0.4）
+                # 最大负贡献 = -(0.6 * 50 + 0.4 * 35) = -44
+                kdj_contribution = -(0.6 * overbought_factor + 0.4 * convergence_factor)
                 
                 self._log.info(f"KDJ分析: K={self.kdj.value_k:.2f}, D={self.kdj.value_d:.2f}, J={self.kdj.value_j:.2f}")
                 self._log.info(f"KDJ均值={kdj_avg:.2f}, 最大差值={kdj_max_diff:.2f}")
