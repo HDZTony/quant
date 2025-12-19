@@ -1183,7 +1183,21 @@ class ETF159506Strategy(Strategy):
         rank_ratio = self.check_macd_rank('peak')  # 比较极大值
         price_rank_ratio = self.check_price_rank('peak')
         self._log.info(f"【顶部信号检查】MACD排名={rank_ratio:.3f}, 价格排名={price_rank_ratio:.3f}, 最近极值点类型={self.latest_extreme_type}, 是否有时间差={self.time_diff_minutes_from_latest_extreme is not None}")
-        if rank_ratio > 0.9 and price_rank_ratio > 0.9 and self.latest_extreme_type == 'peak':
+        
+        # 获取当前分钟的 dif 和 latest_extreme 的 dif 进行比较
+        current_dif = self.dif_history[-1] if self.dif_history else None
+        latest_extreme_dif = None
+        if self.macd_extremes_history:
+            latest_extreme = self.macd_extremes_history[-1]
+            latest_extreme_dif = latest_extreme[1]  # extreme[1] 是 dif 值
+        
+        # 检查当前分钟 dif 是否小于 latest_extreme 的 dif
+        dif_condition = True  # 默认满足条件（如果没有数据则不限制）
+        if current_dif is not None and latest_extreme_dif is not None:
+            dif_condition = current_dif < latest_extreme_dif
+            self._log.info(f"DIF比较: 当前DIF={current_dif:.6f}, 最近极值点DIF={latest_extreme_dif:.6f}, 条件满足={dif_condition}")
+        
+        if rank_ratio > 0.9 and price_rank_ratio > 0.9 and self.latest_extreme_type == 'peak' and dif_condition:
             # 如果排名比例大于0.9，表示当前MACD值排在前10%（排名很好），计算成交量比值
             if self.time_diff_minutes_from_latest_extreme is not None:
                 # 根据时间差计算索引
