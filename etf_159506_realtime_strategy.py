@@ -22,6 +22,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.objects import Price
+from nautilus_trader.common import Environment
 from collections import deque
 import pandas as pd
 from datetime import datetime, time, date, timedelta
@@ -166,6 +167,11 @@ class ETF159506Strategy(Strategy):
         
         # 当日开盘价与涨跌幅记录
         self.today_open_price: float | None = None
+        
+        # 判断是否为回测模式（初始化为 None，在 on_start 时确定）
+        # 通过检查 clock 类型来判断：TestClock 表示回测，LiveClock 表示实时
+        self.is_backtest_mode = None
+        self.last_bar_timestamp = None
         self.today_pct_change: float | None = None
         self.today_date: date | None = None
         self.today_pct_change_history: list[dict] = []  # [{'time': datetime, 'pct': float}]
@@ -217,6 +223,14 @@ class ETF159506Strategy(Strategy):
     
     def on_start(self):
         """策略启动时调用"""
+        # 判断是否为回测模式（在 on_start 时检查，此时 clock 已正确设置）
+        if self.is_backtest_mode is None:
+            # 通过检查 clock 类型名称来判断：TestClock 表示回测，LiveClock 表示实时
+            # 使用类型名称字符串判断，因为 Cython 类的 isinstance 可能不可靠
+            clock_type_name = type(self.clock).__name__
+            self.is_backtest_mode = clock_type_name == "TestClock"
+            self._log.info(f"Clock 类型: {clock_type_name}, 策略运行模式: {'回测模式' if self.is_backtest_mode else '实时模式'}")
+        
         bar_type = self.config.bar_type
         
         # ✅ 初始化 instrument 对象（用于价格创建）
@@ -277,7 +291,6 @@ class ETF159506Strategy(Strategy):
         self._log.info(f"已订阅订单成交事件: {self.config.instrument_id}")
         
         self._log.info(f"ETF159506 MACD金叉死叉策略已启动，订阅 {self.config.instrument_id} 的 {bar_type}")
-        
 
     def _round_to_lot_size(self, quantity: int, lot_size: int = 100) -> int:
         """
@@ -366,6 +379,27 @@ class ETF159506Strategy(Strategy):
         
         # 打印每分钟成交量汇总
         self.print_minute_volume_data()
+        
+        # 回测模式：在策略结束时绘制一次图表
+        if self.is_backtest_mode:
+            try:
+                self._log.info("回测模式：策略结束，开始绘制最终图表...")
+                if self.last_bar_timestamp is not None:
+                    # 获取最后一个 bar 对象用于绘图
+                    last_bar = self.cache.bar(self.config.bar_type)
+                    if last_bar:
+                        self.update_realtime_charts(last_bar)
+                        self._log.info("回测模式：最终图表已绘制完成")
+                    else:
+                        self._log.warning("回测模式：无法获取最后一个 bar，跳过绘图")
+                else:
+                    self._log.warning("回测模式：没有记录最后一个 bar 时间戳，跳过绘图")
+            except Exception as e:
+                self._log.error(f"回测模式绘制最终图表失败: {e}")
+                import traceback
+                self._log.error(f"详细错误: {traceback.format_exc()}")
+        else:
+            self._log.info("实时模式：策略停止，不绘制图表")
     
     def _process_technical_signals(self, bar: Bar, beijing_time_str: str, is_historical: bool = False):
         """处理技术信号计算和显示
@@ -717,8 +751,16 @@ class ETF159506Strategy(Strategy):
         self.technical_signal_history.append(signal_record)
         self._log.info(f"记录技术信号历史: 时间={beijing_time_str}, 信号值={current_technical_signal:.2f}")
         
-        # ✅ 更新实时图表（同步执行，保证与其他图一致）
-        self.update_realtime_charts(last_bar)
+        # 更新最后一个 bar 的时间戳（用于回测模式判断）
+        self.last_bar_timestamp = bar.ts_event
+        
+        # ✅ 更新实时图表（根据运行模式决定是否绘图）
+        if self.is_backtest_mode:
+            # 回测模式：不每分钟绘图，只在策略结束时绘图（在 on_stop 中处理）
+            self._log.debug(f"回测模式：跳过每分钟绘图，将在策略结束时统一绘图")
+        else:
+            # 实时模式：每分钟绘图
+            self.update_realtime_charts(last_bar)
         self.technical_signal = 0
     
     def _refresh_open_orders(self, bar: Bar) -> None:
@@ -1117,12 +1159,12 @@ class ETF159506Strategy(Strategy):
         if extreme_type == 'trough':
             # 极小值：MACD值越小，排名越高（越接近1）
             rank_ratio = 1 - (values_below_current / total_count)
-            self._log.info(f"MACD极小值排序分析: 总极小值点数={total_count}, 当前MACD={current_dif:.6f}")
+            self._log.info(f"MACD极小值排序分析: 总极小值点数={total_count}, 当前DIF={current_dif:.6f}")
             self._log.info(f"排名比例={rank_ratio:.3f} (值越小排名越高，1=最小值)")
         else:  # extreme_type == 'peak'
             # 极大值：MACD值越大，排名越高（越接近1）
             rank_ratio = values_below_current / total_count
-            self._log.info(f"MACD极大值排序分析: 总极大值点数={total_count}, 当前MACD={current_dif:.6f}")
+            self._log.info(f"MACD极大值排序分析: 总极大值点数={total_count}, 当前DIF={current_dif:.6f}")
             self._log.info(f"排名比例={rank_ratio:.3f} (值越大排名越高，1=最大值)")
         
         return rank_ratio
@@ -2627,37 +2669,43 @@ class ETF159506Strategy(Strategy):
             return
         
         # 直接从历史记录中取最后3个值
-        hist_n_minus_2 = abs(self.histogram_history[-3])
-        hist_n_minus_1 = abs(self.histogram_history[-2])
-        hist_n = abs(self.histogram_history[-1])
+        hist_n_minus_2 = self.histogram_history[-3]
+        hist_n_minus_1 = self.histogram_history[-2]
+        hist_n = self.histogram_history[-1]
+        current_dif = self.dif_history[-1]
+        # 检测连续变大：|histogram[n-2]| > |histogram[n-1]| > |histogram[n]|
+        is_growing = (hist_n_minus_2 < hist_n_minus_1) and (hist_n_minus_1 < hist_n)
         
-        # 检测连续缩小：|histogram[n-2]| > |histogram[n-1]| > |histogram[n]|
-        is_shrinking = (hist_n_minus_2 > hist_n_minus_1) and (hist_n_minus_1 > hist_n)
-        
-        if is_shrinking:
-            self._log.info(
-                f"🎯 检测到MACD柱连续2分钟缩小: "
-                f"{hist_n_minus_2:.6f} > {hist_n_minus_1:.6f} > {hist_n:.6f}"
-            )
-            self._trigger_rebuy_signal_after_death_cross()
-            self._reset_histogram_monitor()
+        if is_growing :
+            if current_dif < 0:
+                self._log.info(
+                    f"🎯 检测到MACD柱连续2分钟变大: "
+                    f"{hist_n_minus_2:.6f} < {hist_n_minus_1:.6f} < {hist_n:.6f}"
+                )
+                self._trigger_rebuy_signal_after_death_cross()
+                self._reset_histogram_monitor()
+            else:
+                self._log.info(
+                    f"DIF值为正，不触发买入信号: {current_dif:.6f}, MACD柱连续2分钟变大: {hist_n_minus_2:.6f} < {hist_n_minus_1:.6f} < {hist_n:.6f}"
+                )
+                self._reset_histogram_monitor()
         else:
             self._log.debug(
-                f"MACD柱未连续缩小: {hist_n_minus_2:.6f}, {hist_n_minus_1:.6f}, {hist_n:.6f}"
+                f"MACD柱未连续变大: {hist_n_minus_2:.6f}, {hist_n_minus_1:.6f}, {hist_n:.6f}"
             )
     
     def _trigger_rebuy_signal_after_death_cross(self):
-        """死叉卖出后，MACD柱连续缩小触发的买入信号（+300技术信号值）"""
+        """死叉卖出后，MACD柱连续变大触发的买入信号（+300技术信号值）"""
         rebuy_contribution = 300  # 增加300技术信号值，而非直接买入
         self.technical_signal += rebuy_contribution
         
         self.technical_signal_steps.append({
-            'description': '死叉后MACD柱连续2分钟缩小买入信号(+300)',
+            'description': '死叉后MACD柱连续2分钟变大买入信号(+300)',
             'delta': rebuy_contribution
         })
         
         self._log.info(
-            f"🔔 触发死叉后买入信号：MACD柱连续2分钟缩小，"
+            f"🔔 触发死叉后买入信号：MACD柱连续2分钟变大，"
             f"增加技术信号+300，当前信号值={self.technical_signal}"
         )
     
@@ -2843,9 +2891,20 @@ class ETF159506Strategy(Strategy):
             current_time_beijing = current_time_utc.tz_localize('UTC').tz_convert('Asia/Shanghai')
             target_date = current_time_beijing.date()
             
-            # 使用固定文件名，每次覆盖旧图片
+            # 根据运行模式决定文件名格式
+            if self.is_backtest_mode:
+                # 回测模式：文件名包含日期
+                date_str = target_date.strftime('%Y%m%d')
+                kline_filename = f"etf_159506_backtest_kline_{date_str}.png"
+                trade_points_filename = f"etf_159506_backtest_trade_points_{date_str}.png"
+                extremes_filename = f"etf_159506_backtest_extremes_{date_str}.png"
+            else:
+                # 实时模式：使用固定文件名，每次覆盖旧图片
+                kline_filename = "etf_159506_realtime_kline.png"
+                trade_points_filename = "etf_159506_realtime_trade_points.png"
+                extremes_filename = "etf_159506_realtime_extremes.png"
+            
             # 1. 生成K线图（包含买卖点）
-            kline_filename = "etf_159506_realtime_kline.png"
             self.create_realtime_kline_chart(
                 save_path=kline_filename,
                 target_date=target_date,
@@ -2853,19 +2912,17 @@ class ETF159506Strategy(Strategy):
                 technical_signals=self.technical_signals,
                 technical_signal_value=technical_signal,
             )
-            self._log.info(f"实时K线图已更新: {kline_filename} (时间: {current_time_beijing.strftime('%H:%M:%S')})")
+            self._log.info(f"{'回测' if self.is_backtest_mode else '实时'}K线图已更新: {kline_filename} (时间: {current_time_beijing.strftime('%H:%M:%S')})")
             
             # 2. 生成买卖点分析图表
-            trade_points_filename = "etf_159506_realtime_trade_points.png"
             self.create_trade_points_chart(
                 save_path=trade_points_filename,
                 target_date=target_date,
                 trade_signals=self.trade_signals
             )
-            self._log.info(f"买卖点分析图表已更新: {trade_points_filename}")
+            self._log.info(f"{'回测' if self.is_backtest_mode else '实时'}买卖点分析图表已更新: {trade_points_filename}")
             
             # 3. 生成极值点分析图表
-            extremes_filename = "etf_159506_realtime_extremes.png"
             extremes_data = {
                 'price_peaks': list(self.price_peaks),
                 'price_troughs': list(self.price_troughs),

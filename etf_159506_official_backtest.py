@@ -14,6 +14,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import mplfinance as mpf
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # NautilusTrader imports
 from nautilus_trader.backtest.node import BacktestNode
@@ -29,10 +31,12 @@ from nautilus_trader.model.enums import AccountType, OmsType
 from nautilus_trader.model.currencies import CNY
 from nautilus_trader.model.objects import Money
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import BarType, TradeTick, Bar
+from nautilus_trader.serialization.arrow.serializer import ArrowSerializer
+from nautilus_trader.persistence.wranglers import BarDataWrangler
 
 # 导入策略和工具
-from etf_159506_strategy import ETF159506Strategy
+from etf_159506_realtime_strategy import ETF159506Strategy
 from etf_159506_strategy_config import ETF159506Config
 from etf_159506_instrument import create_etf_159506_default, create_etf_159506_bar_type
 from etf_159506_catalog_loader import ETF159506RedisKlineGenerator
@@ -60,7 +64,7 @@ logging.getLogger('BACKTESTER').setLevel(logging.INFO)
 class ETF159506OfficialBacktest:
     """159506 ETF 官方回测系统"""
     
-    def __init__(self, catalog_path: str = "catalog/etf_159506_cache"):
+    def __init__(self, catalog_path: str = "data_catalog"):
         self.catalog_path = Path(catalog_path)
         self.catalog = None
         
@@ -85,8 +89,11 @@ class ETF159506OfficialBacktest:
     def _init_catalog(self):
         """初始化数据 catalog"""
         try:
+            # 如果路径不存在，尝试创建目录
             if not self.catalog_path.exists():
-                raise FileNotFoundError(f"Catalog 路径不存在: {self.catalog_path}")
+                logger.warning(f"Catalog 路径不存在: {self.catalog_path}，尝试创建...")
+                self.catalog_path.mkdir(parents=True, exist_ok=True)
+                logger.info(f"已创建 Catalog 路径: {self.catalog_path}")
             
             self.catalog = ParquetDataCatalog(self.catalog_path)
             logger.info(f"Catalog 初始化成功: {self.catalog_path}")
@@ -113,8 +120,232 @@ class ETF159506OfficialBacktest:
             logger.error(f"初始化 Catalog 失败: {e}")
             raise
     
+    def _load_data_from_parquet_file(self, parquet_file_path: str):
+        """
+        从指定的 parquet 文件加载 TradeTick 数据
+        
+        根据 NautilusTrader 文档，此方法：
+        1. 读取外部 parquet 文件（NautilusTrader 标准格式）
+        2. 使用 ArrowSerializer 反序列化为 TradeTick 对象
+        3. 写入当前 catalog 以供回测使用
+        
+        参考: https://nautilustrader.io/docs/latest/concepts/data
+        
+        Parameters
+        ----------
+        parquet_file_path : str
+            Parquet 文件的完整路径，应为 NautilusTrader 标准格式的 TradeTick 数据
+        """
+        try:
+            parquet_path = Path(parquet_file_path)
+            
+            if not parquet_path.exists():
+                raise FileNotFoundError(f"Parquet 文件不存在: {parquet_file_path}")
+            
+            logger.info(f"正在从 parquet 文件加载 TradeTick 数据: {parquet_file_path}")
+            
+            # 读取 parquet 文件为 pyarrow Table
+            # 根据文档，NautilusTrader 使用 PyArrow 作为底层存储格式
+            table = pq.read_table(parquet_file_path)
+            logger.info(f"从 parquet 文件读取到 {len(table)} 条记录")
+            
+            # 使用 ArrowSerializer 的公共 API 将 Table 转换为 TradeTick 对象
+            # 这是 NautilusTrader 推荐的反序列化方法
+            # 参考: https://nautilustrader.io/docs/latest/concepts/data#reading-data
+            trade_ticks = ArrowSerializer.deserialize(
+                data_cls=TradeTick,
+                batch=table
+            )
+            
+            logger.info(f"成功转换 {len(trade_ticks)} 个 TradeTick 对象")
+            
+            # 写入 catalog
+            # 根据文档，write_data 方法会自动处理数据组织
+            # 参考: https://nautilustrader.io/docs/latest/concepts/data#writing-data
+            if trade_ticks:
+                # 确保工具有效（如果 catalog 中没有）
+                instruments = self.catalog.instruments()
+                if not instruments or self.instrument_id not in [inst.id for inst in instruments]:
+                    logger.info("添加工具到 catalog...")
+                    self.catalog.write_data([self.instrument])
+                
+                # 写入 TradeTick 数据
+                # 注意：如果数据重叠，可能需要使用 skip_disjoint_check=True
+                self.catalog.write_data(trade_ticks, skip_disjoint_check=True)
+                logger.info(f"已写入 {len(trade_ticks)} 条 TradeTick 数据到 catalog: {self.catalog_path}")
+                
+                # 从 TradeTick 数据生成 Bar 数据（1分钟K线）
+                logger.info("正在从 TradeTick 数据生成 Bar 数据...")
+                bars = self._generate_bars_from_ticks(trade_ticks)
+                
+                if bars:
+                    self.catalog.write_data(bars, skip_disjoint_check=True)
+                    logger.info(f"已写入 {len(bars)} 条 Bar 数据到 catalog")
+                else:
+                    logger.warning("未能生成 Bar 数据")
+                
+                # 验证数据写入
+                written_ticks = self.catalog.query(
+                    data_cls=TradeTick,
+                    identifiers=[str(self.instrument_id)]
+                )
+                logger.info(f"Catalog 中现有 TradeTick 数据: {len(written_ticks)} 条")
+                
+                written_bars = self.catalog.query(
+                    data_cls=Bar,
+                    identifiers=[str(self.instrument_id)],
+                    bar_types=[self.bar_type]
+                )
+                logger.info(f"Catalog 中现有 Bar 数据: {len(written_bars)} 条")
+            else:
+                logger.warning("没有成功转换任何 TradeTick 数据")
+                
+        except Exception as e:
+            logger.error(f"从 parquet 文件加载数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            raise
+    
+    def _generate_bars_from_ticks(self, trade_ticks: list[TradeTick]) -> list[Bar]:
+        """
+        从 TradeTick 数据生成 Bar 数据（1分钟K线）
+        
+        根据 NautilusTrader 文档，Trade-to-bar aggregation 会从 TradeTick 自动生成 Bar
+        参考: https://nautilustrader.io/docs/latest/concepts/data#types-of-aggregation
+        """
+        try:
+            if not trade_ticks:
+                logger.warning("没有 TradeTick 数据，无法生成 Bar")
+                return []
+            
+            # 将 TradeTick 转换为 DataFrame 进行聚合
+            tick_data = []
+            for tick in trade_ticks:
+                # 将纳秒时间戳转换为 datetime
+                ts_event_ns = tick.ts_event
+                timestamp = pd.to_datetime(ts_event_ns, unit='ns')
+                
+                tick_data.append({
+                    'timestamp': timestamp,
+                    'price': float(tick.price),
+                    'volume': int(tick.size),  # TradeTick.size 是单笔成交量
+                    'ts_event': ts_event_ns
+                })
+            
+            df = pd.DataFrame(tick_data)
+            df.set_index('timestamp', inplace=True)
+            
+            # 按1分钟时间窗口聚合数据
+            resampled = df.resample('1min').agg({
+                'price': ['first', 'max', 'min', 'last'],
+                'volume': 'sum'  # 累加得到该分钟的总成交量
+            }).dropna()
+            
+            # 重命名列
+            resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+            
+            # 使用 BarDataWrangler 生成 Bar 对象
+            wrangler = BarDataWrangler(bar_type=self.bar_type, instrument=self.instrument)
+            bars = wrangler.process(resampled)
+            
+            logger.info(f"成功生成 {len(bars)} 条 Bar 数据")
+            return bars
+            
+        except Exception as e:
+            logger.error(f"从 TradeTick 生成 Bar 数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            return []
+    
+    def _load_data_for_date(self, target_date: date):
+        """
+        加载指定日期的所有 TradeTick 数据文件
+        
+        Parameters
+        ----------
+        target_date : date
+            要加载数据的日期
+        """
+        try:
+            # 构建数据目录路径
+            trade_tick_dir = Path(self.catalog_path) / "data" / "trade_tick" / "159506.SZSE"
+            
+            if not trade_tick_dir.exists():
+                raise FileNotFoundError(f"TradeTick 数据目录不存在: {trade_tick_dir}")
+            
+            # 查找指定日期的所有 parquet 文件
+            date_str = target_date.strftime("%Y-%m-%d")
+            pattern = f"{date_str}T*.parquet"
+            
+            parquet_files = list(trade_tick_dir.glob(pattern))
+            
+            if not parquet_files:
+                logger.warning(f"未找到 {target_date} 的 TradeTick 数据文件")
+                return
+            
+            logger.info(f"找到 {len(parquet_files)} 个 {target_date} 的 TradeTick 数据文件")
+            
+            # 按文件名排序，确保按时间顺序加载
+            parquet_files.sort()
+            
+            # 加载所有文件
+            total_ticks = 0
+            total_bars = 0
+            
+            for parquet_file in parquet_files:
+                logger.info(f"正在加载文件: {parquet_file.name}")
+                
+                # 读取并转换数据
+                table = pq.read_table(parquet_file)
+                trade_ticks = ArrowSerializer.deserialize(
+                    data_cls=TradeTick,
+                    batch=table
+                )
+                
+                if trade_ticks:
+                    # 确保工具有效
+                    instruments = self.catalog.instruments()
+                    if not instruments or self.instrument_id not in [inst.id for inst in instruments]:
+                        self.catalog.write_data([self.instrument])
+                    
+                    # 写入 TradeTick 数据
+                    self.catalog.write_data(trade_ticks, skip_disjoint_check=True)
+                    total_ticks += len(trade_ticks)
+                    
+                    # 生成 Bar 数据
+                    bars = self._generate_bars_from_ticks(trade_ticks)
+                    if bars:
+                        self.catalog.write_data(bars, skip_disjoint_check=True)
+                        total_bars += len(bars)
+            
+            logger.info(f"总共加载 {total_ticks} 条 TradeTick 数据，生成 {total_bars} 条 Bar 数据")
+            
+            # 验证数据
+            written_ticks = self.catalog.query(
+                data_cls=TradeTick,
+                identifiers=[str(self.instrument_id)],
+                start=datetime.combine(target_date, datetime.min.time()),
+                end=datetime.combine(target_date, datetime.max.time())
+            )
+            logger.info(f"Catalog 中 {target_date} 的 TradeTick 数据: {len(written_ticks)} 条")
+            
+            written_bars = self.catalog.query(
+                data_cls=Bar,
+                identifiers=[str(self.instrument_id)],
+                bar_types=[self.bar_type],
+                start=datetime.combine(target_date, datetime.min.time()),
+                end=datetime.combine(target_date, datetime.max.time())
+            )
+            logger.info(f"Catalog 中 {target_date} 的 Bar 数据: {len(written_bars)} 条")
+            
+        except Exception as e:
+            logger.error(f"加载 {target_date} 的数据失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            raise
+    
     def _load_data_with_catalog_loader(self, target_date=None):
-        """使用 catalog loader 加载数据"""
+        """使用 catalog loader 加载数据（已废弃，保留用于兼容性）"""
         try:
             # 创建 catalog loader
             catalog_loader = ETF159506RedisKlineGenerator(catalog_path=str(self.catalog_path))
@@ -383,7 +614,7 @@ class ETF159506OfficialBacktest:
             engine_config = BacktestEngineConfig(
                 strategies=[
                     ImportableStrategyConfig(
-                        strategy_path="etf_159506_strategy:ETF159506Strategy",
+                        strategy_path="etf_159506_realtime_strategy:ETF159506Strategy",
                         config_path="etf_159506_strategy_config:ETF159506Config",
                         config={
                             "instrument_id": str(self.instrument_id),
@@ -438,8 +669,8 @@ class ETF159506OfficialBacktest:
         try:
             logger.info(f"开始回测: {start_date} 到 {end_date}")
             
-            # 加载指定日期的数据
-            self._load_data_with_catalog_loader(start_date)
+            # 加载指定日期的所有 TradeTick 数据文件
+            self._load_data_for_date(start_date)
             
             # 创建回测配置
             logger.info("创建回测配置...")
@@ -543,8 +774,8 @@ class ETF159506OfficialBacktest:
         """运行 7-25 日的回测"""
         try:
             # 设置回测日期
-            start_date = date(2025, 9, 10)
-            end_date = date(2025, 9, 10)
+            start_date = date(2025, 12, 23)
+            end_date = date(2025, 12, 23)
             
             logger.info(f"开始 7-25 日回测...")
             
@@ -557,8 +788,14 @@ class ETF159506OfficialBacktest:
             # 分析结果
             self.analyze_results(result)
             
-            # 显示回测结果K线图
-            self.display_backtest_chart(start_date, end_date)
+            # 注意：图表已由策略在 on_stop 时绘制（带日期后缀）
+            # 回测系统不再重复绘制，避免从 catalog 读取数据的问题
+            logger.info("图表已由策略在回测结束时自动绘制（带日期后缀）")
+            logger.info(f"请查看以下文件：")
+            date_str = start_date.strftime('%Y%m%d')
+            logger.info(f"  - etf_159506_backtest_kline_{date_str}.png")
+            logger.info(f"  - etf_159506_backtest_trade_points_{date_str}.png")
+            logger.info(f"  - etf_159506_backtest_extremes_{date_str}.png")
             
             return result
             
