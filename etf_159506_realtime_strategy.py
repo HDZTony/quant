@@ -1109,10 +1109,10 @@ class ETF159506Strategy(Strategy):
                 self.technical_signals.append(technical_signal)
                 self._log.info(f"记录histogram技术信号: {technical_signal}")
         else:
-            self._log.info("未找到三个交替点或未找到有效的histogram值，直接增加技术信号300")
+            self._log.info("dif从负到正，未找到三个交替点或未找到有效的histogram值，直接增加技术信号300")
             self.technical_signal += 300
             self.technical_signal_steps.append({
-                'description': '未找到三个交替点或未找到有效的histogram值',
+                'description': 'dif从负到正，未找到三个交替点或未找到有效的histogram值',
                 'delta': 300
             })
         
@@ -3325,17 +3325,17 @@ class ETF159506Strategy(Strategy):
             # 保存图片
             if save_path:
                 plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                self._log.info(f"极值点图表已保存到: {save_path}")
+                # self._log.info(f"极值点图表已保存到: {save_path}")
             
             # 显示图表（非阻塞模式）
             plt.show(block=False)
             
-            self._log.info("极值点图表生成完成")
+            # self._log.info("极值点图表生成完成")
             
         except Exception as e:
-            self._log.error(f"创建极值点图表失败: {e}")
+            # self._log.error(f"创建极值点图表失败: {e}")
             import traceback
-            self._log.error(f"详细错误: {traceback.format_exc()}")
+            # self._log.error(f"详细错误: {traceback.format_exc()}")
 
     def create_trade_points_chart(self, save_path: str = None, target_date: date = None, trade_signals: List[Dict] = None):
         """创建专门的买卖点图表"""
@@ -3344,7 +3344,7 @@ class ETF159506Strategy(Strategy):
             kline_data = self.get_kline_data_from_cache()
             
             if not kline_data:
-                self._log.warning("没有数据可绘制")
+                # self._log.warning("没有数据可绘制")
                 return
             
             # 转换为DataFrame
@@ -3362,7 +3362,7 @@ class ETF159506Strategy(Strategy):
                 df['timestamp'] = df['timestamp'].dt.tz_localize(utc_tz)
                 # 转换为北京时间
                 df['timestamp'] = df['timestamp'].dt.tz_convert(beijing_tz)
-                self._log.info("已将UTC时间转换为北京时间")
+                # self._log.info("已将UTC时间转换为北京时间")
             
             df = df.sort_values('timestamp')
             
@@ -3401,12 +3401,12 @@ class ETF159506Strategy(Strategy):
             trading_data = pd.concat([morning_data, afternoon_data])
             
             if len(trading_data) == 0:
-                self._log.warning("没有交易时间内的数据可绘制")
+                #self._log.warning("没有交易时间内的数据可绘制")
                 return
             
-            self._log.info(f"上午数据: {len(morning_data)} 条")
-            self._log.info(f"下午数据: {len(afternoon_data)} 条")
-            self._log.info(f"总交易数据: {len(trading_data)} 条")
+            # self._log.info(f"上午数据: {len(morning_data)} 条")
+            # self._log.info(f"下午数据: {len(afternoon_data)} 条")
+            # self._log.info(f"总交易数据: {len(trading_data)} 条")
             
             # 使用交易数据的时间作为索引
             trading_data = trading_data.set_index('timestamp')
@@ -3911,25 +3911,25 @@ class ETF159506Strategy(Strategy):
             mapped_df.index = [time_mapping[idx] for idx in mapped_df.index]
             
             # 数据验证和调试信息
-            self._log.info(f"[K线图] complete_df列: {list(complete_df.columns)}")
-            self._log.info(f"[K线图] complete_df行数: {len(complete_df)}")
-            self._log.info(f"[K线图] time_mapping键数量: {len(time_mapping)}")
-            self._log.info(f"[K线图] mapped_df列: {list(mapped_df.columns)}")
-            self._log.info(f"[K线图] mapped_df行数: {len(mapped_df)}")
+            # self._log.info(f"[K线图] complete_df列: {list(complete_df.columns)}")
+            # self._log.info(f"[K线图] complete_df行数: {len(complete_df)}")
+            # self._log.info(f"[K线图] time_mapping键数量: {len(time_mapping)}")
+            # self._log.info(f"[K线图] mapped_df列: {list(mapped_df.columns)}")
+            # self._log.info(f"[K线图] mapped_df行数: {len(mapped_df)}")
             
             # 检查mapped_df是否有price列
             if 'price' not in mapped_df.columns:
-                self._log.error(f"[K线图] mapped_df缺少'price'列，可用列: {list(mapped_df.columns)}")
+                # self._log.error(f"[K线图] mapped_df缺少'price'列，可用列: {list(mapped_df.columns)}")
                 # 尝试使用close列
                 if 'close' in mapped_df.columns:
                     mapped_df['price'] = mapped_df['close']
-                    self._log.info("[K线图] 使用'close'列作为'price'")
+                    # self._log.info("[K线图] 使用'close'列作为'price'")
                 else:
-                    self._log.error("[K线图] mapped_df既没有'price'也没有'close'列，无法绘制")
+                    # self._log.error("[K线图] mapped_df既没有'price'也没有'close'列，无法绘制")
                     return
             
             if len(mapped_df) == 0:
-                self._log.error("[K线图] mapped_df为空，无法绘制")
+                # self._log.error("[K线图] mapped_df为空，无法绘制")
                 return
             
             # 固定X轴范围为完整交易日（不随数据量变化）
@@ -3954,19 +3954,19 @@ class ETF159506Strategy(Strategy):
             
             # 验证price数据
             price_data = mapped_df['price'].dropna()
-            self._log.info(f"[K线图] price数据条数: {len(price_data)}")
+            # self._log.info(f"[K线图] price数据条数: {len(price_data)}")
             if len(price_data) > 0:
-                self._log.info(f"[K线图] price数据时间范围: {price_data.index.min()} 到 {price_data.index.max()}")
+                # self._log.info(f"[K线图] price数据时间范围: {price_data.index.min()} 到 {price_data.index.max()}")
                 # 确保x轴范围包含数据范围
                 data_min = price_data.index.min()
                 data_max = price_data.index.max()
                 if data_min < x_min:
                     x_min = data_min - pd.Timedelta(minutes=5)  # 留出一些边距
-                    self._log.info(f"[K线图] 调整x_min以包含数据: {x_min}")
+                    # self._log.info(f"[K线图] 调整x_min以包含数据: {x_min}")
                 if data_max > x_max:
                     x_max = data_max + pd.Timedelta(minutes=5)  # 留出一些边距
-                    self._log.info(f"[K线图] 调整x_max以包含数据: {x_max}")
-            self._log.info(f"[K线图] 最终x轴范围: {x_min} 到 {x_max}")
+                    # self._log.info(f"[K线图] 调整x_max以包含数据: {x_max}")
+            # self._log.info(f"[K线图] 最终x轴范围: {x_min} 到 {x_max}")
             
             # 为每个子图设置相同的固定x轴范围
             for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
@@ -3979,11 +3979,11 @@ class ETF159506Strategy(Strategy):
                 if len(price_data) >= 2:
                     # 多个数据点时绘制线
                     ax1.plot(price_data.index, price_data.values, linewidth=1, color='blue', alpha=0.8, label='成交价', zorder=1)
-                    self._log.info(f"[K线图] 已绘制价格线，数据点: {len(price_data)}")
+                    # self._log.info(f"[K线图] 已绘制价格线，数据点: {len(price_data)}")
                 else:
                     # 单个数据点时使用scatter显示
                     ax1.scatter(price_data.index, price_data.values, s=50, color='blue', alpha=0.8, label='成交价', zorder=1)
-                    self._log.info(f"[K线图] 已绘制价格点（单点），数据点: {len(price_data)}")
+                    # self._log.info(f"[K线图] 已绘制价格点（单点），数据点: {len(price_data)}")
                 
                 # 如果有OHLC数据，绘制K线（蜡烛图）
                 if all(col in mapped_df.columns for col in ['open', 'high', 'low', 'price']):
@@ -4010,7 +4010,7 @@ class ETF159506Strategy(Strategy):
                             ax1.bar(idx, body_height, bottom=body_bottom, width=bar_width, 
                                    color=color, alpha=0.7, edgecolor='black', linewidth=0.5, zorder=3)
                         
-                        self._log.info(f"[K线图] 已绘制K线，数据点: {len(ohlc_data)}")
+                        # self._log.info(f"[K线图] 已绘制K线，数据点: {len(ohlc_data)}")
             else:
                 self._log.warning("[K线图] price数据为空，无法绘制价格线")
             
@@ -4747,8 +4747,8 @@ class ETF159506Strategy(Strategy):
             
             minute_stats = pd.DataFrame(volume_list)
             
-            self._log.info(f"从已记录数据获取了 {len(minute_stats)} 分钟的成交量（内存访问，无需读取cache）")
-            self._log.info(f"成交量统计 - 总计: {minute_stats['总成交量'].sum():.0f}, 平均: {minute_stats['总成交量'].mean():.2f}, 最大: {minute_stats['总成交量'].max():.0f}")
+            # self._log.info(f"从已记录数据获取了 {len(minute_stats)} 分钟的成交量（内存访问，无需读取cache）")
+            # self._log.info(f"成交量统计 - 总计: {minute_stats['总成交量'].sum():.0f}, 平均: {minute_stats['总成交量'].mean():.2f}, 最大: {minute_stats['总成交量'].max():.0f}")
             
             return minute_stats
             
