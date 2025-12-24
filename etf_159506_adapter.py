@@ -258,10 +258,19 @@ class ETF159506DataSaver:
         self.quote_buffer = deque(maxlen=10000)  # QuoteTick专用缓冲区（最多10000条）
         self.trade_buffer = deque(maxlen=10000)  # TradeTick专用缓冲区（最多10000条）
         self.last_save_time = time.time()
+        
+        # ✅ 定时保存配置
+        self.save_interval_seconds = 30  # 定时保存间隔（秒）
+        self.min_buffer_size = 20  # 最小缓冲区大小（按数量保存的阈值）
+        self._save_timer_thread = None
+        self._stop_timer = False
        
         
         # 初始化数据目录
         self._init_catalog()
+        
+        # ✅ 启动定时保存任务
+        self._start_timer_save()
         
     def _init_catalog(self):
         """初始化Parquet数据目录"""
@@ -326,20 +335,76 @@ class ETF159506DataSaver:
             logger.error(f"❌ 添加QuoteTick失败: {e}")
     
     def _check_quote_save(self):
-        """检查QuoteTick是否需要保存"""
-        current_time = time.time()
-        
-        # 按数量保存 - QuoteTick至少20条数据才保存
-        if len(self.quote_buffer) >= 20:
+        """检查QuoteTick是否需要保存（按数量）"""
+        # 按数量保存 - QuoteTick至少达到最小缓冲区大小才保存
+        if len(self.quote_buffer) >= self.min_buffer_size:
             self._flush_quote_buffer()
     
     def _check_trade_save(self):
-        """检查TradeTick是否需要保存"""
-        current_time = time.time()
-        
-        # 按数量保存 - TradeTick至少20条数据才保存
-        if len(self.trade_buffer) >= 20:
+        """检查TradeTick是否需要保存（按数量）"""
+        # 按数量保存 - TradeTick至少达到最小缓冲区大小才保存
+        if len(self.trade_buffer) >= self.min_buffer_size:
             self._flush_trade_buffer()
+    
+    def _start_timer_save(self):
+        """启动定时保存任务（按时间保存）"""
+        if self._save_timer_thread and self._save_timer_thread.is_alive():
+            return
+        
+        def timer_save_loop():
+            """定时保存循环"""
+            while not self._stop_timer:
+                try:
+                    time.sleep(self.save_interval_seconds)
+                    
+                    if self._stop_timer:
+                        break
+                    
+                    current_time = time.time()
+                    time_since_last_save = current_time - self.last_save_time
+                    
+                    # 如果超过保存间隔，且有数据在缓冲区，则保存
+                    if time_since_last_save >= self.save_interval_seconds:
+                        has_data = False
+                        
+                        # 检查QuoteTick缓冲区
+                        if len(self.quote_buffer) > 0:
+                            logger.info(
+                                f"⏰ 定时保存QuoteTick: {len(self.quote_buffer)} 条 "
+                                f"(距上次保存 {time_since_last_save:.1f} 秒)"
+                            )
+                            self._flush_quote_buffer()
+                            has_data = True
+                        
+                        # 检查TradeTick缓冲区
+                        if len(self.trade_buffer) > 0:
+                            logger.info(
+                                f"⏰ 定时保存TradeTick: {len(self.trade_buffer)} 条 "
+                                f"(距上次保存 {time_since_last_save:.1f} 秒)"
+                            )
+                            self._flush_trade_buffer()
+                            has_data = True
+                        
+                        if has_data:
+                            self.last_save_time = current_time
+                        
+                except Exception as e:
+                    logger.error(f"定时保存任务出错: {e}")
+        
+        self._stop_timer = False
+        self._save_timer_thread = threading.Thread(target=timer_save_loop, daemon=True)
+        self._save_timer_thread.start()
+        logger.info(
+            f"✅ 定时保存任务已启动: 间隔={self.save_interval_seconds}秒, "
+            f"最小缓冲区大小={self.min_buffer_size}条"
+        )
+    
+    def _stop_timer_save(self):
+        """停止定时保存任务"""
+        self._stop_timer = True
+        if self._save_timer_thread and self._save_timer_thread.is_alive():
+            self._save_timer_thread.join(timeout=2)
+        logger.debug("定时保存任务已停止")
     
     def _flush_quote_buffer(self):
         """独立保存QuoteTick缓冲区"""
@@ -414,9 +479,24 @@ class ETF159506DataSaver:
             self.trade_buffer.clear()
     
     def force_save(self):
-        """强制保存所有缓冲数据"""
+        """强制保存所有缓冲数据（用于程序退出时）"""
+        logger.info("🔄 强制保存所有缓冲数据...")
+        quote_count = len(self.quote_buffer)
+        trade_count = len(self.trade_buffer)
+        
         self._flush_quote_buffer()
         self._flush_trade_buffer()
+        
+        logger.info(
+            f"✅ 强制保存完成: QuoteTick {quote_count} 条, TradeTick {trade_count} 条"
+        )
+    
+    def cleanup(self):
+        """清理资源（程序退出时调用）"""
+        logger.info("🧹 清理数据保存器资源...")
+        self._stop_timer_save()  # 停止定时保存任务
+        self.force_save()  # 强制保存所有缓冲数据
+        logger.info("✅ 数据保存器资源清理完成")
     
     def get_saved_data_count(self) -> int:
         """获取已保存的数据条数"""
@@ -996,6 +1076,21 @@ class ETF159506WebSocketClient:
         self.data_receive_count = 0
         self.last_data_time = None
         
+        # ✅ 自动重连配置
+        self.auto_reconnect = True  # 启用自动重连
+        self.reconnect_interval = 5  # 重连间隔（秒）
+        self.max_reconnect_attempts = 2  # 最大重连次数
+        self.reconnect_attempts = 0
+        self.reconnect_timer = None
+        self._should_reconnect = True  # 控制是否应该重连（用于手动断开时禁用）
+        self._main_loop = None  # 主事件循环引用（用于重连）
+        
+        # ✅ 数据接收监控配置
+        self.data_monitor_interval = 30  # 数据监控检查间隔（秒）
+        self.data_timeout_threshold = 60  # 数据超时阈值（秒）- 超过此时间未收到数据则警告
+        self.data_monitor_task = None
+        self._monitoring = False
+        
     async def connect(self) -> bool:
         """连接WebSocket"""
         try:
@@ -1039,6 +1134,17 @@ class ETF159506WebSocketClient:
             
             if self.is_connected:
                 self.logger.info("WebSocket连接成功建立")
+                self.reconnect_attempts = 0  # 重置重连计数
+                # 保存主事件循环引用（用于重连）
+                try:
+                    self._main_loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    # 如果没有运行的事件循环，尝试获取或创建
+                    try:
+                        self._main_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        self._main_loop = None
+                self._start_data_monitoring()  # 启动数据监控
                 return True
             else:
                 self.logger.error("WebSocket连接超时")
@@ -1050,6 +1156,9 @@ class ETF159506WebSocketClient:
     
     async def disconnect(self) -> None:
         """断开WebSocket连接"""
+        self._should_reconnect = False  # 手动断开时禁用自动重连
+        self._stop_data_monitoring()  # 停止数据监控
+        
         if self.ws:
             try:
                 self.ws.close()
@@ -1080,12 +1189,16 @@ class ETF159506WebSocketClient:
         """连接打开回调"""
         self.connection_count += 1
         self.is_connected = True
+        self.reconnect_attempts = 0  # 重置重连计数
         self.logger.info(f"WebSocket连接已建立 (第{self.connection_count}次连接)")
         
         # 订阅数据
         subscription = f"add=lv1_{self.stock_code}"
         ws.send(subscription)
         self.logger.info(f"已订阅: {subscription}")
+        
+        # 启动数据监控
+        self._start_data_monitoring()
     
     def _on_message(self, ws, message, *args):
         """接收消息回调"""
@@ -1170,7 +1283,52 @@ class ETF159506WebSocketClient:
     def _on_close(self, ws, code, msg):
         """连接关闭回调"""
         self.is_connected = False
+        self._stop_data_monitoring()  # 停止数据监控
         self.logger.info(f"WebSocket连接已关闭: {code} - {msg}")
+        
+        # ✅ 自动重连逻辑
+        if self.auto_reconnect and self._should_reconnect:
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                self.logger.warning(
+                    f"⚠️ WebSocket连接断开，将在 {self.reconnect_interval} 秒后尝试重连 "
+                    f"(第 {self.reconnect_attempts}/{self.max_reconnect_attempts} 次)"
+                )
+                
+                # 使用 asyncio 延迟重连（在后台线程中需要特殊处理）
+                def delayed_reconnect():
+                    time.sleep(self.reconnect_interval)
+                    if not self._should_reconnect:  # 检查是否仍然需要重连
+                        return
+                    
+                    try:
+                        # 尝试使用保存的主事件循环
+                        if self._main_loop and self._main_loop.is_running():
+                            asyncio.run_coroutine_threadsafe(self._reconnect_async(), self._main_loop)
+                        else:
+                            # 如果没有可用的循环，尝试获取当前循环
+                            try:
+                                loop = asyncio.get_running_loop()
+                                if loop.is_running():
+                                    asyncio.run_coroutine_threadsafe(self._reconnect_async(), loop)
+                            except RuntimeError:
+                                # 如果没有运行中的循环，创建新的事件循环
+                                new_loop = asyncio.new_event_loop()
+                                asyncio.set_event_loop(new_loop)
+                                try:
+                                    new_loop.run_until_complete(self._reconnect_async())
+                                finally:
+                                    new_loop.close()
+                    except Exception as e:
+                        self.logger.error(f"调度重连任务失败: {e}")
+                
+                reconnect_thread = threading.Thread(target=delayed_reconnect, daemon=True)
+                reconnect_thread.start()
+            else:
+                self.logger.error(
+                    f"❌ 已达到最大重连次数 ({self.max_reconnect_attempts})，停止自动重连。"
+                    f"请检查网络连接或手动重启系统。"
+                )
     
     async def _call_callback(self, callback_name: str, data: Dict):
         """异步调用回调函数"""
@@ -1183,6 +1341,75 @@ class ETF159506WebSocketClient:
                     callback(data)
         except Exception as e:
             self.logger.error(f"回调函数执行失败: {e}")
+    
+    async def _reconnect_async(self) -> None:
+        """异步重连方法"""
+        try:
+            self.logger.info(f"🔄 开始第 {self.reconnect_attempts} 次重连...")
+            success = await self.connect()
+            if success:
+                self.logger.info("✅ WebSocket重连成功")
+            else:
+                self.logger.error("❌ WebSocket重连失败")
+        except Exception as e:
+            self.logger.error(f"重连过程中发生错误: {e}")
+    
+    def _start_data_monitoring(self) -> None:
+        """启动数据接收监控"""
+        if self._monitoring:
+            return
+        
+        self._monitoring = True
+        
+        def monitor_loop():
+            """数据监控循环（在后台线程中运行）"""
+            while self._monitoring and self.is_connected:
+                try:
+                    import time
+                    time.sleep(self.data_monitor_interval)
+                    
+                    if not self._monitoring:
+                        break
+                    
+                    # 检查是否长时间未收到数据
+                    if self.last_data_time is None:
+                        # 刚连接，还没有收到数据，跳过检查
+                        continue
+                    
+                    time_since_last_data = (datetime.now() - self.last_data_time).total_seconds()
+                    
+                    if time_since_last_data > self.data_timeout_threshold:
+                        self.logger.warning(
+                            f"⚠️ 数据接收超时警告: 已 {time_since_last_data:.1f} 秒未收到数据 "
+                            f"(阈值: {self.data_timeout_threshold} 秒)"
+                        )
+                        self.logger.warning(
+                            f"   总接收数据量: {self.data_receive_count} 条, "
+                            f"最后数据时间: {self.last_data_time}"
+                        )
+                        
+                        # 如果超时时间过长，可能是连接问题，触发重连检查
+                        if time_since_last_data > self.data_timeout_threshold * 2:
+                            self.logger.error(
+                                f"❌ 数据接收超时严重，可能是连接断开。"
+                                f"当前连接状态: {self.is_connected}"
+                            )
+                            # 注意：这里不主动触发重连，因为 _on_close 会处理
+                    
+                except Exception as e:
+                    self.logger.error(f"数据监控循环出错: {e}")
+        
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+        self.logger.info(
+            f"✅ 数据接收监控已启动: 检查间隔={self.data_monitor_interval}秒, "
+            f"超时阈值={self.data_timeout_threshold}秒"
+        )
+    
+    def _stop_data_monitoring(self) -> None:
+        """停止数据接收监控"""
+        self._monitoring = False
+        self.logger.debug("数据接收监控已停止")
 
 
 class ETF159506InstrumentProvider(InstrumentProvider):
@@ -1336,6 +1563,15 @@ class ETF159506Adapter:
     
     async def disconnect(self) -> None:
         """断开适配器"""
+        # ✅ 先保存所有缓冲数据，再断开连接
+        if hasattr(self, 'ws_client') and self.ws_client:
+            if hasattr(self.ws_client, 'data_processor') and self.ws_client.data_processor:
+                if hasattr(self.ws_client.data_processor, 'data_saver') and self.ws_client.data_processor.data_saver:
+                    try:
+                        self.ws_client.data_processor.data_saver.cleanup()
+                    except Exception as e:
+                        self.logger.error(f"清理数据保存器失败: {e}")
+        
         await self.http_client.disconnect()
         await self.ws_client.disconnect()
         # 注意：数据客户端和执行客户端现在都由NautilusTrader管理，不需要在这里断开
