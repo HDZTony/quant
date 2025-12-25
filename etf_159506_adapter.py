@@ -421,17 +421,16 @@ class ETF159506DataSaver:
             logger.debug(f"   - QuoteTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
             
             # 保存QuoteTick数据
-            try:
-                self.catalog.write_data(self.quote_buffer)
-                saved_count = len(self.quote_buffer)
-                logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
-                logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
-            except AssertionError as e:
-                # 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
-                if "Intervals are not disjoint" in str(e):
-                    logger.warning(f"⚠️  QuoteTick时间间隔重叠，跳过保存以避免阻塞websocket: {len(self.quote_buffer)} 条数据")
-                else:
-                    raise
+            # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
+            # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
+            # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
+            self.catalog.write_data(
+                self.quote_buffer,
+                skip_disjoint_check=True
+            )
+            saved_count = len(self.quote_buffer)
+            logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
+            logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
             
             # 清空QuoteTick缓冲区
             self.quote_buffer.clear()
@@ -457,17 +456,16 @@ class ETF159506DataSaver:
             logger.debug(f"   - TradeTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
             
             # 保存TradeTick数据
-            try:
-                self.catalog.write_data(self.trade_buffer)
-                saved_count = len(self.trade_buffer)
-                logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
-                logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
-            except AssertionError as e:
-                # 处理时间间隔重叠错误（可能是并发写入或时间戳重复）
-                if "Intervals are not disjoint" in str(e):
-                    logger.warning(f"⚠️  TradeTick时间间隔重叠，跳过保存以避免阻塞websocket: {len(self.trade_buffer)} 条数据")
-                else:
-                    raise
+            # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
+            # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
+            # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
+            self.catalog.write_data(
+                self.trade_buffer,
+                skip_disjoint_check=True
+            )
+            saved_count = len(self.trade_buffer)
+            logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
+            logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
             
             # 清空TradeTick缓冲区
             self.trade_buffer.clear()
