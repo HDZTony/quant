@@ -264,7 +264,10 @@ class ETF159506DataSaver:
         self.min_buffer_size = 20  # 最小缓冲区大小（按数量保存的阈值）
         self._save_timer_thread = None
         self._stop_timer = False
-       
+        
+        # ✅ 添加线程锁保护 catalog 的并发访问（读写互斥）
+        # 解决 parquet 文件并发读写导致的 "Requested range was invalid" 错误
+        self._catalog_lock = threading.RLock()
         
         # 初始化数据目录
         self._init_catalog()
@@ -410,71 +413,75 @@ class ETF159506DataSaver:
         """独立保存QuoteTick缓冲区"""
         if not self.quote_buffer or not self.catalog:
             return
-            
-        try:
-            logger.debug(f"🔍 准备保存QuoteTick数据: {len(self.quote_buffer)} 条")
-            
-            # 显示时间戳范围
-            ts_events = [tick.ts_event for tick in self.quote_buffer]
-            ts_inits = [tick.ts_init for tick in self.quote_buffer]
-            logger.debug(f"   - QuoteTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
-            logger.debug(f"   - QuoteTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
-            
-            # 保存QuoteTick数据
-            # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
-            # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
-            # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
-            self.catalog.write_data(
-                self.quote_buffer,
-                skip_disjoint_check=True
-            )
-            saved_count = len(self.quote_buffer)
-            logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
-            logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
-            
-            # 清空QuoteTick缓冲区
-            self.quote_buffer.clear()
-            
-        except Exception as e:
-            logger.error(f"❌ QuoteTick保存失败: {e}")
-            logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
-            # 即使保存失败，也清空缓冲区避免重复保存
-            self.quote_buffer.clear()
+        
+        # ✅ 使用锁保护写入操作，避免与读取操作并发冲突
+        with self._catalog_lock:
+            try:
+                logger.debug(f"🔍 准备保存QuoteTick数据: {len(self.quote_buffer)} 条")
+                
+                # 显示时间戳范围
+                ts_events = [tick.ts_event for tick in self.quote_buffer]
+                ts_inits = [tick.ts_init for tick in self.quote_buffer]
+                logger.debug(f"   - QuoteTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
+                logger.debug(f"   - QuoteTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
+                
+                # 保存QuoteTick数据
+                # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
+                # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
+                # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
+                self.catalog.write_data(
+                    self.quote_buffer,
+                    skip_disjoint_check=True
+                )
+                saved_count = len(self.quote_buffer)
+                logger.debug(f"💾 已保存 {saved_count} 条QuoteTick数据")
+                logger.info(f"💾 QuoteTick保存完成: {saved_count} 条")
+                
+                # 清空QuoteTick缓冲区
+                self.quote_buffer.clear()
+                
+            except Exception as e:
+                logger.error(f"❌ QuoteTick保存失败: {e}")
+                logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
+                # 即使保存失败，也清空缓冲区避免重复保存
+                self.quote_buffer.clear()
     
     def _flush_trade_buffer(self):
         """独立保存TradeTick缓冲区"""
         if not self.trade_buffer or not self.catalog:
             return
-            
-        try:
-            logger.debug(f"🔍 准备保存TradeTick数据: {len(self.trade_buffer)} 条")
-            
-            # 显示时间戳范围
-            ts_events = [tick.ts_event for tick in self.trade_buffer]
-            ts_inits = [tick.ts_init for tick in self.trade_buffer]
-            logger.debug(f"   - TradeTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
-            logger.debug(f"   - TradeTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
-            
-            # 保存TradeTick数据
-            # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
-            # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
-            # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
-            self.catalog.write_data(
-                self.trade_buffer,
-                skip_disjoint_check=True
-            )
-            saved_count = len(self.trade_buffer)
-            logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
-            logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
-            
-            # 清空TradeTick缓冲区
-            self.trade_buffer.clear()
-            
-        except Exception as e:
-            logger.error(f"❌ TradeTick保存失败: {e}")
-            logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
-            # 即使保存失败，也清空缓冲区避免重复保存
-            self.trade_buffer.clear()
+        
+        # ✅ 使用锁保护写入操作，避免与读取操作并发冲突
+        with self._catalog_lock:
+            try:
+                logger.debug(f"🔍 准备保存TradeTick数据: {len(self.trade_buffer)} 条")
+                
+                # 显示时间戳范围
+                ts_events = [tick.ts_event for tick in self.trade_buffer]
+                ts_inits = [tick.ts_init for tick in self.trade_buffer]
+                logger.debug(f"   - TradeTick ts_event范围: {min(ts_events)} - {max(ts_events)}")
+                logger.debug(f"   - TradeTick ts_init范围: {min(ts_inits)} - {max(ts_inits)}")
+                
+                # 保存TradeTick数据
+                # ✅ 直接使用 skip_disjoint_check=True 避免时间间隔重叠错误
+                # 实时数据保存时，同一秒内的多条数据可能产生相同的时间范围
+                # 参考官方文档: https://nautilustrader.io/docs/latest/concepts/data
+                self.catalog.write_data(
+                    self.trade_buffer,
+                    skip_disjoint_check=True
+                )
+                saved_count = len(self.trade_buffer)
+                logger.debug(f"💾 已保存 {saved_count} 条TradeTick数据")
+                logger.info(f"💾 TradeTick保存完成: {saved_count} 条")
+                
+                # 清空TradeTick缓冲区
+                self.trade_buffer.clear()
+                
+            except Exception as e:
+                logger.error(f"❌ TradeTick保存失败: {e}")
+                logger.error(f"❌ 错误详情: {type(e).__name__}: {str(e)}")
+                # 即使保存失败，也清空缓冲区避免重复保存
+                self.trade_buffer.clear()
     
     def force_save(self):
         """强制保存所有缓冲数据（用于程序退出时）"""
@@ -2266,14 +2273,27 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
                 logger.debug("未配置catalog路径，跳过本地数据加载")
                 return []
             
-            # 导入ParquetDataCatalog
-            from nautilus_trader.persistence.catalog import ParquetDataCatalog
-            
-            # 创建catalog实例
-            catalog = ParquetDataCatalog(catalog_path)
+            # ✅ 优先使用 data_saver 的 catalog（如果存在），避免创建多个实例导致并发冲突
+            # 如果 data_saver 存在且有 catalog，使用它的 catalog 和锁
+            data_saver = getattr(self, 'data_saver', None)
+            if data_saver and data_saver.catalog:
+                catalog = data_saver.catalog
+                catalog_lock = data_saver._catalog_lock
+                logger.debug("使用 data_saver 的 catalog 实例（带锁保护）")
+            else:
+                # 如果没有 data_saver，创建新的 catalog 实例
+                from nautilus_trader.persistence.catalog import ParquetDataCatalog
+                catalog = ParquetDataCatalog(catalog_path)
+                catalog_lock = None
+                logger.debug("创建新的 catalog 实例（无锁，仅读取）")
             
             # 2. 如果没找到bar数据，尝试从trade_tick聚合生成
-            bars_list = await self._generate_bars_from_ticks(catalog, bar_type, start, end, limit)
+            # ✅ 使用锁保护读取操作（如果可用）
+            if catalog_lock:
+                with catalog_lock:
+                    bars_list = await self._generate_bars_from_ticks(catalog, bar_type, start, end, limit)
+            else:
+                bars_list = await self._generate_bars_from_ticks(catalog, bar_type, start, end, limit)
             
             if bars_list:
                 logger.info(f"🔄 从trade_tick聚合生成了 {len(bars_list)} 条K线数据")
@@ -2284,6 +2304,8 @@ class ETF159506NautilusDataClient(LiveMarketDataClient):
             
         except Exception as e:
             logger.warning(f"从catalog加载历史数据失败: {e}")
+            import traceback
+            logger.debug(f"详细错误: {traceback.format_exc()}")
             return []
     
     # ========== 从ETF159506DataClient集成的方法 ==========
