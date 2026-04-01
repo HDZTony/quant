@@ -29,3 +29,5 @@ etf_159506_realtime_extremes.png
 etf_159506_realtime_kline.png
 etf_159506_realtime_trade_points.png
 quant.code-workspace
+
+kline-viewer/node_modules/

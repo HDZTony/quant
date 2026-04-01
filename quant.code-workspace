@@ -4,13 +4,10 @@
 			"path": "."
 		},
 		{
-			"path": "../../redis"
+			"path": "nautilus_trader"
 		},
 		{
-			"path": "../../nautilus_trader"
-		},
-		{
-			"path": "../../../Downloads/redis-8.4.0/redis-8.4.0"
+			"path": "redis-windows"
 		}
 	],
 	"settings": {}

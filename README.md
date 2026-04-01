@@ -278,3 +278,11 @@ def export_data(self, format='csv'):
 ---
 
 **免责声明**: 本系统仅供学习和研究使用，不构成投资建议。使用本系统进行实际交易的风险由用户自行承担。 
+# 手动立刻执行一次
+schtasks /run /tn ETF159506_1min_Collector
+
+# 查看任务状态
+schtasks /query /tn ETF159506_1min_Collector
+
+# 删除任务
+schtasks /delete /tn ETF159506_1min_Collector /f
