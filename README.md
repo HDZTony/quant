@@ -286,3 +286,5 @@ schtasks /query /tn ETF159506_1min_Collector
 
 # 删除任务
 schtasks /delete /tn ETF159506_1min_Collector /f
+
+ETF159506_Tick_Collector

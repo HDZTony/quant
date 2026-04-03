@@ -29,6 +29,7 @@ from datetime import datetime, time, date, timedelta
 import pytz
 import warnings
 from typing import List, Dict
+import json
 import threading
 
 from etf_159506_strategy_config import ETF159506Config
@@ -175,6 +176,56 @@ class ETF159506Strategy(Strategy):
         self.today_pct_change: float | None = None
         self.today_date: date | None = None
         self.today_pct_change_history: list[dict] = []  # [{'time': datetime, 'pct': float}]
+
+        # Redis 实时推送（连接失败时静默降级，不影响交易）
+        self._redis_client = None
+        self._last_bar_signal: str | None = None
+        try:
+            import redis as _redis_mod
+            self._redis_client = _redis_mod.Redis(host="localhost", port=6379, socket_timeout=1)
+            self._redis_client.ping()
+            self._log.info("Redis 连接成功，实时推送已启用")
+        except Exception as e:
+            self._redis_client = None
+            self._log.warning(f"Redis 连接失败，实时推送已禁用: {e}")
+
+    def _publish_bar_to_redis(self, bar: Bar) -> None:
+        """将当前 bar + 指标 + 信号推送到 Redis channel。"""
+        if self._redis_client is None or self.is_backtest_mode:
+            return
+        try:
+            utc_time = pd.to_datetime(bar.ts_event, unit='ns')
+            beijing_time = utc_time.tz_localize('UTC').tz_convert('Asia/Shanghai')
+            payload = {
+                "time": int(beijing_time.timestamp()),
+                "open": bar.open.as_double(),
+                "high": bar.high.as_double(),
+                "low": bar.low.as_double(),
+                "close": bar.close.as_double(),
+                "volume": bar.volume.as_double(),
+                "macd_dif": round(self.macd.value, 6) if self.macd.initialized else None,
+                "macd_dea": round(self.macd_signal.value, 6) if self.macd_signal.initialized else None,
+                "macd_histogram": round(self.macd.value - self.macd_signal.value, 6) if (self.macd.initialized and self.macd_signal.initialized) else None,
+                "rsi": round(self.rsi.value * 100, 2) if self.rsi.initialized else None,
+                "kdj_k": round(self.kdj.value_k, 2) if self.kdj.initialized else None,
+                "kdj_d": round(self.kdj.value_d, 2) if self.kdj.initialized else None,
+                "kdj_j": round(self.kdj.value_j, 2) if self.kdj.initialized else None,
+                "signal": self._last_bar_signal,
+            }
+            self._redis_client.publish("etf:159506:bar", json.dumps(payload))
+            self._last_bar_signal = None
+        except Exception as e:
+            self._log.warning(f"Redis 推送 bar 失败: {e}")
+
+    def _publish_signal_to_redis(self, side: str, price: float, signal_type: str) -> None:
+        """将交易信号推送到 Redis channel。"""
+        if self._redis_client is None or self.is_backtest_mode:
+            return
+        try:
+            payload = {"side": side, "price": price, "signal_type": signal_type}
+            self._redis_client.publish("etf:159506:signal", json.dumps(payload))
+        except Exception as e:
+            self._log.warning(f"Redis 推送 signal 失败: {e}")
 
     def _check_existing_positions(self):
         """
@@ -756,11 +807,11 @@ class ETF159506Strategy(Strategy):
         
         # ✅ 更新实时图表（根据运行模式决定是否绘图）
         if self.is_backtest_mode:
-            # 回测模式：不每分钟绘图，只在策略结束时绘图（在 on_stop 中处理）
             self._log.debug(f"回测模式：跳过每分钟绘图，将在策略结束时统一绘图")
         else:
-            # 实时模式：每分钟绘图
             self.update_realtime_charts(last_bar)
+
+        self._publish_bar_to_redis(last_bar)
         self.technical_signal = 0
     
     def _refresh_open_orders(self, bar: Bar) -> None:
@@ -2460,6 +2511,8 @@ class ETF159506Strategy(Strategy):
             'signal_value': signal_value
         }
         self.trade_signals.append(trade_signal)
+        self._last_bar_signal = "buy"
+        self._publish_signal_to_redis("buy", buy_price.as_double(), signal_type)
         
         self._log.info(
             f"买入订单已提交: 数量={trade_quantity}, "
@@ -2588,6 +2641,8 @@ class ETF159506Strategy(Strategy):
                 'signal_value': signal_value
             }
             self.trade_signals.append(trade_signal)
+            self._last_bar_signal = "sell"
+            self._publish_signal_to_redis("sell", sell_price.as_double(), signal_type)
             
             self._log.info(
                 f"执行SELL订单: 数量={quantity}, 价格={sell_price.as_double():.4f}, "

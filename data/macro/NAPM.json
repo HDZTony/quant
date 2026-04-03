@@ -1,0 +1,1 @@
+{"meta": {"series_id": "NAPM", "name": "ISM制造业PMI", "unit": "指数", "frequency": "monthly", "description": "ISM Manufacturing PMI", "transform": "raw"}, "data": [], "updated_at": "2026-04-03T03:51:13.643661+00:00", "error": "Bad Request.  The series does not exist."}

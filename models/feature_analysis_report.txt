@@ -1,0 +1,55 @@
+======================================================================
+  ML 特征分析报告 — 策略优化建议
+======================================================================
+
+[1] 特征重要性排名 (XGBoost gain)
+--------------------------------------------------
+  # 1  minutes_to_close              importance=0.0908  累计=9%
+  # 2  minutes_from_open             importance=0.0780  累计=17%
+  # 3  min_since_price_peak          importance=0.0448  累计=21%
+  # 4  min_since_price_trough        importance=0.0410  累计=25%
+  # 5  min_since_dif_trough          importance=0.0371  累计=29%
+  # 6  min_since_dif_peak            importance=0.0371  累计=33%
+  # 7  dea                           importance=0.0354  累计=36%
+  # 8  return_20m                    importance=0.0325  累计=40%
+  # 9  j_oversold                    importance=0.0299  累计=43%
+  #10  dif                           importance=0.0294  累计=46%
+  #11  bar_range                     importance=0.0289  累计=48%
+  #12  dea_diff1                     importance=0.0282  累计=51%
+  #13  j_overbought                  importance=0.0281  累计=54%
+  #14  intraday_return               importance=0.0273  累计=57%
+  #15  dif_diff1                     importance=0.0268  累计=60%
+
+  前 23 个特征贡献了 80% 的重要性
+
+[2] 对买入信号最重要的特征 (SHAP)
+--------------------------------------------------
+  # 1  min_since_dif_peak            |SHAP|=0.157427
+  # 2  min_since_dif_trough          |SHAP|=0.154907
+  # 3  min_since_price_trough        |SHAP|=0.151796
+  # 4  min_since_price_peak          |SHAP|=0.144419
+  # 5  dea                           |SHAP|=0.109104
+  # 6  minutes_from_open             |SHAP|=0.101430
+  # 7  return_20m                    |SHAP|=0.077596
+  # 8  intraday_return               |SHAP|=0.067766
+  # 9  bar_return                    |SHAP|=0.057723
+  #10  return_10m                    |SHAP|=0.039512
+
+[3] 对卖出信号最重要的特征 (SHAP)
+--------------------------------------------------
+  # 1  minutes_from_open             |SHAP|=0.186466
+  # 2  min_since_price_peak          |SHAP|=0.182884
+  # 3  min_since_dif_peak            |SHAP|=0.171359
+  # 4  min_since_dif_trough          |SHAP|=0.118186
+  # 5  intraday_return               |SHAP|=0.110672
+  # 6  min_since_price_trough        |SHAP|=0.103921
+  # 7  minutes_to_close              |SHAP|=0.082218
+  # 8  histogram                     |SHAP|=0.078184
+  # 9  dif_diff1                     |SHAP|=0.058465
+  #10  lower_shadow                  |SHAP|=0.047198
+
+[4] 策略优化建议
+--------------------------------------------------
+  - MACD 相关特征 ['dea'] 在 top-5 中出现，当前策略的 MACD 权重设置合理
+  - 时间特征 ['minutes_from_open'] 说明日内不同时段信号强度不同，建议对开盘/尾盘时段使用不同的信号阈值
+  - 低重要性特征（可考虑移除）: ['histogram_diff2', 'volume_ratio_5m', 'volume_diff1', 'death_cross', 'golden_cross']

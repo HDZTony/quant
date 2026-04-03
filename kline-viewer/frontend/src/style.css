@@ -15,3 +15,8 @@ body,
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #1e1e2e;
 }
+
+/* Hide TradingView branding from lightweight-charts */
+a[href*="tradingview.com"] {
+  display: none !important;
+}

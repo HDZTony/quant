@@ -5,9 +5,6 @@
 		},
 		{
 			"path": "nautilus_trader"
-		},
-		{
-			"path": "redis-windows"
 		}
 	],
 	"settings": {}
