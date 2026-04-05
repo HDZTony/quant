@@ -1,6 +1,3 @@
-[submodule "OpenSpace"]
-	path = OpenSpace
-	url = https://github.com/HKUDS/OpenSpace.git
 [submodule "nautilus_trader"]
 	path = nautilus_trader
 	url = https://github.com/HDZTony/nautilus_trader.git
