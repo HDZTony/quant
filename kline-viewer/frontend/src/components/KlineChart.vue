@@ -70,10 +70,77 @@ const hoverTimeLabel = ref('')
 /** 鼠标在图左半区域时，图例贴右上角，避免挡十字线；右半则贴左上角 */
 const legendDockRight = ref(true)
 
-/** 各图区高度（px），可拖拽分割条调整；总高度可超出视口由外层纵向滚动 */
+/** 各图区高度（px），可拖拽分割条在相邻两格间调整；总高度随图表区视口变化 */
 const PANE_MIN_H = 72
-/** 默认总高度较原 830px 再 +1000px（主图 +520，MACD/RSI/KDJ 各 +160） */
-const paneHeights = ref([900, 310, 310, 310])
+/** 首次分配主图 / MACD / RSI / KDJ 占比（总和为 1） */
+const DEFAULT_FRAC = [0.52, 0.16, 0.16, 0.16]
+const paneHeights = ref([320, 120, 120, 120])
+
+const chartScrollRef = ref<HTMLDivElement | null>(null)
+const chartStackRef = ref<HTMLDivElement | null>(null)
+const klineRootRef = ref<HTMLDivElement | null>(null)
+let chartAreaResizeObserver: ResizeObserver | null = null
+let layoutAreaDone = false
+/** 上一次由 layoutChartArea 写入后的各 pane 高度之和；用于区分「用户拖拽增高」与「仅视口变矮」 */
+const lastLayoutPaneSum = ref(0)
+
+const PANE_HEIGHTS_STORAGE_KEY = 'kline-viewer:pane-heights-v1'
+
+function getViewportPaneDist(): number | null {
+  const scroll = chartScrollRef.value
+  const stack = chartStackRef.value
+  if (!scroll || !stack) return null
+  const available = scroll.clientHeight
+  if (available < 1) return null
+  const fixed = measureFixedOverhead(stack)
+  const rawDist = Math.max(0, available - fixed)
+  return Math.max(rawDist, PANE_MIN_H * 4)
+}
+
+function parseSavedPaneHeights(raw: string | null): number[] | null {
+  if (raw == null || raw === '') return null
+  try {
+    const data = JSON.parse(raw) as unknown
+    const arr = Array.isArray(data)
+      ? data
+      : (data && typeof data === 'object' && Array.isArray((data as { heights?: unknown }).heights)
+        ? (data as { heights: unknown[] }).heights
+        : null)
+    if (!arr || arr.length !== 4) return null
+    const nums = arr.map(x => Number(x))
+    if (!nums.every(n => Number.isFinite(n) && n >= PANE_MIN_H)) return null
+    return nums
+  } catch {
+    return null
+  }
+}
+
+function persistPaneHeights() {
+  try {
+    localStorage.setItem(PANE_HEIGHTS_STORAGE_KEY, JSON.stringify({ v: 1, heights: paneHeights.value }))
+  } catch {
+    /* private mode / quota */
+  }
+}
+
+let paneHeightsSaveTimer: ReturnType<typeof setTimeout> | null = null
+function schedulePersistPaneHeights() {
+  if (paneHeightsSaveTimer) clearTimeout(paneHeightsSaveTimer)
+  paneHeightsSaveTimer = setTimeout(() => {
+    paneHeightsSaveTimer = null
+    persistPaneHeights()
+  }, 400)
+}
+
+function restoreFullscreenLayout() {
+  layoutChartArea(false)
+  chartScrollRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+  persistPaneHeights()
+}
+
+function onBeforeUnloadPersistPaneHeights() {
+  persistPaneHeights()
+}
 
 type SplitterDragState = { index: number; startY: number; startHeights: number[] }
 let splitterDrag: SplitterDragState | null = null
@@ -89,10 +156,18 @@ function onSplitterMouseMove(e: MouseEvent) {
   if (!splitterDrag) return
   const { index, startY, startHeights } = splitterDrag
   const dy = e.clientY - startY
-  const a = startHeights[index]! + dy
-  const b = startHeights[index + 1]! - dy
-  if (a < PANE_MIN_H || b < PANE_MIN_H) return
-  const next = [...paneHeights.value]
+  let a = startHeights[index]! + dy
+  let b = startHeights[index + 1]! - dy
+  // 一侧达到最小高度后仍继续拖拽：增加上下两格高度之和，外层 chart-scroll 纵向滚动，便于继续拉高指标区
+  if (a < PANE_MIN_H) {
+    b += PANE_MIN_H - a
+    a = PANE_MIN_H
+  }
+  if (b < PANE_MIN_H) {
+    a += PANE_MIN_H - b
+    b = PANE_MIN_H
+  }
+  const next = [...startHeights]
   next[index] = a
   next[index + 1] = b
   paneHeights.value = next
@@ -102,6 +177,72 @@ function onSplitterMouseUp() {
   splitterDrag = null
   window.removeEventListener('mousemove', onSplitterMouseMove)
   window.removeEventListener('mouseup', onSplitterMouseUp)
+}
+
+function sumPaneHeights(heights: number[]): number {
+  return heights.reduce((a, b) => a + b, 0)
+}
+
+/** 分割条与 MACD/RSI/KDJ 标签等非 pane-wrap 区域占用高度 */
+function measureFixedOverhead(stack: HTMLElement): number {
+  let h = 0
+  for (const child of Array.from(stack.children)) {
+    const el = child as HTMLElement
+    if (!el.classList.contains('pane-wrap')) {
+      h += el.offsetHeight
+    }
+  }
+  return h
+}
+
+/**
+ * 按图表区可视高度分配各 pane；preserveRatio 时在窗口缩放等场景保持用户拖拽后的比例。
+ */
+function layoutChartArea(preserveRatio: boolean) {
+  const scroll = chartScrollRef.value
+  const stack = chartStackRef.value
+  if (!scroll || !stack) return
+
+  const available = scroll.clientHeight
+  if (available < 1) return
+
+  const fixed = measureFixedOverhead(stack)
+  const rawDist = Math.max(0, available - fixed)
+  const dist = Math.max(rawDist, PANE_MIN_H * 4)
+
+  if (preserveRatio && layoutAreaDone && sumPaneHeights(paneHeights.value) > 0) {
+    const oldSum = sumPaneHeights(paneHeights.value)
+    // 用户已通过分割条把总高度拉高到超过当前视口可分配值时，不要按比例压回，
+    // 否则纵向滚动条出现会触发 RO，拖拽「增高」会立刻被抵消。
+    if (oldSum > dist && oldSum > lastLayoutPaneSum.value + 0.5) {
+      return
+    }
+    const scale = dist / oldSum
+    const next = paneHeights.value.map(h => Math.max(PANE_MIN_H, Math.round(h * scale)))
+    next[0] += dist - sumPaneHeights(next)
+    paneHeights.value = next
+  } else {
+    const fracSum = DEFAULT_FRAC.reduce((a, b) => a + b, 0)
+    const next = DEFAULT_FRAC.map(f =>
+      Math.max(PANE_MIN_H, Math.floor((dist * f) / fracSum)),
+    )
+    next[0] += dist - sumPaneHeights(next)
+    paneHeights.value = next
+  }
+  layoutAreaDone = true
+  lastLayoutPaneSum.value = sumPaneHeights(paneHeights.value)
+}
+
+function setupChartAreaResizeObserver() {
+  chartAreaResizeObserver?.disconnect()
+  const el = klineRootRef.value
+  if (!el) return
+  chartAreaResizeObserver = new ResizeObserver(() => {
+    const h = el.clientHeight
+    if (h < 1) return
+    layoutChartArea(layoutAreaDone)
+  })
+  chartAreaResizeObserver.observe(el)
 }
 
 // --- Shared chart options ---
@@ -502,13 +643,36 @@ function setAllData() {
 }
 
 // --- Lifecycle ---
-onMounted(() => {
+onMounted(async () => {
+  await nextTick()
+  const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(PANE_HEIGHTS_STORAGE_KEY) : null
+  const saved = parseSavedPaneHeights(raw)
+  if (saved) {
+    paneHeights.value = saved
+    layoutAreaDone = true
+    await nextTick()
+    const dist = getViewportPaneDist()
+    lastLayoutPaneSum.value = dist ?? sumPaneHeights(saved)
+  } else {
+    layoutChartArea(false)
+  }
+  await nextTick()
   initCharts()
+  setupChartAreaResizeObserver()
+  window.addEventListener('beforeunload', onBeforeUnloadPersistPaneHeights)
   if (props.candles.length > 0) setAllData()
 })
 
 onUnmounted(() => {
+  window.removeEventListener('beforeunload', onBeforeUnloadPersistPaneHeights)
+  if (paneHeightsSaveTimer) {
+    clearTimeout(paneHeightsSaveTimer)
+    paneHeightsSaveTimer = null
+  }
+  persistPaneHeights()
   onSplitterMouseUp()
+  chartAreaResizeObserver?.disconnect()
+  chartAreaResizeObserver = null
   resizeObserver?.disconnect()
   mainChart?.remove()
   macdChart?.remove()
@@ -545,12 +709,22 @@ watch(() => [props.candles, props.macd, props.rsi, props.kdj, props.signals], ()
 }, { deep: true })
 
 let prevFirstTime: number = 0
+
+watch(paneHeights, () => { schedulePersistPaneHeights() }, { deep: true })
 </script>
 
 <template>
-  <div class="kline-root">
-    <div class="chart-scroll">
-      <div class="chart-stack">
+  <div ref="klineRootRef" class="kline-root">
+    <button
+      type="button"
+      class="btn-restore-pane-layout"
+      title="主图与 MACD/RSI/KDJ 恢复为默认比例铺满当前图表区，并写入本地保存"
+      @click="restoreFullscreenLayout"
+    >
+      恢复全屏布局
+    </button>
+    <div ref="chartScrollRef" class="chart-scroll">
+      <div ref="chartStackRef" class="chart-stack">
     <div class="pane-wrap pane-wrap--main" :style="{ height: `${paneHeights[0]}px` }">
       <div ref="mainContainer" class="pane main-pane" />
       <div
@@ -573,7 +747,7 @@ let prevFirstTime: number = 0
 
     <div
       class="pane-splitter"
-      title="上下拖拽调整主图与 MACD 高度"
+      title="拖拽调整主图与 MACD 高度；主图压到最低后继续拖可整体增高（右侧滚动）"
       @mousedown="onSplitterMouseDown(0, $event)"
     />
 
@@ -595,7 +769,7 @@ let prevFirstTime: number = 0
 
     <div
       class="pane-splitter"
-      title="上下拖拽调整 MACD 与 RSI 高度"
+      title="拖拽调整 MACD 与 RSI 高度；一侧压到最低后继续拖可整体增高（滚动）"
       @mousedown="onSplitterMouseDown(1, $event)"
     />
 
@@ -615,7 +789,7 @@ let prevFirstTime: number = 0
 
     <div
       class="pane-splitter"
-      title="上下拖拽调整 RSI 与 KDJ 高度"
+      title="拖拽调整 RSI 与 KDJ 高度；一侧压到最低后继续拖可整体增高（滚动）"
       @mousedown="onSplitterMouseDown(2, $event)"
     />
 
@@ -647,6 +821,27 @@ let prevFirstTime: number = 0
   height: 100%;
   min-height: 0;
   position: relative;
+}
+
+.btn-restore-pane-layout {
+  position: absolute;
+  top: 8px;
+  right: 56px;
+  z-index: 45;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid #45475a;
+  background: rgba(24, 24, 37, 0.92);
+  color: #a6adc8;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.btn-restore-pane-layout:hover {
+  border-color: #89b4fa;
+  color: #cdd6f4;
+  background: #313244;
 }
 
 .chart-scroll {

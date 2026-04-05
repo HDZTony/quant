@@ -288,3 +288,7 @@ schtasks /query /tn ETF159506_1min_Collector
 schtasks /delete /tn ETF159506_1min_Collector /f
 
 ETF159506_Tick_Collector
+
+wsl --set-default-version 2
+wsl --install -d Ubuntu --no-launch
+ubuntu config --default-user root

@@ -5,7 +5,7 @@ import MacroDashboard from './components/MacroDashboard.vue'
 import EquityExplorer from './components/EquityExplorer.vue'
 import MLDashboardVue from './components/MLDashboard.vue'
 
-const API_BASE = import.meta.env.DEV ? 'http://localhost:9090' : ''
+const API_BASE = ''
 
 const mode = ref<ViewMode>('realtime')
 const dates = ref<string[]>([])
@@ -183,9 +183,7 @@ async function loadMacroData() {
 
 function connectWs() {
   if (ws) ws.close()
-  const wsUrl = import.meta.env.DEV
-    ? 'ws://localhost:9090/ws/realtime'
-    : `ws://${location.host}/ws/realtime`
+  const wsUrl = `ws://${location.host}/ws/realtime`
   ws = new WebSocket(wsUrl)
   ws.onopen = () => { wsConnected.value = true }
   ws.onclose = () => {

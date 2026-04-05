@@ -12,7 +12,7 @@ import {
   CrosshairMode,
 } from 'lightweight-charts'
 
-const API_BASE = import.meta.env.DEV ? 'http://localhost:9090' : ''
+const API_BASE = ''
 
 const symbol = ref('AAPL')
 const period = ref('1y')
